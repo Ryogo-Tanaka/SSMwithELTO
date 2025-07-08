@@ -1,0 +1,6 @@
+env-swe/
+results/
+Miniconda3.sh
+SwE.zip
+__pycache__/
+.ipynb_checkpoints/

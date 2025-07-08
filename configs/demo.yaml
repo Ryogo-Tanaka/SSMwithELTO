@@ -1,0 +1,53 @@
+# configs/demo.yaml
+
+# ─────────────────────────────────────
+# モデル構成（エンコーダ・デコーダ）
+# ─────────────────────────────────────
+model:
+  encoder:
+    type: _mlp             # エンコーダの種類 ("mlp" または "cnn" など)
+    input_dim: 5          # 入力データの次元 d
+    output_dim: 32        # 潜在表現 y の次元 p
+    hidden_sizes: [64, 64]# 中間層のユニット数リスト
+    activation: ReLU      # 活性化関数 ("relu", "tanh" など)
+
+  decoder_y2d:
+    type: _mlp             # デコーダの種類（y→d）
+    input_dim: 32         # デコーダ入力次元 p
+    output_dim: 5         # 復元後のデータ次元 d
+    hidden_sizes: [64, 64]# デコーダ中間層のユニット数リスト
+    activation: relu      # 活性化関数
+
+# ─────────────────────────────────────
+# SSM（状態空間モデル）実現アルゴリズムの設定
+# ─────────────────────────────────────
+ssm:
+  realization:
+    h: 5                  # 過去/未来ブロックの長さ（時刻ラグ数）
+    jitter: 1e-6          # 共分散行列に加えるジッター（数値安定化用）
+    cond_thresh: 1e12     # 条件数の上限（これを超えるとエラーを投げる）
+    rank: 5               # 低ランク近似で使う特異値の個数（0 or None で全特異値）
+    reg_type: sum         # 特異値正則化の種類 ("sum": Σσ_i, "squared": Σ(1−σ_i)²)
+
+  observation:
+    kernel: rbf           # CME 用カーネル ("linear" または "rbf")
+    gamma: 0.5            # RBF カーネル幅 (None なら 1/p 自動設定)
+    reg_lambda: 1e-3      # 観測モデルの正則化パラメータ λ
+    approx: False         # グラム行列を近似計算するかどうか
+    approx_rank: 20       # 近似時に使うランク（approx: True の場合のみ有効）
+
+# ─────────────────────────────────────
+# 学習設定
+# ─────────────────────────────────────
+training:
+  data_path: "data/mydata.npz"   # 学習データのパス (.npz もしくは .npy)
+  batch_size: 32                 # ミニバッチサイズ
+  epochs: 50                     # エポック数
+  lr: 0.001                      # 最適化の学習率
+  svd_weight: 0.1                # 特異値正則化項に乗せる重み
+
+# ─────────────────────────────────────
+# 可視化・出力設定
+# ─────────────────────────────────────
+visualization:
+  output_dir: "results/figs"      # プロット画像などを出力するディレクトリ
