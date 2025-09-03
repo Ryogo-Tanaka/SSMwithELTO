@@ -127,7 +127,7 @@ class Realization:
             U64, S64, Vh64 = torch.linalg.svd(T64, full_matrices=False)
             U, S, Vh = U64.to(torch.float32), S64.to(torch.float32), Vh64.to(torch.float32)
             # B = Lambda^{1/2} Vᵀ W_pp
-            self.B = torch.diag(S.pow(0.5)) @ Vh @ W_64.to(torch.float32)
+            self.B = torch.diag(S.pow(0.5)) @ Vh @ W64.to(torch.float32)
             self._L_vals = S
         else:                                  # ランク r の切り出し
             U64, S64, Vh64 = torch.linalg.svd(T64, full_matrices=False)
