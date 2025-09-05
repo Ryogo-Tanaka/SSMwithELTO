@@ -1,0 +1,131 @@
+# config_proposed_method.yaml
+# 提案手法の完全実装用設定ファイル
+
+# ──────────────────────────────────────
+# モデル構成
+# ──────────────────────────────────────
+model:
+  # TCNエンコーダ: multivariate → scalar feature
+  encoder:
+    input_dim: 7        # 入力観測次元 d
+    channels: 64        # TCN隠れ次元
+    layers: 6           # TCN層数
+    kernel_size: 3      # カーネルサイズ
+    activation: "GELU"  # 活性化関数
+    dropout: 0.1        # ドロップアウト率
+
+  # TCNデコーダ: scalar feature → multivariate observation  
+  decoder:
+    output_dim: 7       # 出力観測次元 d
+    window: 8           # Takens窓長
+    tau: 1              # 遅延ステップ
+    hidden: 64          # 隠れ次元
+    ma_kernel: 32       # 移動平均窓
+    gru_hidden: 32      # GRU隠れ次元
+    activation: "GELU"
+    dropout: 0.1
+
+# ──────────────────────────────────────
+# SSM構成
+# ──────────────────────────────────────
+ssm:
+  # 確率的実現 (スカラー特徴量 → 状態)
+  realization:
+    past_horizon: 20    # 過去ブロック長 h
+    jitter: 1e-3        # 数値安定化
+    cond_thresh: 1e12   # 条件数閾値
+    rank: 5             # 状態次元 r
+    reg_type: "sum"     # 特異値正則化タイプ
+
+  # DF-A: 状態層 (状態 → 状態予測)
+  df_state:
+    feature_dim: 32     # 状態特徴次元 d_A
+    lambda_A: 1e-3      # Stage-1正則化
+    lambda_B: 1e-3      # Stage-2正則化
+    
+    # 状態特徴ネットワーク φ_θ
+    feature_net:
+      hidden_sizes: [64, 64]
+      activation: "ReLU"
+      dropout: 0.1
+    
+    # クロスフィッティング
+    cross_fitting:
+      n_blocks: 5
+      min_block_size: 10
+
+  # DF-B: 観測層 (状態予測 → スカラー特徴予測)
+  df_observation:
+    obs_feature_dim: 16  # 観測特徴次元 d_B
+    lambda_B: 1e-3       # Stage-1正則化
+    lambda_dB: 1e-3      # Stage-2正則化
+    
+    # 観測特徴ネットワーク ψ_ω
+    obs_net:
+      hidden_sizes: [32, 32]
+      activation: "ReLU"
+      dropout: 0.1
+    
+    # クロスフィッティング
+    cross_fitting:
+      n_blocks: 5
+      min_block_size: 10
+
+# ──────────────────────────────────────
+# 学習設定
+# ──────────────────────────────────────
+training:
+  # Phase-1: DF学習
+  phase1:
+    epochs: 50          # Phase-1エポック数
+    T1_iterations: 10   # Stage-1反復数 (V推定 + φ更新)
+    T2_iterations: 5    # Stage-2反復数 (U推定 + ψ更新)
+
+  # Phase-2: End-to-end微調整
+  phase2:
+    epochs: 100         # Phase-2エポック数
+    lambda_cca: 0.1     # 正準相関損失重み
+    update_strategy: "all"  # "all" or "encoder_decoder_only"
+
+  # 学習率
+  lr_phi: 1e-3          # φ_θ (状態特徴) 学習率
+  lr_psi: 1e-3          # ψ_ω (観測特徴) 学習率  
+  lr_encoder: 1e-4      # エンコーダ学習率
+  lr_decoder: 1e-4      # デコーダ学習率
+
+  # データ設定
+  sequence_length: 1000 # 使用する系列長
+  validation_split: 0.2 # 検証データ割合
+
+# ──────────────────────────────────────
+# 実験設定
+# ──────────────────────────────────────
+experiment:
+  name: "proposed_method_v1"
+  seed: 42
+  save_interval: 10     # モデル保存間隔(エポック)
+  log_interval: 1       # ログ出力間隔(エポック)
+  
+  # 評価設定
+  evaluation:
+    forecast_steps: 96  # 予測ステップ数
+    warmup_steps: 100   # ウォームアップステップ
+    
+# ──────────────────────────────────────
+# ログ・可視化設定
+# ──────────────────────────────────────
+logging:
+  enable_wandb: false   # Weights & Biases使用
+  wandb_project: "proposed_method"
+  
+visualization:
+  output_dir: "results/proposed_method"
+  plot_intervals: 10    # プロット生成間隔
+  
+  # プロット設定
+  plots:
+    loss_curves: true           # 損失カーブ
+    state_variables: true       # 状態変数
+    singular_values: true       # 特singular値履歴
+    predictions: true           # 予測結果
+    feature_maps: true          # 特徴写像可視化
