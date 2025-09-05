@@ -1,7 +1,5 @@
-# tcn.py
-# Temporal Convolutional Network based encoder/decoder
-# - Encoder: (B, T, d) -> (B, T, p)  [p=1: "stationary" scalar feature series]
-# - Decoder: (B, T, 1) -> (B, T, n)  [Takens window + Stat/Trend two-path]
+# src/models/architectures/tcn.py (修正版 - エンコーダ部分のみ)
+
 import math
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -11,7 +9,7 @@ import torch.nn.functional as F
 
 
 # --------------------------
-# Low-level building blocks
+# Low-level building blocks (変更なし)
 # --------------------------
 class _CausalConv1dZeroMean(nn.Module):
     """
@@ -113,38 +111,50 @@ class _ResidualTCNBlock(nn.Module):
 
 
 # --------------------------
-# Encoder
+# Encoder - **修正版**
 # --------------------------
 class tcnEncoder(nn.Module):
     """
-    Residual-TCN encoder
+    **修正版**: 提案手法対応 Residual-TCN encoder
+    
+    **主な変更点**:
+    1. output_dim=1 をデフォルトに（スカラー特徴量生成）
+    2. 中心化処理の追加（弱定常性向上）
+    3. 出力の一貫性チェック
+    
+    変換フロー:
       (B, T, d) --permute--> (B, d, T)
         --1x1 Conv(d->C)--> (B, C, T)
         --[Residual TCN x L]--> (B, C, T)
         --1x1 Conv(C->p)--> (B, p, T) --permute--> (B, T, p)
+        --center--> (B, T, p) [中心化]
+    
     Args:
-      input_dim:   d
-      output_dim:  p (default=1: scalar feature series m_t)
-      channels:    C (hidden channels)
-      layers:      L (number of residual blocks)
-      kernel_size: K (FIR length; recommend 3)
-      activation:  "GELU" or "ReLU" etc.
-      dropout:     dropout prob inside residual block
+      input_dim:   d (観測次元)
+      output_dim:  p=1 (スカラー特徴量、デフォルト)
+      channels:    C (隠れ次元)
+      layers:      L (残差ブロック数)
+      kernel_size: K (FIRフィルタ長)
+      activation:  活性化関数
+      dropout:     ドロップアウト率
+      center_output: 出力を中心化するか（弱定常性向上）
     """
     def __init__(self,
                  input_dim: int,
-                 output_dim: int = 1,
+                 output_dim: int = 1,  # **修正**: デフォルトを1に
                  channels: int = 64,
                  layers: int = 6,
                  kernel_size: int = 3,
                  activation: str = "GELU",
-                 dropout: float = 0.0):
+                 dropout: float = 0.0,
+                 center_output: bool = True):  # **新機能**: 中心化オプション
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.channels = channels
         self.layers = layers
         self.kernel_size = kernel_size
+        self.center_output = center_output
 
         self.in_proj  = nn.Conv1d(input_dim, channels, kernel_size=1)
         blocks = []
@@ -160,21 +170,75 @@ class tcnEncoder(nn.Module):
         self.tcn = nn.Sequential(*blocks)
         self.out_proj = nn.Conv1d(channels, output_dim, kernel_size=1)
 
-        # small init on out_proj for stable early-phase training
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
+        # **修正**: スカラー出力の場合は小さな初期値
+        if output_dim == 1:
+            nn.init.xavier_uniform_(self.out_proj.weight, gain=0.01)
+        else:
+            nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
     # ---------- stateless forward (batch) ----------
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         """
-        y: [B, T, d]  ->  u: [B, T, p]
+        **修正版**: 中心化処理付き前向き計算
+        
+        Args:
+            y: [B, T, d] 観測系列
+        Returns:
+            u: [B, T, p] 特徴量系列（デフォルトでp=1のスカラー）
         """
+        # 入力検証
+        if y.dim() != 3:
+            raise ValueError(f"入力は3次元 [B, T, d] であるべき: got {y.shape}")
+        
+        B, T, d = y.shape
+        if d != self.input_dim:
+            raise ValueError(f"入力次元不一致: expected {self.input_dim}, got {d}")
+        
         x = y.transpose(1, 2)        # [B, d, T]
         h = self.in_proj(x)          # [B, C, T]
         h = self.tcn(h)              # [B, C, T]
         u = self.out_proj(h)         # [B, p, T]
-        return u.transpose(1, 2)     # [B, T, p]
+        u = u.transpose(1, 2)        # [B, T, p]
+        
+        # **新機能**: 中心化処理（弱定常性向上）
+        if self.center_output:
+            u_mean = u.mean(dim=1, keepdim=True)  # [B, 1, p]
+            u = u - u_mean
+        
+        # **修正**: スカラー出力の場合は形状確認
+        if self.output_dim == 1:
+            assert u.size(2) == 1, f"スカラー出力のはずが {u.size(2)} 次元"
+            # 必要に応じて squeeze: [B, T, 1] -> [B, T]
+            # ただし、一貫性のため [B, T, 1] を維持
+        
+        return u
+    
+    # **新機能**: スカラー特徴量生成の便利メソッド
+    def encode_to_scalar(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        観測系列をスカラー特徴量系列に変換
+        
+        Args:
+            y: [B, T, d] または [T, d]
+        Returns:
+            m: [B, T] または [T] (スカラー特徴量)
+        """
+        if y.dim() == 2:
+            # [T, d] -> [1, T, d]
+            y = y.unsqueeze(0)
+            single_batch = True
+        else:
+            single_batch = False
+        
+        u = self.forward(y)  # [B, T, 1]
+        m = u.squeeze(-1)    # [B, T]
+        
+        if single_batch:
+            m = m.squeeze(0)  # [T]
+        
+        return m
 
     # ---------- helpers ----------
     @torch.no_grad()
@@ -260,12 +324,20 @@ class tcnEncoder(nn.Module):
 
         # 3) final 1x1 conv to project to p
         u_t = self.out_proj(h_prev.unsqueeze(-1)).squeeze(-1)   # [B, p]
+        
+        # **新機能**: 逐次中心化（簡略化版）
+        if self.center_output:
+            # 注意: 完全な中心化には過去の平均が必要
+            # ここでは簡略化してバッチ内平均で近似
+            u_mean = u_t.mean(dim=0, keepdim=True)  # [1, p]
+            u_t = u_t - u_mean
+        
         # state mutated in-place (bufs/ptrs updated)
         return u_t, state
 
 
 # --------------------------
-# Decoder
+# Decoder (変更なし、既存のまま)
 # --------------------------
 def _takens_window(u: torch.Tensor, window: int, tau: int) -> torch.Tensor:
     """

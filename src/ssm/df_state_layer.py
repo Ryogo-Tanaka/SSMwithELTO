@@ -82,10 +82,12 @@ class DFStateLayer:
     資料のSection 1.4.1に対応。状態系列からの1ステップ予測を
     2段階回帰（2SLS）とクロスフィッティングで実現。
     
+    **修正点**: Phase-1学習戦略対応
+    
     計算フロー:
     1. ϕ_θ(x_t) で状態を特徴空間に写像
-    2. Stage-1: V_A推定（転送作用素）
-    3. Stage-2: U_A推定（読み出し行列） 
+    2. Stage-1: V_A推定（転送作用素）+ ϕ_θ勾配更新
+    3. Stage-2: U_A推定（読み出し行列）閉形式解のみ
     4. 予測: x̂_{t|t-1} = U_A^T V_A ϕ_θ(x_{t-1})
     """
     
@@ -127,6 +129,10 @@ class DFStateLayer:
         self.V_A: Optional[torch.Tensor] = None  # 転送作用素 (d_A, d_A)
         self.U_A: Optional[torch.Tensor] = None  # 読み出し行列 (d_A, r)
         self._is_fitted = False
+        
+        # **新機能**: Phase-1学習用の内部状態管理
+        self._stage1_cache = {}  # V_A計算結果をキャッシュ
+        self._stage2_cache = {}  # U_A計算結果をキャッシュ
     
     def _ridge_stage1(
         self, 
@@ -229,6 +235,98 @@ class DFStateLayer:
         
         return U
     
+    # **新機能**: Phase-1学習用メソッド
+    def train_stage1_with_gradients(
+        self,
+        X_states: torch.Tensor,
+        optimizer_phi: torch.optim.Optimizer
+    ) -> Dict[str, float]:
+        """
+        **新機能**: Stage-1学習 + ϕ_θ勾配更新
+        
+        資料の学習戦略に対応:
+        for t = 1 to T1:  # Stage-1
+            V_A^{(-k)} = 閉形式解(Φ_minus, Φ_plus, ϕ_θ固定)
+            ϕ_θ ← ϕ_θ - α∇L1(V_A^{(-k)}, ϕ_θ)  # ϕ_θ更新
+        
+        Args:
+            X_states: 状態系列 (T, r)
+            optimizer_phi: ϕ_θ用オプティマイザ
+            
+        Returns:
+            Dict[str, float]: 損失メトリクス
+        """
+        T, r = X_states.shape
+        
+        if r != self.state_dim:
+            raise ValueError(f"状態次元不一致: expected {self.state_dim}, got {r}")
+        
+        if T < 2:
+            raise ValueError(f"時系列が短すぎます: T={T}")
+        
+        # 特徴量計算（勾配あり）
+        phi_seq = self.phi_theta(X_states)  # (T, d_A)
+        
+        # 過去/未来特徴量分割
+        phi_minus = phi_seq[:-1]  # (T-1, d_A)
+        phi_plus = phi_seq[1:]    # (T-1, d_A)
+        
+        # V_A 推定（簡略化版：全データ使用、実際はクロスフィッティング）
+        V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
+        
+        # Stage-1 損失: ||Φ^+ - V_A Φ^-||_F^2
+        phi_pred = (V_A @ phi_minus.T).T  # (T-1, d_A)
+        loss_stage1 = torch.norm(phi_pred - phi_plus, p='fro') ** 2
+        
+        # ϕ_θ 更新
+        optimizer_phi.zero_grad()
+        loss_stage1.backward()
+        optimizer_phi.step()
+        
+        # V_A をキャッシュ（Stage-2で使用）
+        self._stage1_cache['V_A'] = V_A.detach()
+        self._stage1_cache['phi_minus'] = phi_minus.detach()
+        self._stage1_cache['X_plus'] = X_states[1:].detach()  # (T-1, r)
+        
+        return {'stage1_loss': loss_stage1.item()}
+    
+    def train_stage2_closed_form(self) -> Dict[str, float]:
+        """
+        **新機能**: Stage-2学習（閉形式解のみ、勾配なし）
+        
+        資料の学習戦略に対応:
+        for t = 1 to T2:  # Stage-2
+            U_A = 閉形式解(H^{(cf)}_A, X_+)        # U_A更新（閉形式解のみ）
+        
+        Returns:
+            Dict[str, float]: 損失メトリクス
+        """
+        if 'V_A' not in self._stage1_cache:
+            raise RuntimeError("Stage-1が先に実行されている必要があります")
+        
+        # Stage-1からの結果を取得
+        V_A = self._stage1_cache['V_A']
+        phi_minus = self._stage1_cache['phi_minus']
+        X_plus = self._stage1_cache['X_plus']
+        
+        # 中間特徴量計算（勾配なし）
+        with torch.no_grad():
+            H_cf = (V_A @ phi_minus.T).T  # (T-1, d_A)
+        
+        # U_A 推定（勾配なし）
+        with torch.no_grad():
+            U_A = self._ridge_stage2(H_cf, X_plus, self.lambda_B)
+        
+        # Stage-2 損失計算（参考用）
+        with torch.no_grad():
+            X_pred = (U_A.T @ H_cf.T).T  # (T-1, r)
+            loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2
+        
+        # U_A をキャッシュ
+        self._stage2_cache['U_A'] = U_A
+        
+        return {'stage2_loss': loss_stage2.item()}
+    
     def fit_two_stage(
         self, 
         X_states: torch.Tensor, 
@@ -236,20 +334,11 @@ class DFStateLayer:
         verbose: bool = False
     ) -> 'DFStateLayer':
         """
-        2段階クロスフィッティング学習
+        従来の2段階クロスフィッティング学習（変更なし）
         
-        資料の式(13)(14)と(17)-(20)に対応。
-        
-        Args:
-            X_states: 状態系列 (T, r)
-            use_cross_fitting: クロスフィッティングを使用するか
-            verbose: 詳細ログ出力
-            
-        Returns:
-            self
-            
-        Raises:
-            CrossFittingError: フィッティングに失敗した場合
+        **注意**: これは既存の学習メソッドです。
+        新しいPhase-1学習では train_stage1_with_gradients と 
+        train_stage2_closed_form を使用してください。
         """
         T, r = X_states.shape
         
@@ -351,12 +440,18 @@ class DFStateLayer:
             torch.Tensor: 予測特徴量 (d_A,) または (batch, d_A)
         """
         if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
+            # **修正**: キャッシュされた結果も使用可能に
+            if 'V_A' in self._stage1_cache:
+                V_A = self._stage1_cache['V_A']
+            else:
+                raise RuntimeError("fit_two_stage() または train_stage1_with_gradients() を先に実行してください")
+        else:
+            V_A = self.V_A
         
         if phi_prev.dim() == 1:
-            return self.V_A @ phi_prev
+            return V_A @ phi_prev
         else:
-            return (self.V_A @ phi_prev.T).T
+            return (V_A @ phi_prev.T).T
     
     def predict_one_step(self, x_prev: torch.Tensor) -> torch.Tensor:
         """
@@ -369,7 +464,15 @@ class DFStateLayer:
             torch.Tensor: 予測状態 (r,) または (batch, r)
         """
         if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
+            # **修正**: キャッシュされた結果も使用可能に
+            if 'V_A' in self._stage1_cache and 'U_A' in self._stage2_cache:
+                V_A = self._stage1_cache['V_A']
+                U_A = self._stage2_cache['U_A']
+            else:
+                raise RuntimeError("学習が完了していません")
+        else:
+            V_A = self.V_A
+            U_A = self.U_A
         
         # 特徴写像
         phi_prev = self.phi_theta(x_prev)
@@ -379,9 +482,9 @@ class DFStateLayer:
         
         # 状態空間に戻す
         if phi_pred.dim() == 1:
-            return self.U_A.T @ phi_pred
+            return U_A.T @ phi_pred
         else:
-            return (self.U_A.T @ phi_pred.T).T
+            return (U_A.T @ phi_pred.T).T
     
     def predict_sequence(
         self, 
@@ -399,8 +502,8 @@ class DFStateLayer:
             torch.Tensor: 予測系列 (T-1, r)
             Optional[torch.Tensor]: 特徴量系列 (T-1, d_A)
         """
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
+        if not self._is_fitted and 'V_A' not in self._stage1_cache:
+            raise RuntimeError("学習が完了していません")
         
         T = X_states.size(0)
         predictions = []
@@ -425,25 +528,26 @@ class DFStateLayer:
     
     def get_transfer_operator(self) -> torch.Tensor:
         """転送作用素 V_A を取得"""
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
-        return self.V_A.clone()
+        if self._is_fitted:
+            return self.V_A.clone()
+        elif 'V_A' in self._stage1_cache:
+            return self._stage1_cache['V_A'].clone()
+        else:
+            raise RuntimeError("学習が完了していません")
     
     def get_readout_matrix(self) -> torch.Tensor:
         """読み出し行列 U_A を取得"""
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
-        return self.U_A.clone()
+        if self._is_fitted:
+            return self.U_A.clone()
+        elif 'U_A' in self._stage2_cache:
+            return self._stage2_cache['U_A'].clone()
+        else:
+            raise RuntimeError("学習が完了していません")
     
     def get_state_dict(self) -> Dict[str, Any]:
         """学習済みパラメータを辞書で取得"""
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
-        
-        return {
+        state_dict = {
             'phi_theta': self.phi_theta.state_dict(),
-            'V_A': self.V_A,
-            'U_A': self.U_A,
             'config': {
                 'state_dim': self.state_dim,
                 'feature_dim': self.feature_dim,
@@ -451,3 +555,16 @@ class DFStateLayer:
                 'lambda_B': self.lambda_B
             }
         }
+        
+        if self._is_fitted:
+            state_dict.update({
+                'V_A': self.V_A,
+                'U_A': self.U_A,
+            })
+        
+        if self._stage1_cache:
+            state_dict['stage1_cache'] = self._stage1_cache.copy()
+        if self._stage2_cache:
+            state_dict['stage2_cache'] = self._stage2_cache.copy()
+            
+        return state_dict

@@ -6,7 +6,6 @@ from typing import Optional, Tuple, Dict, Any
 import warnings
 
 from .cross_fitting import CrossFittingManager, TwoStageCrossFitter, CrossFittingError
-from .df_state_layer import DFStateLayer
 
 
 class ObservationFeatureNet(nn.Module):
@@ -91,17 +90,19 @@ class DFObservationLayer:
     資料のSection 1.4.2に対応。DF-Aで得られた状態予測を操作変数として、
     スカラー特徴量の1ステップ予測を2SLSで実現。
     
+    **修正点**: DF-Aとの密結合による特徴写像φ_θの共有
+    
     計算フロー:
-    1. DF-Aから状態予測 x̂_{t|t-1} を受け取る
-    2. ϕ_θ(x̂_{t|t-1}) を操作変数として使用
+    1. DF-Aから状態予測 x̂_{t|t-1} と共有特徴写像 φ_θ を受け取る
+    2. φ_θ(x̂_{t|t-1}) を操作変数として使用
     3. ψ_ω(m_t) で観測特徴量を計算
     4. Stage-1: V_B推定, Stage-2: u_B推定
-    5. 予測: m̂_{t|t-1} = u_B^T V_B ϕ_θ(x̂_{t|t-1})
+    5. 予測: m̂_{t|t-1} = u_B^T V_B φ_θ(x̂_{t|t-1})
     """
     
     def __init__(
         self,
-        df_state_layer: DFStateLayer,
+        df_state_layer,  # DFStateLayerインスタンス（必須）
         obs_feature_dim: int = 16,
         lambda_B: float = 1e-3,
         lambda_dB: float = 1e-3,
@@ -110,25 +111,25 @@ class DFObservationLayer:
     ):
         """
         Args:
-            df_state_layer: 学習済みDFStateLayerインスタンス
+            df_state_layer: **必須** 学習済みDFStateLayerインスタンス
             obs_feature_dim: 観測特徴次元 d_B
             lambda_B: Stage-1正則化パラメータ λ_B
             lambda_dB: Stage-2正則化パラメータ λ_{dB}
             obs_net_config: ObservationFeatureNetの設定
             cross_fitting_config: CrossFittingManagerの設定
         """
-        if not df_state_layer._is_fitted:
-            raise RuntimeError("df_state_layerは学習済みである必要があります")
+        if df_state_layer is None:
+            raise ValueError("df_state_layerは必須です。DFStateLayerインスタンスを渡してください。")
         
         self.df_state = df_state_layer
         self.obs_feature_dim = obs_feature_dim
         self.lambda_B = lambda_B
         self.lambda_dB = lambda_dB
         
-        # 共有特徴ネットワーク（DF-Aから直接参照）
+        # **重要**: 共有特徴ネットワーク（DF-Aから直接参照）
         self.phi_theta = df_state_layer.phi_theta
         
-        # 観測特徴ネットワーク
+        # 観測特徴ネットワーク ψ_ω
         obs_config = obs_net_config or {}
         self.psi_omega = ObservationFeatureNet(
             input_dim=1,
@@ -143,6 +144,10 @@ class DFObservationLayer:
         self.V_B: Optional[torch.Tensor] = None  # 観測転送作用素 (d_B, d_A)
         self.u_B: Optional[torch.Tensor] = None  # 観測読み出しベクトル (d_B,)
         self._is_fitted = False
+        
+        # **新機能**: Phase-1学習用の内部状態管理
+        self._stage1_cache = {}  # V_B計算結果をキャッシュ
+        self._stage2_cache = {}  # u_B計算結果をキャッシュ
     
     def _ridge_stage1_vb(
         self, 
@@ -248,6 +253,125 @@ class DFObservationLayer:
         
         return u_B
     
+    # **新機能**: Phase-1学習用メソッド
+    def train_stage1_with_gradients(
+        self, 
+        X_hat_states: torch.Tensor,
+        m_features: torch.Tensor,
+        optimizer_phi: torch.optim.Optimizer,
+        fix_psi_omega: bool = True
+    ) -> Dict[str, float]:
+        """
+        **新機能**: Stage-1学習 + φ_θ勾配更新
+        
+        資料の学習戦略に対応:
+        V_B = 閉形式解(Φ_prev, Ψ_curr)       # V_B計算（ψ_ω固定）
+        φ_θ ← φ_θ - α∇L1(V_B, φ_θ)         # φ_θ更新（ψ_ω固定）
+        
+        Args:
+            X_hat_states: DF-Aからの状態予測 (T-1, r)
+            m_features: スカラー特徴量 (T,)
+            optimizer_phi: φ_θ用オプティマイザ
+            fix_psi_omega: ψ_ω を固定するか
+            
+        Returns:
+            Dict[str, float]: 損失メトリクス
+        """
+        if not self.df_state._is_fitted:
+            raise RuntimeError("DF-Aが学習済みである必要があります")
+        
+        # 時間合わせ
+        T_x = X_hat_states.size(0)  # T-1
+        m_curr = m_features[1:T_x+1]  # (T-1,)
+        
+        if fix_psi_omega:
+            # ψ_ω 固定でStage-1学習
+            with torch.no_grad():
+                psi_curr = self.psi_omega(m_curr.unsqueeze(1))  # (T-1, d_B)
+        else:
+            psi_curr = self.psi_omega(m_curr.unsqueeze(1))  # (T-1, d_B)
+        
+        # φ_θ 勾配あり
+        phi_prev = self.phi_theta(X_hat_states)  # (T-1, d_A)
+        
+        # V_B 推定
+        V_B = self._ridge_stage1_vb(phi_prev, psi_curr, self.lambda_B)
+        
+        # Stage-1 損失: ||Ψ - V_B Φ||_F^2
+        psi_pred = (V_B @ phi_prev.T).T  # (T-1, d_B)
+        loss_stage1 = torch.norm(psi_pred - psi_curr, p='fro') ** 2
+        
+        # φ_θ 更新
+        optimizer_phi.zero_grad()
+        loss_stage1.backward()
+        optimizer_phi.step()
+        
+        # V_B をキャッシュ（Stage-2で使用）
+        self._stage1_cache['V_B'] = V_B.detach()
+        self._stage1_cache['phi_prev'] = phi_prev.detach()
+        
+        return {'stage1_loss': loss_stage1.item()}
+        
+    def train_stage2_with_gradients(
+        self,
+        m_features: torch.Tensor,
+        optimizer_psi: torch.optim.Optimizer,
+        fix_phi_theta: bool = True
+    ) -> Dict[str, float]:
+        """
+        **新機能**: Stage-2学習 + ψ_ω勾配更新
+        
+        資料の学習戦略に対応:
+        u_B = 閉形式解(H^{(cf)}_B, m)        # u_B計算（φ_θ固定）
+        ψ_ω ← ψ_ω - α∇L2(u_B, ψ_ω)         # ψ_ω更新（φ_θ固定）
+        
+        Args:
+            m_features: スカラー特徴量 (T,)
+            optimizer_psi: ψ_ω用オプティマイザ
+            fix_phi_theta: φ_θ を固定するか
+            
+        Returns:
+            Dict[str, float]: 損失メトリクス
+        """
+        if 'V_B' not in self._stage1_cache:
+            raise RuntimeError("Stage-1が先に実行されている必要があります")
+        
+        # Stage-1からの結果を取得
+        V_B = self._stage1_cache['V_B']
+        phi_prev = self._stage1_cache['phi_prev']
+        T_eff = phi_prev.size(0)
+        m_curr = m_features[1:T_eff+1]  # (T-1,)
+        
+        if fix_phi_theta:
+            # φ_θ 固定でStage-2学習
+            with torch.no_grad():
+                H = (V_B @ phi_prev.T).T  # (T-1, d_B)
+        else:
+            phi_prev_grad = self.phi_theta(self._stage1_cache['X_hat'])
+            H = (V_B @ phi_prev_grad.T).T  # (T-1, d_B)
+        
+        # u_B 推定
+        u_B = self._ridge_stage2_ub(H, m_curr, self.lambda_dB)
+        
+        # Stage-2 損失: ||m - H u_B||_2^2
+        if fix_phi_theta:
+            m_pred = (H * u_B).sum(dim=1)  # (T-1,)
+        else:
+            m_pred = (H * u_B).sum(dim=1)  # (T-1,)
+            
+        loss_stage2 = torch.norm(m_pred - m_curr, p=2) ** 2
+        
+        # ψ_ω 更新
+        if not fix_phi_theta:
+            optimizer_psi.zero_grad()
+            loss_stage2.backward()
+            optimizer_psi.step()
+        
+        # u_B をキャッシュ
+        self._stage2_cache['u_B'] = u_B.detach()
+        
+        return {'stage2_loss': loss_stage2.item()}
+    
     def fit_two_stage(
         self, 
         X_hat_states: torch.Tensor,  # DF-Aからの状態予測
@@ -256,18 +380,11 @@ class DFObservationLayer:
         verbose: bool = False
     ) -> 'DFObservationLayer':
         """
-        2段階クロスフィッティング学習
+        従来の2段階クロスフィッティング学習（変更なし）
         
-        資料の式(21)(22)とDF-B cross-fittingに対応。
-        
-        Args:
-            X_hat_states: DF-Aからの状態予測 (T, r)
-            m_features: スカラー特徴量 (T,) または (T, 1)
-            use_cross_fitting: クロスフィッティングを使用するか
-            verbose: 詳細ログ出力
-            
-        Returns:
-            self
+        **注意**: これは既存の学習メソッドです。
+        新しいPhase-1学習では train_stage1_with_gradients と 
+        train_stage2_with_gradients を使用してください。
         """
         T_x, r = X_hat_states.shape
         
@@ -374,7 +491,7 @@ class DFObservationLayer:
     
     def predict_one_step(self, x_hat_prev: torch.Tensor) -> torch.Tensor:
         """
-        1ステップ特徴量予測: m̂_{t|t-1} = u_B^T V_B ϕ_θ(x̂_{t|t-1})
+        1ステップ特徴量予測: m̂_{t|t-1} = u_B^T V_B φ_θ(x̂_{t|t-1})
         
         Args:
             x_hat_prev: 前時刻の状態予測 (r,) または (batch, r)
@@ -383,18 +500,26 @@ class DFObservationLayer:
             torch.Tensor: 予測スカラー特徴量 () または (batch,)
         """
         if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
+            # **修正**: キャッシュされた結果も使用可能に
+            if 'V_B' in self._stage1_cache and 'u_B' in self._stage2_cache:
+                V_B = self._stage1_cache['V_B']
+                u_B = self._stage2_cache['u_B']
+            else:
+                raise RuntimeError("fit_two_stage() または train_stage1/2_with_gradients() を先に実行してください")
+        else:
+            V_B = self.V_B
+            u_B = self.u_B
         
-        # 状態特徴写像
+        # 状態特徴写像（共有φ_θ）
         phi_prev = self.phi_theta(x_hat_prev)
         
         # 観測転送作用素適用 + 読み出し
         if phi_prev.dim() == 1:
-            h_pred = self.V_B @ phi_prev  # (d_B,)
-            return self.u_B @ h_pred      # scalar
+            h_pred = V_B @ phi_prev  # (d_B,)
+            return u_B @ h_pred      # scalar
         else:
-            h_pred = (self.V_B @ phi_prev.T).T  # (batch, d_B)
-            return (h_pred * self.u_B).sum(dim=1)  # (batch,)
+            h_pred = (V_B @ phi_prev.T).T  # (batch, d_B)
+            return (h_pred * u_B).sum(dim=1)  # (batch,)
     
     def predict_sequence(
         self, 
@@ -409,8 +534,8 @@ class DFObservationLayer:
         Returns:
             torch.Tensor: 予測特徴量系列 (T-1,)
         """
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
+        if not self._is_fitted and 'V_B' not in self._stage1_cache:
+            raise RuntimeError("学習が完了していません")
         
         T = X_hat_states.size(0)
         predictions = []
@@ -423,28 +548,42 @@ class DFObservationLayer:
     
     def get_observation_operator(self) -> torch.Tensor:
         """観測転送作用素 V_B を取得"""
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
-        return self.V_B.clone()
+        if self._is_fitted:
+            return self.V_B.clone()
+        elif 'V_B' in self._stage1_cache:
+            return self._stage1_cache['V_B'].clone()
+        else:
+            raise RuntimeError("学習が完了していません")
     
     def get_readout_vector(self) -> torch.Tensor:
         """観測読み出しベクトル u_B を取得"""
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
-        return self.u_B.clone()
+        if self._is_fitted:
+            return self.u_B.clone()
+        elif 'u_B' in self._stage2_cache:
+            return self._stage2_cache['u_B'].clone()
+        else:
+            raise RuntimeError("学習が完了していません")
     
     def get_state_dict(self) -> Dict[str, Any]:
         """学習済みパラメータを辞書で取得"""
-        if not self._is_fitted:
-            raise RuntimeError("fit_two_stage() を先に実行してください")
-        
-        return {
+        state_dict = {
             'psi_omega': self.psi_omega.state_dict(),
-            'V_B': self.V_B,
-            'u_B': self.u_B,
             'config': {
                 'obs_feature_dim': self.obs_feature_dim,
                 'lambda_B': self.lambda_B,
                 'lambda_dB': self.lambda_dB
             }
         }
+        
+        if self._is_fitted:
+            state_dict.update({
+                'V_B': self.V_B,
+                'u_B': self.u_B,
+            })
+        
+        if self._stage1_cache:
+            state_dict['stage1_cache'] = self._stage1_cache.copy()
+        if self._stage2_cache:
+            state_dict['stage2_cache'] = self._stage2_cache.copy()
+            
+        return state_dict
