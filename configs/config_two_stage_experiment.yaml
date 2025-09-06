@@ -1,0 +1,143 @@
+# config_two_stage_experiment.yaml
+# 提案手法の2段階学習実験用設定ファイル
+
+# ──────────────────────────────────────
+# モデル構成
+# ──────────────────────────────────────
+model:
+  # TCNエンコーダ: multivariate → scalar feature
+  encoder:
+    type: "tcn"           # TCNエンコーダを使用
+    input_dim: 6          # 入力観測次元 d (シミュレーションデータに合わせて調整)
+    output_dim: 1         # スカラー特徴量（固定）
+    channels: 64          # TCN隠れ次元
+    layers: 6             # TCN層数 
+    kernel_size: 3        # カーネルサイズ
+    activation: "GELU"    # 活性化関数
+    dropout: 0.1          # ドロップアウト率
+    center_output: true   # 中心化有効（弱定常性向上）
+
+  # TCNデコーダ: scalar feature → multivariate observation
+  decoder:
+    type: "tcn"           # TCNデコーダを使用
+    output_dim: 6         # 出力観測次元 d
+    window: 8             # Takens窓長
+    tau: 1                # 遅延ステップ
+    hidden: 64            # 隠れ次元
+    ma_kernel: 32         # 移動平均窓
+    gru_hidden: 32        # GRU隠れ次元
+    activation: "GELU"
+    dropout: 0.1
+
+# ──────────────────────────────────────
+# SSM構成
+# ──────────────────────────────────────
+ssm:
+  # 確率的実現 (スカラー特徴量 → 状態)
+  realization:
+    past_horizon: 20      # 過去ブロック長 h
+    jitter: 1e-3          # 数値安定化
+    cond_thresh: 1e12     # 条件数閾値
+    rank: 5               # 状態次元 r
+    reg_type: "sum"       # 特異値正則化タイプ
+
+  # DF-A: 状態層 (状態 → 状態予測)
+  df_state:
+    feature_dim: 32       # 状態特徴次元 d_A
+    lambda_A: 1e-3        # Stage-1正則化
+    lambda_B: 1e-3        # Stage-2正則化
+    
+    # 状態特徴ネットワーク φ_θ
+    feature_net_config:
+      hidden_sizes: [64, 64]
+      activation: "ReLU"
+      dropout: 0.1
+    
+    # クロスフィッティング
+    cross_fitting_config:
+      n_blocks: 5
+      min_block_size: 10
+
+  # DF-B: 観測層 (状態予測 → スカラー特徴予測)
+  df_observation:
+    obs_feature_dim: 16   # 観測特徴次元 d_B
+    lambda_B: 1e-3        # Stage-1正則化
+    lambda_dB: 1e-3       # Stage-2正則化
+    
+    # 観測特徴ネットワーク ψ_ω
+    obs_net_config:
+      hidden_sizes: [32, 32]
+      activation: "ReLU"
+      dropout: 0.1
+    
+    # クロスフィッティング
+    cross_fitting_config:
+      n_blocks: 5
+      min_block_size: 10
+
+# ──────────────────────────────────────
+# 学習設定
+# ──────────────────────────────────────
+training:
+  # Phase-1: DF学習
+  phase1_epochs: 30       # Phase-1エポック数
+  T1_iterations: 8        # Stage-1反復数 (V推定 + φ/ψ更新)
+  T2_iterations: 3        # Stage-2反復数 (U推定)
+  df_a_warmup_epochs: 5   # DF-Bを開始する前のDF-Aウォームアップ
+
+  # Phase-2: End-to-end微調整
+  phase2_epochs: 50       # Phase-2エポック数
+  lambda_cca: 0.01        # 正準相関損失重み
+  update_strategy: "all"  # "all" or "encoder_decoder_only"
+
+  # 学習率
+  lr_phi: 1e-3            # φ_θ (状態特徴) 学習率
+  lr_psi: 1e-3            # ψ_ω (観測特徴) 学習率  
+  lr_encoder: 5e-4        # エンコーダ学習率
+  lr_decoder: 5e-4        # デコーダ学習率
+
+  # ログ・保存設定
+  log_interval: 1         # ログ出力間隔(エポック)
+  save_interval: 10       # モデル保存間隔(エポック)
+  verbose: true           # 詳細ログ
+
+# ──────────────────────────────────────
+# 実験設定
+# ──────────────────────────────────────
+experiment:
+  name: "two_stage_experiment_v1"
+  description: "提案手法の2段階学習戦略の実装テスト"
+  seed: 42
+  
+  # 評価設定
+  evaluation:
+    forecast_steps: 96    # 予測ステップ数
+    warmup_ratio: 0.8     # ウォームアップデータ割合
+    
+# ──────────────────────────────────────
+# 可視化・出力設定
+# ──────────────────────────────────────
+visualization:
+  enable_plots: true
+  plot_intervals: 5       # プロット生成間隔(エポック)
+  
+  # プロット設定
+  plots:
+    phase1_losses: true           # Phase-1損失推移
+    phase2_losses: true           # Phase-2損失推移
+    learning_curves: true         # 学習曲線
+    prediction_results: true      # 予測結果
+    state_evolution: true         # 状態変数推移
+    feature_analysis: true        # 特徴量解析
+
+# ──────────────────────────────────────
+# デバッグ・開発設定
+# ──────────────────────────────────────
+debug:
+  save_intermediate: false      # 中間結果保存
+  profile_training: false       # 学習プロファイリング
+  gradient_clipping: 1.0        # 勾配クリッピング
+  
+  # エラー処理
+  continue_on_error: false      # エラー時継続
+  max_retries: 3                # 最大リトライ回数
