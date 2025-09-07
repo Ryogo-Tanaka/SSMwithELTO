@@ -161,7 +161,8 @@ def test_individual_components(config: Dict[str, Any], Y: torch.Tensor, verbose:
         if verbose:
             print(f"✓ 確率的実現: {m_input.shape} -> {X_states.shape}")
             if hasattr(realization, '_L_vals') and realization._L_vals is not None:
-                print(f"  特異値: {realization._L_vals.cpu().numpy()}")
+                singular_values_for_display = realization._L_vals.detach().cpu().numpy()
+                print(f"  特異値: {singular_values_for_display}")
     
     except Exception as e:
         results['realization'] = False

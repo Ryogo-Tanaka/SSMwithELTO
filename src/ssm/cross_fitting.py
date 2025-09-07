@@ -58,7 +58,7 @@ class CrossFittingManager:
             block_k: ブロック番号 (0-indexed)
             
         Returns:
-            List[int]: I_{-k} = {0,...,T} \ B_k
+            List[int]: I_{-k} = {0,...,T} /  B_k
         """
         if not (0 <= block_k < self.n_blocks):
             raise ValueError(f"block_k must be in [0, {self.n_blocks}), got {block_k}")
