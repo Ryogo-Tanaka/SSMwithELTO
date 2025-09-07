@@ -126,6 +126,16 @@ class TrainingLogger:
                 'epoch', 'total_loss', 'rec_loss', 'cca_loss',
                 'lr_encoder', 'lr_decoder', 'lr_phi', 'lr_psi'
             ])
+    def enable_time_alignment_debug(self):
+        """時間対応のデバッグ情報を有効化"""
+        self._debug_time_alignment = True
+        if self.config.verbose:
+            print("時間対応デバッグモード有効化")
+
+    def disable_time_alignment_debug(self):
+        """時間対応のデバッグ情報を無効化"""
+        if hasattr(self, '_debug_time_alignment'):
+            delattr(self, '_debug_time_alignment')
     
     def log_phase1(self, epoch: int, phase: TrainingPhase, stage: str, 
                    iteration: int, metrics: Dict[str, float], 
@@ -561,53 +571,115 @@ class TwoStageTrainer:
     
     def _forward_and_loss_phase2(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Phase-2の前向き推論と損失計算
+        **修正版**: Phase-2の前向き推論と損失計算（厳密な時間管理）
+        
+        時間関係の厳密な定式化:
+        Step 1: {y_t}_{t=0}^{T-1} → {m_t}_{t=0}^{T-1}
+        Step 2: {m_t} → {x_t}_{t=h}^{T-h} (length: T_eff = T-2h+1)
+        Step 3: x_{t-1} → x̂_{t|t-1} for t ∈ {h+1, ..., T-h} (length: T_pred = T_eff-1)
+        Step 4: x̂_{t|t-1} → m̂_{t|t-1} for t ∈ {h+1, ..., T-h}
+        Step 5: m̂_{t|t-1} → ŷ_{t|t-1}
+        Step 6: Compare ŷ_{t|t-1} with y_t for t ∈ {h+1, ..., T-h}
         
         Returns:
             (total_loss, rec_loss, cca_loss)
         """
         T, d = Y_train.shape
+        h = self.realization.h
         
-        # 1. エンコード: y_t → m_t
+        if T <= 2 * h:
+            # 時系列が短すぎる場合のフォールバック
+            return (torch.tensor(1e6, device=self.device), 
+                    torch.tensor(0., device=self.device), 
+                    torch.tensor(0., device=self.device))
+        
+        # Step 1: エンコード {y_t}_{t=0}^{T-1} → {m_t}_{t=0}^{T-1}
         m_tensor = self.encoder(Y_train.unsqueeze(0))  # (1, T, 1)
         m_series = m_tensor.squeeze()  # (T,)
+        if m_series.dim() == 0:  # スカラーの場合
+            m_series = m_series.unsqueeze(0)
         
-        # 2. 確率的実現: m_t → x_t
+        # Step 2: 確率的実現 {m_t} → {x_t}_{t=h}^{T-h}
         self.realization.fit(m_series.unsqueeze(1))
         X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
+        T_eff = X_states.size(0)  # T_eff = T - 2h + 1
         
-        # 3. DF-A予測: x_{t-1} → x̂_{t|t-1}
-        X_hat_states = self.df_state.predict_sequence(X_states)  # (T_eff-1, r)
+        if T_eff <= 1:
+            # 状態系列が短すぎる場合
+            return (torch.tensor(1e6, device=self.device), 
+                    torch.tensor(0., device=self.device), 
+                    torch.tensor(0., device=self.device))
         
-        # 4. DF-B予測: x̂_{t|t-1} → m̂_{t|t-1}
-        m_hat_series = []
-        for t in range(X_hat_states.size(0)):
-            m_hat_t = self.df_obs.predict_one_step(X_hat_states[t])
-            m_hat_series.append(m_hat_t)
+        # 時間対応の確認（デバッグ用）
+        if self.config.verbose and hasattr(self, '_debug_time_alignment'):
+            print(f"[DEBUG] Time alignment: T={T}, h={h}, T_eff={T_eff}")
+            print(f"[DEBUG] X_states corresponds to x_{{h}} to x_{{T-h}} = x_{{{h}}} to x_{{{h+T_eff-1}}}")
         
-        if not m_hat_series:
-            # デフォルト損失
-            return torch.tensor(1e6, device=self.device), torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
+        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}
+        # 入力: x_h, x_{h+1}, ..., x_{T-h-1} (X_states[0:T_eff-1])
+        # 出力: x̂_{h+1|h}, x̂_{h+2|h+1}, ..., x̂_{T-h|T-h-1} (length: T_pred = T_eff-1)
+        X_hat_states = self.df_state.predict_sequence(X_states)  # (T_pred, r)
+        T_pred = X_hat_states.size(0)  # T_pred = T_eff - 1 = T - 2h
         
-        m_hat_tensor = torch.stack(m_hat_series)  # (T_eff-1,)
+        if T_pred <= 0:
+            return (torch.tensor(1e6, device=self.device), 
+                    torch.tensor(0., device=self.device), 
+                    torch.tensor(0., device=self.device))
         
-        # 5. デコード: m̂_{t|t-1} → ŷ_{t|t-1}
+        # Step 4: DF-B予測 x̂_{t|t-1} → m̂_{t|t-1}
+        # X_hat_states[i] = x̂_{h+1+i|h+i} for i = 0, 1, ..., T_pred-1
+        m_hat_series = torch.zeros(T_pred, device=self.device, dtype=m_series.dtype)
+        
+        for i in range(T_pred):
+            # X_hat_states[i] corresponds to x̂_{h+1+i|h+i}
+            # 予測: m̂_{h+1+i|h+i}
+            m_hat_i = self.df_obs.predict_one_step(X_hat_states[i])
+            
+            # スカラー確保
+            if m_hat_i.dim() == 0:
+                m_hat_series[i] = m_hat_i
+            else:
+                m_hat_series[i] = m_hat_i.squeeze()
+        
+        # Step 5: デコード m̂_{t|t-1} → ŷ_{t|t-1}
         # TCNデコーダは [B, T, 1] を期待
-        m_hat_input = m_hat_tensor.unsqueeze(0).unsqueeze(2)  # (1, T_eff-1, 1)
-        Y_hat = self.decoder(m_hat_input).squeeze(0)  # (T_eff-1, d)
+        m_hat_input = m_hat_series.unsqueeze(0).unsqueeze(2)  # (1, T_pred, 1)
+        Y_hat = self.decoder(m_hat_input).squeeze(0)  # (T_pred, d)
         
-        # 6. 損失計算
-        # 時間合わせ
-        h = self.realization.h
-        start_idx = h + 1
-        end_idx = start_idx + Y_hat.size(0)
-        Y_target = Y_train[start_idx:end_idx, :]  # (T_eff-1, d)
+        # Step 6: 損失計算 - 厳密な時間対応
+        # 予測: ŷ_{h+1|h}, ŷ_{h+2|h+1}, ..., ŷ_{T-h|T-h-1}
+        # 真値: y_{h+1}, y_{h+2}, ..., y_{T-h}
+        # インデックス: h+1, h+2, ..., h+T_pred = h+1, ..., T-h
+        
+        target_start_idx = h + 1
+        target_end_idx = target_start_idx + T_pred
+        
+        # 範囲チェック
+        if target_end_idx > T:
+            # 安全のため調整
+            T_pred_safe = T - target_start_idx
+            Y_hat = Y_hat[:T_pred_safe, :]
+            target_end_idx = target_start_idx + T_pred_safe
+        
+        Y_target = Y_train[target_start_idx:target_end_idx, :]  # (T_pred, d)
+        
+        # 形状一致確認
+        if Y_hat.size(0) != Y_target.size(0):
+            min_len = min(Y_hat.size(0), Y_target.size(0))
+            Y_hat = Y_hat[:min_len, :]
+            Y_target = Y_target[:min_len, :]
+        
+        # デバッグ情報
+        if self.config.verbose and hasattr(self, '_debug_time_alignment'):
+            print(f"[DEBUG] Prediction: ŷ_{{t|t-1}} for t ∈ [{target_start_idx}, {target_end_idx-1}]")
+            print(f"[DEBUG] Target: y_t for t ∈ [{target_start_idx}, {target_end_idx-1}]")
+            print(f"[DEBUG] Y_hat.shape: {Y_hat.shape}, Y_target.shape: {Y_target.shape}")
         
         # 再構成損失
         rec_loss = torch.norm(Y_hat - Y_target, p='fro') ** 2
         
-        # 正準相関損失（簡略化）
-        cca_loss = torch.tensor(0.0, device=self.device)  # TODO: 実装
+        # 正準相関損失（まだTODO - 次の修正で実装）
+        cca_loss = torch.tensor(0.0, device=self.device)
         
         # 総損失
         total_loss = rec_loss + self.config.lambda_cca * cca_loss
