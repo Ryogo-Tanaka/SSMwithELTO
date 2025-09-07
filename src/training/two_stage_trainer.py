@@ -346,16 +346,15 @@ class TwoStageTrainer:
         T, d = Y_train.shape
         
         # 1. エンコード: y_t → m_t
-        with torch.no_grad():
             # バッチ次元追加: (T, d) -> (1, T, d)
-            m_tensor = self.encoder(Y_train.unsqueeze(0))  # (1, T, 1)
-            m_series = m_tensor.squeeze()  # (T,)
-            
-            if m_series.dim() == 0:  # スカラーの場合
-                m_series = m_series.unsqueeze(0)
-            
-            if self.config.verbose:
-                print(f"エンコード完了: {Y_train.shape} -> {m_series.shape}")
+        m_tensor = self.encoder(Y_train.unsqueeze(0))  # (1, T, 1)
+        m_series = m_tensor.squeeze()  # (T,)
+        
+        if m_series.dim() == 0:  # スカラーの場合
+            m_series = m_series.unsqueeze(0)
+        
+        if self.config.verbose:
+            print(f"エンコード完了: {Y_train.shape} -> {m_series.shape}")
         
         # 2. 確率的実現: m_t → x_t
         self.realization.fit(m_series.unsqueeze(1))  # (T,) -> (T, 1)
@@ -678,14 +677,107 @@ class TwoStageTrainer:
         # 再構成損失
         rec_loss = torch.norm(Y_hat - Y_target, p='fro') ** 2
         
-        # 正準相関損失（まだTODO - 次の修正で実装）
-        cca_loss = torch.tensor(0.0, device=self.device)
+        # 正準相関損失の計算
+        cca_loss = self._compute_cca_loss(m_series, X_states)
         
         # 総損失
         total_loss = rec_loss + self.config.lambda_cca * cca_loss
         
         return total_loss, rec_loss, cca_loss
     
+    def _compute_cca_loss(self, m_series: torch.Tensor, X_states: torch.Tensor) -> torch.Tensor:
+        """
+        正準相関損失の計算
+        
+        論文Section 2.6の L_cca 実装:
+        L_cca = -Σ ρ_i^2 (正準相関係数の二乗和を最大化)
+        
+        Args:
+            m_series: スカラー特徴量系列 (T,)
+            X_states: 状態系列 (T_eff, r)
+        
+        Returns:
+            CCA損失: -Σ ρ_i^2
+        """
+        # Method 1: 確率的実現から特異値（正準相関係数）を取得
+        if hasattr(self.realization, '_L_vals') and self.realization._L_vals is not None:
+            singular_values = self.realization._L_vals  # σ_1, σ_2, ..., σ_r
+            
+            # 数値安定性のためのクリッピング
+            singular_values = torch.clamp(singular_values, min=1e-8, max=1.0)
+            
+            # 正準相関係数の二乗和を最大化 → 負の損失
+            cca_loss = -torch.sum(singular_values ** 2)
+            
+            if self.config.verbose and hasattr(self, '_debug_cca'):
+                print(f"[DEBUG CCA] Singular values: {singular_values.cpu().numpy()}")
+                print(f"[DEBUG CCA] CCA loss: {cca_loss.item():.6f}")
+            
+            return cca_loss
+        else:
+            # Method 2: フォールバック - エンコーダ特徴量と状態の共分散最大化
+            if self.config.verbose:
+                warnings.warn("確率的実現の特異値が利用できません。共分散ベースのCCA損失を使用します。")
+            return self._compute_covariance_based_cca_loss(m_series, X_states)
+
+    def _compute_covariance_based_cca_loss(self, m_series: torch.Tensor, X_states: torch.Tensor) -> torch.Tensor:
+        """
+        共分散ベースの代替CCA損失（フォールバック）
+        
+        スカラー特徴量と状態系列間の正規化共分散を最大化
+        """
+        h = self.realization.h
+        T_eff = X_states.size(0)
+        
+        # 時間対応の調整：X_states[i] corresponds to x_{h+i}
+        # m_series の対応する部分を取得
+        m_aligned = m_series[h:h+T_eff]  # (T_eff,)
+        X_aligned = X_states  # (T_eff, r)
+        
+        # データ長が一致しない場合の調整
+        min_len = min(m_aligned.size(0), X_aligned.size(0))
+        m_aligned = m_aligned[:min_len]
+        X_aligned = X_aligned[:min_len, :]
+        
+        if min_len < 2:
+            # データが不足している場合
+            return torch.tensor(0.0, device=self.device)
+        
+        # 中心化
+        m_centered = m_aligned - m_aligned.mean()  # (min_len,)
+        X_centered = X_aligned - X_aligned.mean(dim=0, keepdim=True)  # (min_len, r)
+        
+        # 共分散計算
+        cross_cov = torch.abs(torch.sum(m_centered.unsqueeze(1) * X_centered, dim=0))  # (r,)
+        
+        # 正規化項（数値安定性のための小さな値を追加）
+        m_var = torch.var(m_centered, unbiased=False) + 1e-8
+        X_var = torch.var(X_centered, dim=0, unbiased=False) + 1e-8  # (r,)
+        
+        # 正規化共分散（正準相関係数の近似）
+        normalized_cov = cross_cov / torch.sqrt(m_var * X_var)  # (r,)
+        
+        # 二乗和を最大化 → 負の損失
+        cca_loss = -torch.sum(normalized_cov ** 2)
+        
+        if self.config.verbose and hasattr(self, '_debug_cca'):
+            print(f"[DEBUG CCA Fallback] Normalized covariances: {normalized_cov.cpu().numpy()}")
+            print(f"[DEBUG CCA Fallback] CCA loss: {cca_loss.item():.6f}")
+        
+        return cca_loss
+
+    def enable_cca_debug(self):
+        """CCA損失のデバッグ情報を有効化"""
+        self._debug_cca = True
+        if self.config.verbose:
+            print("CCA損失デバッグモード有効化")
+
+    def disable_cca_debug(self):
+        """CCA損失のデバッグ情報を無効化"""
+        if hasattr(self, '_debug_cca'):
+            delattr(self, '_debug_cca')
+
+        
     def fit(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         完全な2段階学習実行
