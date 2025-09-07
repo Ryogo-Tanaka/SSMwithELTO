@@ -33,15 +33,24 @@ class Realization:
     ):
         """
         Args:
-          past_horizon:  number of time-lags in past/future Hankel blocks
-          jitter:        small epsilon to add to diagonals of covariances
-          cond_thresh:   max allowed condition number before rejection
+        past_horizon:  number of time-lags in past/future Hankel blocks
+        jitter:        small epsilon to add to diagonals of covariances
+        cond_thresh:   max allowed condition number before rejection
         """
-        self.h = past_horizon
-        self.jitter = jitter
-        self.cond_thresh = cond_thresh
-        self.rank = rank or 0
-        self.reg_type = reg_type
+        # **修正**: 数値パラメータの型変換を明示的に実行
+        self.h = int(past_horizon)
+        self.jitter = float(jitter)  # **追加**: 明示的なfloat変換
+        self.cond_thresh = float(cond_thresh)  # **追加**: 明示的なfloat変換
+        
+        # rank処理
+        if rank is not None:
+            self.rank = int(rank)  # **修正**: 明示的なint変換
+        else:
+            self.rank = rank
+            
+        self.reg_type = str(reg_type)  # **追加**: 明示的なstr変換
+        
+        # 初期化
         self.B = None
         self._L_vals = None
 
@@ -73,8 +82,8 @@ class Realization:
         rank   = self.rank      # 低ランク近似の次数
         # eps_chol   = 1e-7
         # eps_jitter = 1e-10
-        eps_chol   = self.jitter
-        eps_jitter = self.jitter
+        eps_chol   = float(self.jitter)
+        eps_jitter = float(self.jitter)
         q_over     = 5
 
         # 1. ── ラグ共分散 (バッチ外積, float32) -----------------

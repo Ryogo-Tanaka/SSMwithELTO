@@ -121,6 +121,7 @@ class tcnEncoder(nn.Module):
     1. output_dim=1 をデフォルトに（スカラー特徴量生成）
     2. 中心化処理の追加（弱定常性向上）
     3. 出力の一貫性チェック
+    4. **新機能**: type パラメータの処理追加
     
     変換フロー:
       (B, T, d) --permute--> (B, d, T)
@@ -130,6 +131,7 @@ class tcnEncoder(nn.Module):
         --center--> (B, T, p) [中心化]
     
     Args:
+      type:        エンコーダタイプ（"tcn"等、ファクトリーパターン対応）
       input_dim:   d (観測次元)
       output_dim:  p=1 (スカラー特徴量、デフォルト)
       channels:    C (隠れ次元)
@@ -141,14 +143,22 @@ class tcnEncoder(nn.Module):
     """
     def __init__(self,
                  input_dim: int,
-                 output_dim: int = 1,  # **修正**: デフォルトを1に
+                 type: Optional[str] = None,  # **追加**: ファクトリーパターン対応
+                 output_dim: int = 1,
                  channels: int = 64,
                  layers: int = 6,
                  kernel_size: int = 3,
                  activation: str = "GELU",
                  dropout: float = 0.0,
-                 center_output: bool = True):  # **新機能**: 中心化オプション
+                 center_output: bool = True,
+                 **kwargs):  # **追加**: 未知のパラメータを受け取る
         super().__init__()
+        
+        # **新機能**: type パラメータの検証
+        if type is not None and type != "tcn":
+            raise ValueError(f"tcnEncoder は type='tcn' のみサポート。指定値: {type}")
+        
+        self.encoder_type = type or "tcn"  # **追加**: タイプ情報保存
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.channels = channels
@@ -177,6 +187,7 @@ class tcnEncoder(nn.Module):
             nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
+
 
     # ---------- stateless forward (batch) ----------
     def forward(self, y: torch.Tensor) -> torch.Tensor:
@@ -374,6 +385,7 @@ class tcnDecoder(nn.Module):
         Merge: H = H_S + H_T
         Output: y_hat = Linear(d_h -> n)  # [B, T, n]
     Args:
+      type:        デコーダタイプ（"tcn"等、ファクトリーパターン対応）
       output_dim:  n   (dimension of reconstructed observation)
       window:      l   (Takens window length)
       tau:         τ   (delay step)
@@ -385,14 +397,22 @@ class tcnDecoder(nn.Module):
     """
     def __init__(self,
                  output_dim: int,
+                 type: Optional[str] = None,  # **追加**: ファクトリーパターン対応
                  window: int = 8,
                  tau: int = 1,
                  hidden: int = 64,
                  ma_kernel: int = 64,
                  gru_hidden: int = 64,
                  activation: str = "GELU",
-                 dropout: float = 0.0):
+                 dropout: float = 0.0,
+                 **kwargs):  # **追加**: 未知のパラメータを受け取る
         super().__init__()
+        
+        # **新機能**: type パラメータの検証
+        if type is not None and type != "tcn":
+            raise ValueError(f"tcnDecoder は type='tcn' のみサポート。指定値: {type}")
+        
+        self.decoder_type = type or "tcn"  # **追加**: タイプ情報保存
         self.output_dim = output_dim
         self.window = window
         self.tau = tau

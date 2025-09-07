@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # _tests/test_integration.py
 """
-提案手法の統合テスト
+提案手法の統合テスト（修正後実装対応版）
+
+修正内容:
+- TwoStageTrainerクラスに対応
+- 新しいDF-A/DF-B APIに対応
+- Phase-1/Phase-2学習フローに対応
+- 詳細な動作確認機能追加
 
 実行方法:
   cd SSMwithELTO
@@ -44,7 +50,7 @@ def check_dependencies():
             print(f"✗ {module}")
     
     if missing:
-        print(f"\n❌ 不足モジュール: {missing}")
+        print(f"❌ 不足モジュール: {missing}")
         print("pip install torch numpy pyyaml matplotlib pandas で解決できます")
         return False
     
@@ -72,7 +78,7 @@ def check_project_structure():
             print(f"✗ {path.relative_to(PROJECT_ROOT)}")
     
     if missing_paths:
-        print(f"\n❌ 不足パス: {[str(p.relative_to(PROJECT_ROOT)) for p in missing_paths]}")
+        print(f"❌ 不足パス: {[str(p.relative_to(PROJECT_ROOT)) for p in missing_paths]}")
         return False
     
     print("✓ プロジェクト構造OK")
@@ -115,7 +121,7 @@ def generate_synthetic_data(config: Dict[str, Any]) -> torch.Tensor:
     return Y
 
 def test_individual_components(config: Dict[str, Any], Y: torch.Tensor, verbose: bool = True) -> Dict[str, bool]:
-    """個別コンポーネントのテスト"""
+    """個別コンポーネントのテスト（修正後実装対応）"""
     results = {}
     
     if verbose:
@@ -126,12 +132,10 @@ def test_individual_components(config: Dict[str, Any], Y: torch.Tensor, verbose:
         from src.models.architectures.tcn import tcnEncoder
         encoder = tcnEncoder(**config['model']['encoder'])
         
-        Y_batch = Y.unsqueeze(0)
-        m_output = encoder(Y_batch)
-        m_series = m_output.squeeze()
-        
-        if m_series.dim() == 2 and m_series.size(1) == 1:
-            m_series = m_series.squeeze(1)
+        # 修正: 3次元入力に対応
+        Y_batch = Y.unsqueeze(0)  # (T, d) -> (1, T, d)
+        m_output = encoder(Y_batch)  # (1, T, 1)
+        m_series = m_output.squeeze()  # (T,)
         
         results['encoder'] = True
         if verbose:
@@ -149,7 +153,7 @@ def test_individual_components(config: Dict[str, Any], Y: torch.Tensor, verbose:
         from src.ssm.realization import Realization
         realization = Realization(**config['ssm']['realization'])
         
-        m_input = m_series.unsqueeze(1) if m_series.dim() == 1 else m_series
+        m_input = m_series.unsqueeze(1)  # (T,) -> (T, 1)
         realization.fit(m_input)
         X_states = realization.filter(m_input)
         
@@ -198,10 +202,10 @@ def test_individual_components(config: Dict[str, Any], Y: torch.Tensor, verbose:
             **config['ssm']['df_observation']
         )
         
-        # 簡単な予測テスト
+        # 状態予測を取得
         X_hat_states = df_state.predict_sequence(X_states)
         
-        optimizer_psi = torch.optim.Adam(df_obs.psi_omega.parameters(), lr=1e-3)
+        optimizer_phi = torch.optim.Adam(df_state.phi_theta.parameters(), lr=1e-3)
         metrics = df_obs.train_stage1_with_gradients(
             X_hat_states, m_series, optimizer_phi, fix_psi_omega=True
         )
@@ -236,17 +240,17 @@ def test_individual_components(config: Dict[str, Any], Y: torch.Tensor, verbose:
     
     return results
 
-def test_integration_pipeline(config_path: str, quick: bool = False, verbose: bool = True) -> bool:
-    """統合パイプラインテスト"""
+def test_two_stage_trainer(config_path: str, quick: bool = False, verbose: bool = True) -> bool:
+    """TwoStageTrainerを用いた統合テスト"""
     if verbose:
-        print("\n=== 統合パイプラインテスト ===")
+        print("\n=== TwoStageTrainer統合テスト ===")
     
     try:
         # 設定読み込み
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
         
-        # クイックモードでは更に短縮
+        # クイックモード設定
         if quick:
             config['training']['phase1_epochs'] = 2
             config['training']['phase2_epochs'] = 2
@@ -256,7 +260,7 @@ def test_integration_pipeline(config_path: str, quick: bool = False, verbose: bo
         # データ生成
         Y = generate_synthetic_data(config)
         
-        # 個別テスト
+        # 個別テスト実行
         component_results = test_individual_components(config, Y, verbose)
         
         failed_components = [k for k, v in component_results.items() if not v]
@@ -265,9 +269,9 @@ def test_integration_pipeline(config_path: str, quick: bool = False, verbose: bo
                 print(f"✗ 失敗コンポーネント: {failed_components}")
             return False
         
-        # 完全統合テスト
+        # TwoStageTrainer統合テスト
         if verbose:
-            print("\n--- 完全統合テスト ---")
+            print("\n--- TwoStageTrainer統合テスト ---")
         
         from src.training.two_stage_trainer import TwoStageTrainer, TrainingConfig
         from src.models.architectures.tcn import tcnEncoder, tcnDecoder
@@ -313,7 +317,7 @@ def test_integration_pipeline(config_path: str, quick: bool = False, verbose: bo
                     df_b_loss = final_metrics.get('df_b_stage1_loss', 'N/A')
                     print(f"  最終損失 - DF-A: {df_a_loss}, DF-B: {df_b_loss}")
             
-            # Phase-2学習（クイックモードでは省略）
+            # Phase-2学習（クイックモードでは省略可能）
             if not quick:
                 if verbose:
                     print("Phase-2学習実行中...")
@@ -348,11 +352,105 @@ def test_integration_pipeline(config_path: str, quick: bool = False, verbose: bo
                 traceback.print_exc()
         return False
 
+def test_learning_flow_analysis(config_path: str, verbose: bool = True) -> bool:
+    """学習フローの詳細分析テスト"""
+    if verbose:
+        print("\n=== 学習フロー分析テスト ===")
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # 小規模設定
+        config['training']['phase1_epochs'] = 3
+        config['training']['phase2_epochs'] = 2
+        
+        Y = generate_synthetic_data(config)
+        
+        from src.training.two_stage_trainer import TwoStageTrainer, TrainingConfig
+        from src.models.architectures.tcn import tcnEncoder, tcnDecoder
+        from src.ssm.realization import Realization
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # モデル・トレーナー初期化
+            encoder = tcnEncoder(**config['model']['encoder'])
+            decoder = tcnDecoder(**config['model']['decoder'])
+            realization = Realization(**config['ssm']['realization'])
+            training_config = TrainingConfig(**config['training'])
+            
+            trainer = TwoStageTrainer(
+                encoder=encoder,
+                decoder=decoder,
+                realization=realization,
+                df_state_config=config['ssm']['df_state'],
+                df_obs_config=config['ssm']['df_observation'],
+                training_config=training_config,
+                device=torch.device('cpu'),
+                output_dir=temp_dir
+            )
+            
+            # 時間対応デバッグモード有効化
+            trainer.enable_time_alignment_debug()
+            
+            # Phase-1の詳細分析
+            if verbose:
+                print("Phase-1詳細分析実行中...")
+            
+            phase1_results = trainer.train_phase1(Y)
+            
+            # 学習履歴分析
+            if phase1_results:
+                # 損失推移分析
+                df_a_losses = [m.get('df_a_stage1_loss') for m in phase1_results if 'df_a_stage1_loss' in m]
+                df_b_losses = [m.get('df_b_stage1_loss') for m in phase1_results if 'df_b_stage1_loss' in m]
+                
+                if verbose:
+                    print(f"✓ DF-A損失推移: {len(df_a_losses)}個のエポック")
+                    if df_a_losses:
+                        print(f"  初期損失: {df_a_losses[0]:.4f} -> 最終損失: {df_a_losses[-1]:.4f}")
+                    
+                    print(f"✓ DF-B損失推移: {len(df_b_losses)}個のエポック")
+                    if df_b_losses:
+                        print(f"  初期損失: {df_b_losses[0]:.4f} -> 最終損失: {df_b_losses[-1]:.4f}")
+            
+            # Phase-2分析
+            if verbose:
+                print("Phase-2詳細分析実行中...")
+            
+            phase2_results = trainer.train_phase2(Y)
+            
+            if phase2_results:
+                total_losses = [r['total_loss'] for r in phase2_results]
+                rec_losses = [r['rec_loss'] for r in phase2_results]
+                
+                if verbose:
+                    print(f"✓ Phase-2損失推移: {len(total_losses)}個のエポック")
+                    if total_losses:
+                        print(f"  総損失: {total_losses[0]:.4f} -> {total_losses[-1]:.4f}")
+                        print(f"  再構成損失: {rec_losses[0]:.4f} -> {rec_losses[-1]:.4f}")
+            
+            # 学習サマリ取得
+            summary = trainer.get_training_summary()
+            if verbose:
+                print(f"✓ 学習サマリ取得完了")
+                print(f"  学習完了: {summary['training_complete']}")
+                print(f"  総パラメータ数: {sum(summary['model_info'].values())}")
+        
+        return True
+        
+    except Exception as e:
+        if verbose:
+            print(f"✗ 学習フロー分析エラー: {e}")
+            traceback.print_exc()
+        return False
+
 def main():
-    parser = argparse.ArgumentParser(description="提案手法統合テスト")
+    """メイン実行関数"""
+    parser = argparse.ArgumentParser(description="提案手法統合テスト（修正後実装対応版）")
     parser.add_argument('--quick', action='store_true', help='高速テスト（短縮版）')
     parser.add_argument('--full', action='store_true', help='完全テスト')
     parser.add_argument('--debug', action='store_true', help='デバッグモード（詳細出力）')
+    parser.add_argument('--analysis', action='store_true', help='学習フロー分析テスト')
     parser.add_argument('--config', type=str, default='_tests/test_config.yaml', 
                        help='設定ファイルパス')
     args = parser.parse_args()
@@ -369,9 +467,11 @@ def main():
         print("🚀 高速テストモード")
     elif args.full:
         print("🎯 完全テストモード")
+    elif args.analysis:
+        print("📊 学習フロー分析モード")
     
-    print("提案手法 統合テスト開始")
-    print("=" * 50)
+    print("提案手法 統合テスト開始（修正後実装対応版）")
+    print("=" * 60)
     
     # 依存関係チェック
     if not check_dependencies():
@@ -393,19 +493,26 @@ def main():
     
     print(f"📋 設定ファイル: {config_path.relative_to(PROJECT_ROOT)}")
     
-    # 統合テスト実行
+    # テスト実行
     try:
-        success = test_integration_pipeline(str(config_path), args.quick, verbose)
+        success = True
         
-        print("\n" + "=" * 50)
+        # 基本統合テスト
+        if args.analysis:
+            success = test_learning_flow_analysis(str(config_path), verbose)
+        else:
+            success = test_two_stage_trainer(str(config_path), args.quick, verbose)
+        
+        print("\n" + "=" * 60)
         if success:
             print("🎉 統合テスト成功！")
-            print("本格実験の準備ができました。")
+            print("修正後実装の基本動作確認完了。")
             
             if args.quick:
                 print("\n次のステップ:")
-                print("  python _tests/test_integration.py --full  # 完全テスト")
-                print("  python main_two_stage.py --config configs/config_two_stage_experiment.yaml --data data/sim_complex.npz --output results/exp1")
+                print("  python _tests/test_integration.py --full     # 完全テスト")
+                print("  python _tests/test_integration.py --analysis # 学習フロー分析")
+                print("  python main_two_stage.py --config configs/config_two_stage_experiment.yaml")
             
             return 0
         else:

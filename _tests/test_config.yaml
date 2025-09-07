@@ -1,5 +1,5 @@
 # _tests/test_config.yaml
-# 統合テスト用最小設定
+# 統合テスト用設定（修正後実装対応版）
 
 model:
   encoder:
@@ -11,7 +11,7 @@ model:
     kernel_size: 3
     activation: "GELU"
     dropout: 0.0
-    center_output: true
+    center_output: true   # 中心化有効（弱定常性向上）
 
   decoder:
     type: "tcn"
@@ -81,8 +81,8 @@ training:
 
 # テスト用実験設定
 experiment:
-  name: "integration_test"
-  description: "統合テスト用最小設定"
+  name: "integration_test_v2"
+  description: "統合テスト用設定（修正後実装対応版）"
   seed: 42
 
 # デバッグ設定
@@ -90,3 +90,4 @@ debug:
   save_intermediate: false
   profile_training: false
   continue_on_error: false
+  time_alignment_debug: true  # 時間対応デバッグ
