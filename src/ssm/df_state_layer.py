@@ -109,8 +109,8 @@ class DFStateLayer:
             feature_net_config: StateFeatureNetの設定
             cross_fitting_config: CrossFittingManagerの設定
         """
-        self.state_dim = state_dim
-        self.feature_dim = feature_dim
+        self.state_dim = int(state_dim)
+        self.feature_dim = int(feature_dim)
         self.lambda_A = lambda_A
         self.lambda_B = lambda_B
         
@@ -155,6 +155,7 @@ class DFStateLayer:
             torch.Tensor: 転送作用素 V (d_A, d_A)
         """
         N, d_A = X_features.shape
+        N, d_A = int(N), int(d_A)
         
         if N < d_A:
             warnings.warn(f"サンプル数 {N} < 特徴次元 {d_A}。数値不安定の可能性")
@@ -365,6 +366,7 @@ class DFStateLayer:
             Dict[str, float]: 損失メトリクス
         """
         T, r = X_states.shape
+        T, r = int(T), int(r)
         
         if r != self.state_dim:
             raise ValueError(f"状態次元不一致: expected {self.state_dim}, got {r}")
@@ -500,7 +502,7 @@ class DFStateLayer:
         verbose: bool
     ):
         """クロスフィッティング付き学習"""
-        T_eff = Phi_minus.size(0)  # T-1
+        T_eff = int(Phi_minus.size(0))  # T-1)
         
         # クロスフィッティング管理
         cf_manager = CrossFittingManager(T_eff, **self.cf_config)
