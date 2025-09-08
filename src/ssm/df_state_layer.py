@@ -135,6 +135,8 @@ class DFStateLayer:
         self._stage2_cache = {}  # U_A計算結果をキャッシュ
         self._cf_manager: Optional[CrossFittingManager] = None  # クロスフィッティング管理
     
+
+    
     def _ridge_stage1(
         self, 
         X_features: torch.Tensor, 
@@ -145,22 +147,27 @@ class DFStateLayer:
         Stage-1 Ridge回帰: 転送作用素推定
         
         V = (Y^T X)(X^T X + λI)^{-1}
-        
-        Args:
-            X_features: 入力特徴量 Φ^-_{-k} (N, d_A)
-            Y_targets: 目的特徴量 Φ^+_{-k} (N, d_A)  
-            reg_lambda: 正則化パラメータ λ_A
-            
-        Returns:
-            torch.Tensor: 転送作用素 V (d_A, d_A)
         """
+
         N, d_A = X_features.shape
-        N, d_A = int(N), int(d_A)
+        N_t, d_A_t = Y_targets.shape
+        
+        # 明示的な型変換を追加
+        N = int(N.item() if hasattr(N, 'item') else N)
+        d_A = int(d_A.item() if hasattr(d_A, 'item') else d_A)
+        N_t = int(N_t.item() if hasattr(N_t, 'item') else N_t)
+        d_A_t = int(d_A_t.item() if hasattr(d_A_t, 'item') else d_A_t)
+        
+        if N != N_t:
+            raise ValueError(f"特徴量とターゲットのサンプル数不一致: {N} vs {N_t}")
+        
+        if d_A != d_A_t:
+            raise ValueError(f"特徴量とターゲットの次元不一致: {d_A} vs {d_A_t}")
         
         if N < d_A:
             warnings.warn(f"サンプル数 {N} < 特徴次元 {d_A}。数値不安定の可能性")
         
-        # グラム行列 + 正則化
+        # グラム行列 + 正則化（d_Aは確実にint）
         XtX = X_features.T @ X_features  # (d_A, d_A)
         XtX_reg = XtX + reg_lambda * torch.eye(d_A, device=X_features.device, dtype=X_features.dtype)
         

@@ -87,6 +87,33 @@ class TrainingConfig:
     log_interval: int = 1    # ログ出力間隔（エポック）
     save_interval: int = 10  # モデル保存間隔（エポック）
     verbose: bool = True     # 詳細ログ
+    
+    def __post_init__(self):
+        """初期化後の型変換と検証"""
+        # 数値型の確実な変換（YAML読み込み対策）
+        self.phase1_epochs = int(self.phase1_epochs)
+        self.T1_iterations = int(self.T1_iterations)
+        self.T2_iterations = int(self.T2_iterations)
+        self.df_a_warmup_epochs = int(self.df_a_warmup_epochs)
+        self.phase2_epochs = int(self.phase2_epochs)
+        self.log_interval = int(self.log_interval)
+        self.save_interval = int(self.save_interval)
+        
+        # 学習率の型変換
+        self.lr_phi = float(self.lr_phi)
+        self.lr_psi = float(self.lr_psi)
+        self.lr_encoder = float(self.lr_encoder)
+        self.lr_decoder = float(self.lr_decoder)
+        self.lambda_cca = float(self.lambda_cca)
+        
+        # 文字列型の正規化
+        self.update_strategy = str(self.update_strategy)
+        
+        # 真偽値の変換（"true"/"false"文字列対策）
+        if isinstance(self.verbose, str):
+            self.verbose = self.verbose.lower() in ('true', '1', 'yes', 'on')
+        else:
+            self.verbose = bool(self.verbose)
 
 
 class TrainingLogger:
