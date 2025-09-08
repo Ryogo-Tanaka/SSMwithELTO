@@ -273,7 +273,7 @@ class DFStateLayer:
     
     def _compute_crossfit_stage1_loss(
         self, 
-        X_states: torch.Tensor,
+        X_states: torch.Tensor, 
         use_simple_fallback: bool = False
     ) -> torch.Tensor:
         """
@@ -284,7 +284,7 @@ class DFStateLayer:
             use_simple_fallback: 簡易版を使用するかどうか
             
         Returns:
-            torch.Tensor: Stage-1損失
+            torch.Tensor: Stage-1損失（スカラー）
         """
         T, r = X_states.shape
         
@@ -303,6 +303,10 @@ class DFStateLayer:
             V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
             phi_pred = (V_A @ phi_minus.T).T
             loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2
+            
+            # **追加**: 非クロスフィッティング用キャッシュクリア
+            self._stage1_cache.pop('V_A_list', None)
+            self._stage1_cache.pop('cf_manager', None)
         else:
             # **修正**: 真のクロスフィッティング実装
             cf_manager = self._initialize_cross_fitting(T_eff)
@@ -312,29 +316,34 @@ class DFStateLayer:
                 V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
                 phi_pred = (V_A @ phi_minus.T).T
                 loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2
+                
+                # **追加**: 非クロスフィッティング用キャッシュクリア
+                self._stage1_cache.pop('V_A_list', None)
+                self._stage1_cache.pop('cf_manager', None)
             else:
                 # クロスフィッティングによる損失計算
                 cf_fitter = TwoStageCrossFitter(cf_manager)
                 
-                # Stage-1: V_A^{(-k)} 推定
-                V_list = cf_fitter.cross_fit_stage1(
-                    phi_minus, phi_plus,
-                    self._ridge_stage1,
-                    reg_lambda=self.lambda_A
-                )
+                # Stage-1: V_A^{(-k)} 推定（勾配なし）
+                with torch.no_grad():
+                    V_list = cf_fitter.cross_fit_stage1(
+                        phi_minus, phi_plus,  # **修正**: detach()削除
+                        self._ridge_stage1,
+                        reg_lambda=self.lambda_A
+                    )
                 
-                # Out-of-fold予測誤差の計算
+                # Out-of-fold予測誤差の計算（勾配あり）
                 total_loss = 0.0
                 for k in range(cf_manager.n_blocks):
                     # ブロックkのインデックス
                     block_indices = cf_manager.get_block_indices(k)
                     
-                    # ブロックkでの予測
-                    phi_minus_k = phi_minus[block_indices]
-                    phi_plus_k = phi_plus[block_indices]
+                    # ブロックkでの予測（勾配あり）
+                    phi_minus_k = phi_minus[block_indices]  # 勾配あり
+                    phi_plus_k = phi_plus[block_indices]    # 勾配あり
                     
                     # V_A^{(-k)}による予測
-                    V_k = V_list[k]
+                    V_k = V_list[k]  # 勾配なし（detach済み）
                     phi_pred_k = (V_k @ phi_minus_k.T).T
                     
                     # ブロックkの損失
@@ -354,11 +363,11 @@ class DFStateLayer:
         self,
         X_states: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
-        T1_iterations: int = 8,  # **追加**: T1反復数パラメータ
+        T1_iterations: int = 8,
         use_cross_fitting: bool = True
     ) -> Dict[str, float]:
         """
-        **修正版**: Stage-1学習 + ϕ_θ勾配更新（クロスフィッティング対応）
+        **完全修正版**: Stage-1学習 + ϕ_θ勾配更新（クロスフィッティング対応）
         
         資料の学習戦略に対応:
         for t = 1 to T1:  # Stage-1
@@ -368,10 +377,11 @@ class DFStateLayer:
         Args:
             X_states: 状態系列 (T, r)
             optimizer_phi: ϕ_θ用オプティマイザ
+            T1_iterations: T1反復数
             use_cross_fitting: クロスフィッティングを使用するかどうか
             
         Returns:
-            Dict[str, float]: 損失メトリクス
+            Dict[str, float]: 損失メトリクス（TwoStageTrainer互換）
         """
         T, r = X_states.shape
         T, r = int(T), int(r)
@@ -401,7 +411,7 @@ class DFStateLayer:
             loss_history.append(loss_stage1.item())
             total_loss += loss_stage1.item()
         
-        # Stage-2用データ準備（detach で計算グラフ切断）
+        # **重要**: Stage-2用データ準備（detach で計算グラフ切断）
         with torch.no_grad():
             phi_seq = self.phi_theta(X_states)
             phi_minus = phi_seq[:-1]
@@ -414,11 +424,12 @@ class DFStateLayer:
             V_A = self._ridge_stage1(phi_minus, phi_seq[1:], self.lambda_A)
             self._stage1_cache['V_A'] = V_A.detach()
         
+        # **修正**: 完全な戻り値（TwoStageTrainer互換）
         return {
             'stage1_loss': total_loss / T1_iterations,
             'loss_history': loss_history,
             'iterations_completed': T1_iterations
-        }
+    }
     
     def train_stage2_closed_form(self) -> Dict[str, float]:
         """

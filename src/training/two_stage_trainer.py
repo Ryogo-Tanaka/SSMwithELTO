@@ -114,6 +114,45 @@ class TrainingConfig:
             self.verbose = self.verbose.lower() in ('true', '1', 'yes', 'on')
         else:
             self.verbose = bool(self.verbose)
+    
+    @classmethod
+    def from_nested_dict(cls, config_dict: Dict[str, Any]) -> 'TrainingConfig':
+        """
+        ネスト構造の設定辞書からTrainingConfigを作成
+        デフォルト値は@dataclassの定義から自動取得
+        """
+        import dataclasses
+        
+        flattened = {}
+        
+        # フラット化処理
+        def flatten_dict(d: Dict[str, Any], prefix: str = ""):
+            for key, value in d.items():
+                new_key = f"{prefix}{key}" if prefix else key
+                if isinstance(value, dict):
+                    flatten_dict(value, f"{new_key}_")
+                else:
+                    flattened[new_key] = value
+        
+        flatten_dict(config_dict)
+        
+        # dataclassのフィールド情報からデフォルト値を取得
+        field_info = {f.name: f for f in dataclasses.fields(cls)}
+        
+        config_args = {}
+        for field_name, field in field_info.items():
+            if field_name in flattened:
+                # 設定ファイルに値がある場合
+                config_args[field_name] = flattened[field_name]
+            elif field.default is not dataclasses.MISSING:
+                # dataclassでデフォルト値が定義されている場合
+                config_args[field_name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                # default_factoryが定義されている場合
+                config_args[field_name] = field.default_factory()
+            # else: デフォルト値がない必須フィールドは設定ファイルに依存
+        
+        return cls(**config_args)
 
 
 class TrainingLogger:
@@ -1028,13 +1067,25 @@ def create_trainer_from_config(config_path: str, device: torch.device, output_di
     decoder = tcnDecoder(**config['model']['decoder'])
     realization = Realization(**config['ssm']['realization'])
     
-    # 学習設定
+    # 学習設定の作成（改善版）
+    training_config = None
+    training_dict = config.get('training', {})
+    
+    # まず直接作成を試行
     try:
-        training_config = TrainingConfig(**config['training'])
+        training_config = TrainingConfig(**training_dict)
     except (TypeError, ValueError) as e:
-        # ネスト構造の場合のフォールバック
-        print(f"標準設定読み込み失敗 ({e}), ネスト構造を試行")
-        training_config = TrainingConfig.from_nested_dict(config['training'])
+        print(f"直接設定読み込み失敗: {e}")
+        
+        # ネスト構造対応を試行
+        try:
+            training_config = TrainingConfig.from_nested_dict(training_dict)
+        except Exception as e2:
+            print(f"ネスト構造読み込みも失敗: {e2}")
+            
+            # デフォルト設定で作成
+            print("デフォルト設定を使用します")
+            training_config = TrainingConfig()
     
     # トレーナー作成
     trainer = TwoStageTrainer(
