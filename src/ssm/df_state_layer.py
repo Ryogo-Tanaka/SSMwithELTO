@@ -354,6 +354,7 @@ class DFStateLayer:
         self,
         X_states: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
+        T1_iterations: int = 8,  # **追加**: T1反復数パラメータ
         use_cross_fitting: bool = True
     ) -> Dict[str, float]:
         """
@@ -381,18 +382,26 @@ class DFStateLayer:
         if T < 2:
             raise ValueError(f"時系列が短すぎます: T={T}")
         
-        # **修正**: クロスフィッティング対応の損失計算
-        loss_stage1 = self._compute_crossfit_stage1_loss(
-            X_states, 
-            use_simple_fallback=not use_cross_fitting
-        )
+        total_loss = 0.0
+        loss_history = []
         
-        # ϕ_θ 更新
-        optimizer_phi.zero_grad()
-        loss_stage1.backward()
-        optimizer_phi.step()
+        # **修正**: T1回の反復実行（定式化準拠）
+        for iteration in range(T1_iterations):
+            # 各反復で新しい計算グラフを作成
+            loss_stage1 = self._compute_crossfit_stage1_loss(
+                X_states, 
+                use_simple_fallback=not use_cross_fitting
+            )
+            
+            # 勾配計算・更新
+            optimizer_phi.zero_grad()
+            loss_stage1.backward()
+            optimizer_phi.step()
+            
+            loss_history.append(loss_stage1.item())
+            total_loss += loss_stage1.item()
         
-        # **修正**: 後続のStage-2で使用するデータをキャッシュ
+        # Stage-2用データ準備（detach で計算グラフ切断）
         with torch.no_grad():
             phi_seq = self.phi_theta(X_states)
             phi_minus = phi_seq[:-1]
@@ -401,17 +410,15 @@ class DFStateLayer:
             self._stage1_cache['phi_minus'] = phi_minus.detach()
             self._stage1_cache['X_plus'] = X_plus.detach()
             
-            # 最新のV_Aを計算（Stage-2で使用）
-            if 'V_A_list' in self._stage1_cache:
-                # クロスフィッティング使用時：平均転送作用素
-                V_A_list = self._stage1_cache['V_A_list']
-                self._stage1_cache['V_A'] = torch.stack(V_A_list).mean(dim=0).detach()
-            else:
-                # 非クロスフィッティング時：直接計算
-                V_A = self._ridge_stage1(phi_minus, phi_seq[1:], self.lambda_A)
-                self._stage1_cache['V_A'] = V_A.detach()
+            # 最新のV_A計算
+            V_A = self._ridge_stage1(phi_minus, phi_seq[1:], self.lambda_A)
+            self._stage1_cache['V_A'] = V_A.detach()
         
-        return {'stage1_loss': loss_stage1.item()}
+        return {
+            'stage1_loss': total_loss / T1_iterations,
+            'loss_history': loss_history,
+            'iterations_completed': T1_iterations
+        }
     
     def train_stage2_closed_form(self) -> Dict[str, float]:
         """
@@ -599,16 +606,33 @@ class DFStateLayer:
         Returns:
             torch.Tensor: 予測状態 (r,) または (batch, r)
         """
-        if not self._is_fitted:
-            # **修正**: キャッシュされた結果も使用可能に
-            if 'V_A' in self._stage1_cache and 'U_A' in self._stage2_cache:
-                V_A = self._stage1_cache['V_A']
-                U_A = self._stage2_cache['U_A']
-            else:
-                raise RuntimeError("学習が完了していません")
-        else:
+        V_A = None
+        U_A = None
+        
+        if self._is_fitted:
+            # 完全学習済み
             V_A = self.V_A
             U_A = self.U_A
+        elif 'V_A' in self._stage1_cache and 'U_A' in self._stage2_cache:
+            # Phase-1学習済み
+            V_A = self._stage1_cache['V_A']
+            U_A = self._stage2_cache['U_A']
+        elif 'V_A' in self._stage1_cache:
+            # **新規**: Stage-1のみ完了の場合の対応
+            V_A = self._stage1_cache['V_A']
+            # 簡易的なU_A推定
+            if 'phi_minus' in self._stage1_cache and 'X_plus' in self._stage1_cache:
+                with torch.no_grad():
+                    phi_minus = self._stage1_cache['phi_minus']
+                    X_plus = self._stage1_cache['X_plus']
+                    H_simple = (V_A @ phi_minus.T).T
+                    U_A = self._ridge_stage2(H_simple, X_plus, self.lambda_B)
+                    # キャッシュに保存
+                    self._stage2_cache['U_A'] = U_A.detach()
+            else:
+                raise RuntimeError("Stage-1は完了していますが、Stage-2実行に必要なデータが不足しています")
+        else:
+            raise RuntimeError("学習が完了していません。fit_two_stage() または train_stage1_with_gradients() を先に実行してください")
         
         # 特徴写像
         phi_prev = self.phi_theta(x_prev)

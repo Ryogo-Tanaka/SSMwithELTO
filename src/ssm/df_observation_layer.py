@@ -295,6 +295,7 @@ class DFObservationLayer:
         X_hat_states: torch.Tensor,
         m_features: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
+        T1_iterations: int = 8,  # **追加**: T1反復数パラメータ
         fix_psi_omega: bool = True
     ) -> Dict[str, float]:
         """
@@ -313,57 +314,65 @@ class DFObservationLayer:
         Returns:
             Dict[str, float]: 損失メトリクス
         """
+        """Stage-1学習: T1回の反復でφ_θを更新（ψ_ω固定）"""
         if not self.df_state._is_fitted and 'V_A' not in self.df_state._stage1_cache:
             raise RuntimeError("DF-Aが学習済みである必要があります")
         
-        # **修正**: ψ_ω パラメータの完全固定
+        # ψ_ω パラメータの完全固定
         psi_original_states = {}
         if fix_psi_omega:
             psi_original_states = self._freeze_parameters(self.psi_omega)
         
         try:
-            # 時間合わせ
-            T_x = X_hat_states.size(0)  # T-1
-            m_curr = m_features[1:T_x+1]  # (T-1,)
+            total_loss = 0.0
+            loss_history = []
             
-            # 観測特徴量の計算
-            if fix_psi_omega:
-                # パラメータ固定済みなので、通常の前向き計算
-                psi_curr = self.psi_omega(m_curr.unsqueeze(1))  # (T-1, d_B)
-            else:
-                # ψ_ω の勾配も計算
-                psi_curr = self.psi_omega(m_curr.unsqueeze(1))  # (T-1, d_B)
+            # **修正**: T1回の反復実行（定式化準拠）
+            for iteration in range(T1_iterations):
+                # 時間合わせ
+                T_x = X_hat_states.size(0)
+                m_curr = m_features[1:T_x+1]
+                
+                # 観測特徴量の計算（ψ_ω固定）
+                psi_curr = self.psi_omega(m_curr.unsqueeze(1))
+                
+                # φ_θ 勾配ありで操作変数特徴量計算
+                phi_prev = self.phi_theta(X_hat_states)
+                
+                # V_B 推定
+                V_B = self._ridge_stage1_vb(phi_prev, psi_curr, self.lambda_B)
+                
+                # Stage-1 損失
+                psi_pred = (V_B @ phi_prev.T).T
+                loss_stage1 = torch.norm(psi_pred - psi_curr, p='fro') ** 2
+                
+                # φ_θ 更新
+                optimizer_phi.zero_grad()
+                loss_stage1.backward()
+                
+                # **修正**: 固定されたパラメータの勾配をゼロクリア（安全のため）
+                if fix_psi_omega:
+                    for param in self.psi_omega.parameters():
+                        if param.grad is not None:
+                            param.grad.zero_()
+                
+                optimizer_phi.step()
+                
+                loss_history.append(loss_stage1.item())
+                total_loss += loss_stage1.item()
             
-            # φ_θ 勾配ありで操作変数特徴量計算
-            phi_prev = self.phi_theta(X_hat_states)  # (T-1, d_A)
-            
-            # V_B 推定
-            V_B = self._ridge_stage1_vb(phi_prev, psi_curr, self.lambda_B)
-            
-            # Stage-1 損失: ||Ψ - V_B Φ||_F^2
-            psi_pred = (V_B @ phi_prev.T).T  # (T-1, d_B)
-            loss_stage1 = torch.norm(psi_pred - psi_curr, p='fro') ** 2
-            
-            # φ_θ 更新（ψ_ω は固定済み）
-            optimizer_phi.zero_grad()
-            loss_stage1.backward()
-            
-            # **修正**: 固定されたパラメータの勾配をゼロクリア（安全のため）
-            if fix_psi_omega:
-                for param in self.psi_omega.parameters():
-                    if param.grad is not None:
-                        param.grad.zero_()
-            
-            optimizer_phi.step()
-            
-            # V_B をキャッシュ（Stage-2で使用）
+            # V_B をキャッシュ（detach で計算グラフ切断）
             self._stage1_cache['V_B'] = V_B.detach()
             self._stage1_cache['phi_prev'] = phi_prev.detach()
             
-            return {'stage1_loss': loss_stage1.item()}
+            return {
+                'stage1_loss': total_loss / T1_iterations,
+                'loss_history': loss_history,
+                'iterations_completed': T1_iterations
+            }
             
         finally:
-            # **修正**: ψ_ω パラメータの復元
+            # ψ_ω パラメータの復元
             if fix_psi_omega and psi_original_states:
                 self._restore_parameters(self.psi_omega, psi_original_states)
         

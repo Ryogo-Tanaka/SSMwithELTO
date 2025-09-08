@@ -449,32 +449,26 @@ class TwoStageTrainer:
         return self.training_history['phase1_metrics']
     
     def _train_df_a_epoch(self, X_states: torch.Tensor, epoch: int) -> Dict[str, float]:
-        """
-        DF-A（状態層）のエポック学習
-        
-        Stage-1: V_A推定 + φ_θ更新を T1 回反復
-        Stage-2: U_A推定を T2 回実行（閉形式解のみ）
-        """
+        """DF-A（状態層）のエポック学習（定式化準拠）"""
         metrics = {}
         opt_phi = self.optimizers['phi']
         
-        # Stage-1: V_A推定 + φ_θ更新反復
-        stage1_losses = []
-        for t in range(self.config.T1_iterations):
-            stage1_metrics = self.df_state.train_stage1_with_gradients(
-                X_states, opt_phi
-            )
-            stage1_losses.append(stage1_metrics['stage1_loss'])
-            
-            # ログ記録
-            self.logger.log_phase1(
-                epoch, TrainingPhase.PHASE1_DF_A, 'stage1', t,
-                stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
-            )
+        # **修正**: Stage-1を1回だけ呼び出し、内部でT1反復
+        stage1_metrics = self.df_state.train_stage1_with_gradients(
+            X_states, 
+            opt_phi,
+            T1_iterations=self.config.T1_iterations  # **修正**: 設定から取得
+        )
         
-        metrics['df_a_stage1_loss'] = sum(stage1_losses) / len(stage1_losses)
+        metrics['df_a_stage1_loss'] = stage1_metrics['stage1_loss']
         
-        # Stage-2: U_A推定（閉形式解のみ）
+        # ログ記録（T1回分をまとめて記録）
+        self.logger.log_phase1(
+            epoch, TrainingPhase.PHASE1_DF_A, 'stage1', 0,
+            stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
+        )
+        
+        # Stage-2: U_A推定（T2回実行）
         stage2_losses = []
         for t in range(self.config.T2_iterations):
             stage2_metrics = self.df_state.train_stage2_closed_form()
@@ -491,36 +485,32 @@ class TwoStageTrainer:
         return metrics
     
     def _train_df_b_epoch(self, X_states: torch.Tensor, m_series: torch.Tensor, epoch: int) -> Dict[str, float]:
-        """
-        DF-B（観測層）のエポック学習
-        
-        Stage-1: V_B推定 + φ_θ更新を T1 回反復（ψ_ω固定）
-        Stage-2: u_B推定 + ψ_ω更新を T2 回反復（φ_θ固定）
-        """
+        """DF-B（観測層）のエポック学習（定式化準拠）"""
         metrics = {}
         opt_phi = self.optimizers['phi']
         opt_psi = self.optimizers['psi']
         
         # DF-Aからの状態予測を取得
-        X_hat_states = self.df_state.predict_sequence(X_states)  # (T-1, r)
+        X_hat_states = self.df_state.predict_sequence(X_states)
         
-        # Stage-1: V_B推定 + φ_θ更新（ψ_ω固定）
-        stage1_losses = []
-        for t in range(self.config.T1_iterations):
-            stage1_metrics = self.df_obs.train_stage1_with_gradients(
-                X_hat_states, m_series, opt_phi, fix_psi_omega=True
-            )
-            stage1_losses.append(stage1_metrics['stage1_loss'])
-            
-            # ログ記録
-            self.logger.log_phase1(
-                epoch, TrainingPhase.PHASE1_DF_B, 'stage1', t,
-                stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
-            )
+        # **修正**: Stage-1を1回だけ呼び出し、内部でT1反復
+        stage1_metrics = self.df_obs.train_stage1_with_gradients(
+            X_hat_states, 
+            m_series, 
+            opt_phi, 
+            T1_iterations=self.config.T1_iterations,  # **修正**: 設定から取得
+            fix_psi_omega=True
+        )
         
-        metrics['df_b_stage1_loss'] = sum(stage1_losses) / len(stage1_losses)
+        metrics['df_b_stage1_loss'] = stage1_metrics['stage1_loss']
         
-        # Stage-2: u_B推定 + ψ_ω更新（φ_θ固定）
+        # ログ記録
+        self.logger.log_phase1(
+            epoch, TrainingPhase.PHASE1_DF_B, 'stage1', 0,
+            stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
+        )
+        
+        # Stage-2: u_B推定 + ψ_ω更新（T2回反復）
         stage2_losses = []
         for t in range(self.config.T2_iterations):
             stage2_metrics = self.df_obs.train_stage2_with_gradients(
@@ -1039,7 +1029,12 @@ def create_trainer_from_config(config_path: str, device: torch.device, output_di
     realization = Realization(**config['ssm']['realization'])
     
     # 学習設定
-    training_config = TrainingConfig(**config['training'])
+    try:
+        training_config = TrainingConfig(**config['training'])
+    except (TypeError, ValueError) as e:
+        # ネスト構造の場合のフォールバック
+        print(f"標準設定読み込み失敗 ({e}), ネスト構造を試行")
+        training_config = TrainingConfig.from_nested_dict(config['training'])
     
     # トレーナー作成
     trainer = TwoStageTrainer(
