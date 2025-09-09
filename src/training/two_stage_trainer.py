@@ -41,6 +41,7 @@ for epoch in Phase2:
   (u_η, g_α, ϕ_θ, ψ_ω).backward()
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Dict, Any, Optional, List, Tuple
@@ -630,7 +631,7 @@ class TwoStageTrainer:
         
         loss_total = loss_rec + self.config.lambda_cca * loss_cca
         
-        return loss_total, rec_loss, loss_cca
+        return loss_total, loss_rec, loss_cca
     
     def _handle_short_timeseries_phase2(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """短い時系列用のフォールバック処理"""
