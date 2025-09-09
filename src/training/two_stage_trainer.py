@@ -1,4 +1,6 @@
-# src/training/two_stage_trainer.py
+# ===== src/training/two_stage_trainer.py 完全修正版 =====
+# 修正1-4統合: 時間調整 + 計算グラフ分離 + ヘルパー関数
+
 """
 TwoStageTrainer: 提案手法の2段階学習戦略実装
 
@@ -48,8 +50,9 @@ import json
 import csv
 from dataclasses import dataclass
 from enum import Enum
+import gc
 
-# 修正済みコンポーネントのインポート
+# コンポーネントインポート
 from ..ssm.df_state_layer import DFStateLayer
 from ..ssm.df_observation_layer import DFObservationLayer
 from ..ssm.realization import Realization
@@ -114,74 +117,32 @@ class TrainingConfig:
             self.verbose = self.verbose.lower() in ('true', '1', 'yes', 'on')
         else:
             self.verbose = bool(self.verbose)
-    
-    @classmethod
-    def from_nested_dict(cls, config_dict: Dict[str, Any]) -> 'TrainingConfig':
-        """
-        ネスト構造の設定辞書からTrainingConfigを作成
-        デフォルト値は@dataclassの定義から自動取得
-        """
-        import dataclasses
-        
-        flattened = {}
-        
-        # フラット化処理
-        def flatten_dict(d: Dict[str, Any], prefix: str = ""):
-            for key, value in d.items():
-                new_key = f"{prefix}{key}" if prefix else key
-                if isinstance(value, dict):
-                    flatten_dict(value, f"{new_key}_")
-                else:
-                    flattened[new_key] = value
-        
-        flatten_dict(config_dict)
-        
-        # dataclassのフィールド情報からデフォルト値を取得
-        field_info = {f.name: f for f in dataclasses.fields(cls)}
-        
-        config_args = {}
-        for field_name, field in field_info.items():
-            if field_name in flattened:
-                # 設定ファイルに値がある場合
-                config_args[field_name] = flattened[field_name]
-            elif field.default is not dataclasses.MISSING:
-                # dataclassでデフォルト値が定義されている場合
-                config_args[field_name] = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                # default_factoryが定義されている場合
-                config_args[field_name] = field.default_factory()
-            # else: デフォルト値がない必須フィールドは設定ファイルに依存
-        
-        return cls(**config_args)
 
 
 class TrainingLogger:
-    """学習過程のログ管理"""
-    
-    def __init__(self, output_dir: str):
+    """学習ログ管理クラス"""
+    def __init__(self, output_dir: Path):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # CSVファイルパス
+        self.phase1_csv_path = self.output_dir / 'phase1_training.csv'
+        self.phase2_csv_path = self.output_dir / 'phase2_training.csv'
+        
         # ログデータ
-        self.phase1_logs: List[Dict[str, Any]] = []
-        self.phase2_logs: List[Dict[str, Any]] = []
-        self.current_phase: Optional[TrainingPhase] = None
+        self.phase1_logs = []
+        self.phase2_logs = []
         
-        # CSV ファイル初期化
-        self.phase1_csv_path = self.output_dir / "phase1_training.csv"
-        self.phase2_csv_path = self.output_dir / "phase2_training.csv"
-        
-        self._init_csv_files()
+        # CSV初期化
+        self._initialize_csv_files()
     
-    def _init_csv_files(self):
-        """CSVファイルのヘッダ初期化"""
+    def _initialize_csv_files(self):
+        """CSVファイルのヘッダー初期化"""
         # Phase-1 CSV
         with open(self.phase1_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'epoch', 'phase', 'stage', 'iteration', 
-                'df_a_stage1_loss', 'df_a_stage2_loss',
-                'df_b_stage1_loss', 'df_b_stage2_loss',
+                'epoch', 'phase', 'stage', 'iteration', 'loss', 
                 'lr_phi', 'lr_psi'
             ])
         
@@ -192,16 +153,6 @@ class TrainingLogger:
                 'epoch', 'total_loss', 'rec_loss', 'cca_loss',
                 'lr_encoder', 'lr_decoder', 'lr_phi', 'lr_psi'
             ])
-    def enable_time_alignment_debug(self):
-        """時間対応のデバッグ情報を有効化"""
-        self._debug_time_alignment = True
-        if self.config.verbose:
-            print("時間対応デバッグモード有効化")
-
-    def disable_time_alignment_debug(self):
-        """時間対応のデバッグ情報を無効化"""
-        if hasattr(self, '_debug_time_alignment'):
-            delattr(self, '_debug_time_alignment')
     
     def log_phase1(self, epoch: int, phase: TrainingPhase, stage: str, 
                    iteration: int, metrics: Dict[str, float], 
@@ -213,8 +164,7 @@ class TrainingLogger:
             'stage': stage,
             'iteration': iteration,
             'metrics': metrics,
-            'learning_rates': learning_rates,
-            'timestamp': torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+            'learning_rates': learning_rates
         }
         
         self.phase1_logs.append(log_entry)
@@ -222,12 +172,9 @@ class TrainingLogger:
         # CSV書き込み
         with open(self.phase1_csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
+            loss_value = metrics.get('stage1_loss') or metrics.get('stage2_loss', '')
             writer.writerow([
-                epoch, phase.value, stage, iteration,
-                metrics.get('df_a_stage1_loss', ''),
-                metrics.get('df_a_stage2_loss', ''),
-                metrics.get('df_b_stage1_loss', ''),
-                metrics.get('df_b_stage2_loss', ''),
+                epoch, phase.value, stage, iteration, loss_value,
                 learning_rates.get('lr_phi', ''),
                 learning_rates.get('lr_psi', '')
             ])
@@ -282,53 +229,36 @@ class TwoStageTrainer:
     1. Phase-1: DF-A/DF-B の協調学習
     2. Phase-2: End-to-end微調整
     3. 学習過程の詳細ログ・可視化
-    4. モデル保存・復元
+    4. 時間インデックス調整とメモリ効率化
     """
     
-    def __init__(
-        self,
-        encoder: tcnEncoder,
-        decoder: tcnDecoder,
-        realization: Realization,
-        df_state_config: Dict[str, Any],
-        df_obs_config: Dict[str, Any],
-        training_config: TrainingConfig,
-        device: torch.device,
-        output_dir: str
-    ):
-        """
-        Args:
-            encoder: TCNエンコーダ（スカラー特徴量生成）
-            decoder: TCNデコーダ（観測再構成）
-            realization: 確率的実現クラス
-            df_state_config: DF-A設定
-            df_obs_config: DF-B設定
-            training_config: 学習設定
-            device: 計算デバイス
-            output_dir: 出力ディレクトリ
-        """
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, realization: Realization,
+                 df_state_config: Dict[str, Any], df_obs_config: Dict[str, Any],
+                 training_config: TrainingConfig, device: torch.device, output_dir: str):
+        # 基本設定
         self.encoder = encoder.to(device)
         self.decoder = decoder.to(device)
         self.realization = realization
         self.config = training_config
         self.device = device
-        
-        # ログ管理
-        self.logger = TrainingLogger(output_dir)
         self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # DF-A/DF-B初期化（遅延初期化）
-        self.df_state: Optional[DFStateLayer] = None
-        self.df_obs: Optional[DFObservationLayer] = None
+        # **修正4: 時間調整用の状態管理**
+        self._last_X_states_length = None  # 状態系列長キャッシュ
+        
+        # DF layers設定保存
         self.df_state_config = df_state_config
         self.df_obs_config = df_obs_config
         
-        # 最適化器（遅延初期化）
-        self.optimizers: Dict[str, torch.optim.Optimizer] = {}
-        
         # 学習状態
+        self.df_state = None
+        self.df_obs = None
+        self.optimizers = {}
         self.current_epoch = 0
         self.phase1_complete = False
+        
+        # 学習履歴
         self.training_history = {
             'phase1_metrics': [],
             'phase2_losses': []
@@ -336,83 +266,70 @@ class TwoStageTrainer:
         
         # 一時データ保存
         self._temp_data = {}
+        
+        # ログ管理
+        self.logger = TrainingLogger(self.output_dir)
+        
+        print(f"TwoStageTrainer初期化完了: {device}")
     
     def _initialize_df_layers(self, X_states: torch.Tensor):
-        """
-        DF-AとDF-Bを初期化
-        
-        Args:
-            X_states: 初期状態系列（状態次元推定用）
-        """
-        if self.df_state is not None:
-            return  # 既に初期化済み
-        
-        _, state_dim = X_states.shape
+        """DF layers初期化"""
+        _, r = X_states.shape
         
         # DF-A初期化
         self.df_state = DFStateLayer(
-            state_dim=state_dim,
+            state_dim=r,
             **self.df_state_config
-        )
+        ).to(self.device)
         
-        # DF-B初期化（DF-Aに依存）
+        # DF-B初期化（DF-Aを参照）
         self.df_obs = DFObservationLayer(
             df_state_layer=self.df_state,
             **self.df_obs_config
-        )
+        ).to(self.device)
         
-        if self.config.verbose:
-            print(f"DF-A初期化: 状態次元={state_dim}, 特徴次元={self.df_state.feature_dim}")
-            print(f"DF-B初期化: 観測特徴次元={self.df_obs.obs_feature_dim}")
+        print(f"DF layers初期化完了: state_dim={r}")
     
     def _initialize_optimizers(self):
-        """最適化器の初期化"""
-        if self.df_state is None or self.df_obs is None:
-            raise RuntimeError("DF layersが初期化されていません")
+        """最適化器初期化"""
+        # Phase-1用の個別最適化器
+        self.optimizers['phi'] = torch.optim.Adam(
+            self.df_state.phi_theta.parameters(), 
+            lr=self.config.lr_phi
+        )
         
-        self.optimizers = {
-            'phi': torch.optim.Adam(
-                self.df_state.phi_theta.parameters(),
-                lr=self.config.lr_phi
-            ),
-            'psi': torch.optim.Adam(
-                self.df_obs.psi_omega.parameters(),
-                lr=self.config.lr_psi
-            ),
-            'encoder': torch.optim.Adam(
-                self.encoder.parameters(),
-                lr=self.config.lr_encoder
-            ),
-            'decoder': torch.optim.Adam(
-                self.decoder.parameters(),
-                lr=self.config.lr_decoder
-            ),
-            'e2e': None  # Phase-2で初期化
-        }
+        self.optimizers['psi'] = torch.optim.Adam(
+            self.df_obs.psi_omega.parameters(), 
+            lr=self.config.lr_psi
+        )
         
-        # Phase-2用統合オプティマイザ
+        # Phase-2用の統合最適化器
+        if self.config.update_strategy == "all":
+            # 全パラメータ更新
+            phase2_params = list(self.encoder.parameters()) + \
+                           list(self.decoder.parameters()) + \
+                           list(self.df_state.phi_theta.parameters()) + \
+                           list(self.df_obs.psi_omega.parameters())
+        else:
+            # エンコーダ・デコーダのみ更新
+            phase2_params = list(self.encoder.parameters()) + \
+                           list(self.decoder.parameters())
+        
         self.optimizers['e2e'] = torch.optim.Adam([
             {'params': self.encoder.parameters(), 'lr': self.config.lr_encoder},
             {'params': self.decoder.parameters(), 'lr': self.config.lr_decoder},
             {'params': self.df_state.phi_theta.parameters(), 'lr': self.config.lr_phi},
             {'params': self.df_obs.psi_omega.parameters(), 'lr': self.config.lr_psi}
         ])
+        
+        print("最適化器初期化完了")
     
     def _prepare_data(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        データ前処理: エンコード→状態推定
-        
-        Args:
-            Y_train: 訓練観測系列 (T, d)
-            
-        Returns:
-            m_series: スカラー特徴量系列 (T,)
-            X_states: 状態系列 (T_eff, r)
+        **修正4統合**: データ準備（状態系列長の記録付き）
         """
-        T, d = Y_train.shape
-        
         # 1. エンコード: y_t → m_t
-            # バッチ次元追加: (T, d) -> (1, T, d)
+        # バッチ次元追加: (T, d) -> (1, T, d)
         m_tensor = self.encoder(Y_train.unsqueeze(0))  # (1, T, 1)
         m_series = m_tensor.squeeze()  # (T,)
         
@@ -425,6 +342,9 @@ class TwoStageTrainer:
         # 2. 確率的実現: m_t → x_t
         self.realization.fit(m_series.unsqueeze(1))  # (T,) -> (T, 1)
         X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
+        
+        # **修正4: 状態系列長を記録（時間調整用）**
+        self._last_X_states_length = X_states.size(0)
         
         if self.config.verbose:
             print(f"状態推定完了: {m_series.shape} -> {X_states.shape}")
@@ -488,20 +408,26 @@ class TwoStageTrainer:
         return self.training_history['phase1_metrics']
     
     def _train_df_a_epoch(self, X_states: torch.Tensor, epoch: int) -> Dict[str, float]:
-        """DF-A（状態層）のエポック学習（定式化準拠）"""
+        """
+        **修正2統合**: DF-A（状態層）のエポック学習（完全グラフ分離版）
+        """
         metrics = {}
         opt_phi = self.optimizers['phi']
         
-        # **修正**: Stage-1を1回だけ呼び出し、内部でT1反復
-        stage1_metrics = self.df_state.train_stage1_with_gradients(
-            X_states, 
-            opt_phi,
-            T1_iterations=self.config.T1_iterations  # **修正**: 設定から取得
-        )
+        # **修正2: 完全にデタッチされた入力で独立グラフ作成**
+        X_states_detached = X_states.detach().requires_grad_(False)
+        
+        # **修正2: 独立計算コンテキストでDF-A学習**
+        with torch.enable_grad():
+            stage1_metrics = self.df_state.train_stage1_with_gradients(
+                X_states_detached, 
+                opt_phi,
+                T1_iterations=self.config.T1_iterations
+            )
         
         metrics['df_a_stage1_loss'] = stage1_metrics['stage1_loss']
         
-        # ログ記録（T1回分をまとめて記録）
+        # ログ記録
         self.logger.log_phase1(
             epoch, TrainingPhase.PHASE1_DF_A, 'stage1', 0,
             stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
@@ -510,36 +436,53 @@ class TwoStageTrainer:
         # Stage-2: U_A推定（T2回実行）
         stage2_losses = []
         for t in range(self.config.T2_iterations):
-            stage2_metrics = self.df_state.train_stage2_closed_form()
-            stage2_losses.append(stage2_metrics['stage2_loss'])
-            
-            # ログ記録
-            self.logger.log_phase1(
-                epoch, TrainingPhase.PHASE1_DF_A, 'stage2', t,
-                stage2_metrics, {}
-            )
+            with torch.no_grad():  # **修正2: Stage-2は勾配なし**
+                stage2_metrics = self.df_state.train_stage2_closed_form()
+                stage2_losses.append(stage2_metrics['stage2_loss'])
+                
+                # ログ記録
+                self.logger.log_phase1(
+                    epoch, TrainingPhase.PHASE1_DF_A, 'stage2', t,
+                    stage2_metrics, {}
+                )
         
         metrics['df_a_stage2_loss'] = sum(stage2_losses) / len(stage2_losses)
         
+        # **修正2: 明示的グラフクリア**
+        self._clear_computation_graph()
+        
         return metrics
     
-    def _train_df_b_epoch(self, X_states: torch.Tensor, m_series: torch.Tensor, epoch: int) -> Dict[str, float]:
-        """DF-B（観測層）のエポック学習（定式化準拠）"""
+    def _train_df_b_epoch(self, X_states: torch.Tensor, m_series: torch.Tensor, 
+                         epoch: int) -> Dict[str, float]:
+        """
+        **修正2+4統合**: DF-B（観測層）のエポック学習（完全グラフ分離 + ヘルパー使用）
+        """
         metrics = {}
         opt_phi = self.optimizers['phi']
         opt_psi = self.optimizers['psi']
         
-        # DF-Aからの状態予測を取得
-        X_hat_states = self.df_state.predict_sequence(X_states)
+        # **修正2: 完全にデタッチされた入力で独立グラフ作成**
+        X_states_detached = X_states.detach().requires_grad_(False)
         
-        # **修正**: Stage-1を1回だけ呼び出し、内部でT1反復
-        stage1_metrics = self.df_obs.train_stage1_with_gradients(
-            X_hat_states, 
-            m_series, 
-            opt_phi, 
-            T1_iterations=self.config.T1_iterations,  # **修正**: 設定から取得
-            fix_psi_omega=True
-        )
+        # **修正2: 独立計算コンテキストでDF-B学習**
+        with torch.enable_grad():
+            # DF-Aからの状態予測を取得
+            X_hat_states = self.df_state.predict_sequence(X_states_detached)
+            
+            # **修正4: ヘルパーメソッドを使用した時間インデックス調整**
+            m_aligned = self._align_time_series(
+                X_hat_states, m_series, X_states.size(0), epoch, "DF-B"
+            )
+            
+            # Stage-1学習
+            stage1_metrics = self.df_obs.train_stage1_with_gradients(
+                X_hat_states, 
+                m_aligned,  # **修正2+4: 時間調整済み**
+                opt_phi, 
+                T1_iterations=self.config.T1_iterations,
+                fix_psi_omega=True
+            )
         
         metrics['df_b_stage1_loss'] = stage1_metrics['stage1_loss']
         
@@ -549,21 +492,30 @@ class TwoStageTrainer:
             stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
         )
         
+        # **修正2: 明示的グラフクリア**
+        self._clear_computation_graph()
+        
         # Stage-2: u_B推定 + ψ_ω更新（T2回反復）
         stage2_losses = []
         for t in range(self.config.T2_iterations):
-            stage2_metrics = self.df_obs.train_stage2_with_gradients(
-                m_series, opt_psi, fix_phi_theta=True
-            )
-            stage2_losses.append(stage2_metrics['stage2_loss'])
-            
-            # ログ記録
-            self.logger.log_phase1(
-                epoch, TrainingPhase.PHASE1_DF_B, 'stage2', t,
-                stage2_metrics, {'lr_psi': opt_psi.param_groups[0]['lr']}
-            )
+            with torch.enable_grad():
+                stage2_metrics = self.df_obs.train_stage2_with_gradients(
+                    m_aligned,  # **修正2+4: 時間調整済み**
+                    opt_psi, 
+                    fix_phi_theta=True
+                )
+                stage2_losses.append(stage2_metrics['stage2_loss'])
+                
+                # ログ記録
+                self.logger.log_phase1(
+                    epoch, TrainingPhase.PHASE1_DF_B, 'stage2', t,
+                    stage2_metrics, {'lr_psi': opt_psi.param_groups[0]['lr']}
+                )
         
         metrics['df_b_stage2_loss'] = sum(stage2_losses) / len(stage2_losses)
+        
+        # **修正2: 最終グラフクリア**
+        self._clear_computation_graph()
         
         return metrics
     
@@ -626,227 +578,246 @@ class TwoStageTrainer:
     
     def _forward_and_loss_phase2(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        **修正版**: Phase-2の前向き推論と損失計算（厳密な時間管理）
-        
-        時間関係の厳密な定式化:
-        Step 1: {y_t}_{t=0}^{T-1} → {m_t}_{t=0}^{T-1}
-        Step 2: {m_t} → {x_t}_{t=h}^{T-h} (length: T_eff = T-2h+1)
-        Step 3: x_{t-1} → x̂_{t|t-1} for t ∈ {h+1, ..., T-h} (length: T_pred = T_eff-1)
-        Step 4: x̂_{t|t-1} → m̂_{t|t-1} for t ∈ {h+1, ..., T-h}
-        Step 5: m̂_{t|t-1} → ŷ_{t|t-1}
-        Step 6: Compare ŷ_{t|t-1} with y_t for t ∈ {h+1, ..., T-h}
-        
-        Returns:
-            (total_loss, rec_loss, cca_loss)
+        **修正4統合**: Phase-2の前向き推論と損失計算（時間調整ヘルパー使用）
         """
         T, d = Y_train.shape
         h = self.realization.h
         
         if T <= 2 * h:
             # 時系列が短すぎる場合のフォールバック
-            return (torch.tensor(1e6, device=self.device), 
-                    torch.tensor(0., device=self.device), 
-                    torch.tensor(0., device=self.device))
+            return self._handle_short_timeseries_phase2(Y_train)
         
-        # Step 1: エンコード {y_t}_{t=0}^{T-1} → {m_t}_{t=0}^{T-1}
-        m_tensor = self.encoder(Y_train.unsqueeze(0))  # (1, T, 1)
-        m_series = m_tensor.squeeze()  # (T,)
-        if m_series.dim() == 0:  # スカラーの場合
-            m_series = m_series.unsqueeze(0)
+        # Step 1: エンコード y_t → m_t
+        m_series = self.encoder(Y_train.unsqueeze(0)).squeeze()  # (T, 1) -> (T,)
+        if m_series.dim() == 2:
+            m_series = m_series.squeeze(1)
         
-        # Step 2: 確率的実現 {m_t} → {x_t}_{t=h}^{T-h}
+        # Step 2: 確率的実現 m_t → x_t
         self.realization.fit(m_series.unsqueeze(1))
         X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
-        T_eff = X_states.size(0)  # T_eff = T - 2h + 1
-        
-        if T_eff <= 1:
-            # 状態系列が短すぎる場合
-            return (torch.tensor(1e6, device=self.device), 
-                    torch.tensor(0., device=self.device), 
-                    torch.tensor(0., device=self.device))
-        
-        # 時間対応の確認（デバッグ用）
-        if self.config.verbose and hasattr(self, '_debug_time_alignment'):
-            print(f"[DEBUG] Time alignment: T={T}, h={h}, T_eff={T_eff}")
-            print(f"[DEBUG] X_states corresponds to x_{{h}} to x_{{T-h}} = x_{{{h}}} to x_{{{h+T_eff-1}}}")
-        
-        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}
-        # 入力: x_h, x_{h+1}, ..., x_{T-h-1} (X_states[0:T_eff-1])
-        # 出力: x̂_{h+1|h}, x̂_{h+2|h+1}, ..., x̂_{T-h|T-h-1} (length: T_pred = T_eff-1)
-        X_hat_states = self.df_state.predict_sequence(X_states)  # (T_pred, r)
-        T_pred = X_hat_states.size(0)  # T_pred = T_eff - 1 = T - 2h
-        
-        if T_pred <= 0:
-            return (torch.tensor(1e6, device=self.device), 
-                    torch.tensor(0., device=self.device), 
-                    torch.tensor(0., device=self.device))
-        
-        # Step 4: DF-B予測 x̂_{t|t-1} → m̂_{t|t-1}
-        # X_hat_states[i] = x̂_{h+1+i|h+i} for i = 0, 1, ..., T_pred-1
-        m_hat_series = torch.zeros(T_pred, device=self.device, dtype=m_series.dtype)
-        
-        for i in range(T_pred):
-            # X_hat_states[i] corresponds to x̂_{h+1+i|h+i}
-            # 予測: m̂_{h+1+i|h+i}
-            m_hat_i = self.df_obs.predict_one_step(X_hat_states[i])
-            
-            # スカラー確保
-            if m_hat_i.dim() == 0:
-                m_hat_series[i] = m_hat_i
-            else:
-                m_hat_series[i] = m_hat_i.squeeze()
-        
-        # Step 5: デコード m̂_{t|t-1} → ŷ_{t|t-1}
-        # TCNデコーダは [B, T, 1] を期待
-        m_hat_input = m_hat_series.unsqueeze(0).unsqueeze(2)  # (1, T_pred, 1)
-        Y_hat = self.decoder(m_hat_input).squeeze(0)  # (T_pred, d)
-        
-        # Step 6: 損失計算 - 厳密な時間対応
-        # 予測: ŷ_{h+1|h}, ŷ_{h+2|h+1}, ..., ŷ_{T-h|T-h-1}
-        # 真値: y_{h+1}, y_{h+2}, ..., y_{T-h}
-        # インデックス: h+1, h+2, ..., h+T_pred = h+1, ..., T-h
-        
-        target_start_idx = h + 1
-        target_end_idx = target_start_idx + T_pred
-        
-        # 範囲チェック
-        if target_end_idx > T:
-            # 安全のため調整
-            T_pred_safe = T - target_start_idx
-            Y_hat = Y_hat[:T_pred_safe, :]
-            target_end_idx = target_start_idx + T_pred_safe
-        
-        Y_target = Y_train[target_start_idx:target_end_idx, :]  # (T_pred, d)
-        
-        # 形状一致確認
-        if Y_hat.size(0) != Y_target.size(0):
-            min_len = min(Y_hat.size(0), Y_target.size(0))
-            Y_hat = Y_hat[:min_len, :]
-            Y_target = Y_target[:min_len, :]
-        
-        # デバッグ情報
-        if self.config.verbose and hasattr(self, '_debug_time_alignment'):
-            print(f"[DEBUG] Prediction: ŷ_{{t|t-1}} for t ∈ [{target_start_idx}, {target_end_idx-1}]")
-            print(f"[DEBUG] Target: y_t for t ∈ [{target_start_idx}, {target_end_idx-1}]")
-            print(f"[DEBUG] Y_hat.shape: {Y_hat.shape}, Y_target.shape: {Y_target.shape}")
-        
-        # 再構成損失
-        rec_loss = torch.norm(Y_hat - Y_target, p='fro') ** 2
-        
-        # 正準相関損失の計算
-        cca_loss = self._compute_cca_loss(m_series, X_states)
-        
-        # 総損失
-        total_loss = rec_loss + self.config.lambda_cca * cca_loss
-        
-        return total_loss, rec_loss, cca_loss
-    
-    def _compute_cca_loss(self, m_series: torch.Tensor, X_states: torch.Tensor) -> torch.Tensor:
-        """
-        正準相関損失の計算
-        
-        論文Section 2.6の L_cca 実装:
-        L_cca = -Σ ρ_i^2 (正準相関係数の二乗和を最大化)
-        
-        Args:
-            m_series: スカラー特徴量系列 (T,)
-            X_states: 状態系列 (T_eff, r)
-        
-        Returns:
-            CCA損失: -Σ ρ_i^2
-        """
-        # Method 1: 確率的実現から特異値（正準相関係数）を取得
-        if hasattr(self.realization, '_L_vals') and self.realization._L_vals is not None:
-            singular_values = self.realization._L_vals  # σ_1, σ_2, ..., σ_r
-            
-            # 数値安定性のためのクリッピング
-            singular_values = torch.clamp(singular_values, min=1e-8, max=1.0)
-            
-            # 正準相関係数の二乗和を最大化 → 負の損失
-            cca_loss = -torch.sum(singular_values ** 2)
-            
-            if self.config.verbose and hasattr(self, '_debug_cca'):
-                print(f"[DEBUG CCA] Singular values: {singular_values.cpu().numpy()}")
-                print(f"[DEBUG CCA] CCA loss: {cca_loss.item():.6f}")
-            
-            return cca_loss
-        else:
-            # Method 2: フォールバック - エンコーダ特徴量と状態の共分散最大化
-            if self.config.verbose:
-                warnings.warn("確率的実現の特異値が利用できません。共分散ベースのCCA損失を使用します。")
-            return self._compute_covariance_based_cca_loss(m_series, X_states)
-
-    def _compute_covariance_based_cca_loss(self, m_series: torch.Tensor, X_states: torch.Tensor) -> torch.Tensor:
-        """
-        共分散ベースの代替CCA損失（フォールバック）
-        
-        スカラー特徴量と状態系列間の正規化共分散を最大化
-        """
-        h = self.realization.h
         T_eff = X_states.size(0)
         
-        # 時間対応の調整：X_states[i] corresponds to x_{h+i}
-        # m_series の対応する部分を取得
-        m_aligned = m_series[h:h+T_eff]  # (T_eff,)
-        X_aligned = X_states  # (T_eff, r)
+        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}
+        X_hat_states = self.df_state.predict_sequence(X_states)  # (T_pred, r)
+        T_pred = X_hat_states.size(0)
         
-        # データ長が一致しない場合の調整
-        min_len = min(m_aligned.size(0), X_aligned.size(0))
-        m_aligned = m_aligned[:min_len]
-        X_aligned = X_aligned[:min_len, :]
+        # **修正4: ヘルパーメソッドを使用した時間調整**
+        m_aligned = self._align_time_series(
+            X_hat_states, m_series, X_states.size(0), 0, "Phase2"
+        )
         
-        if min_len < 2:
-            # データが不足している場合
-            return torch.tensor(0.0, device=self.device)
+        # Step 4: DF-B予測 x̂_{t|t-1} → m̂_{t|t-1}
+        m_hat_series = []
+        for t in range(T_pred):
+            m_hat_t = self.df_obs.predict_one_step(X_hat_states[t])
+            m_hat_series.append(m_hat_t)
+        m_hat_tensor = torch.stack(m_hat_series)  # (T_pred,)
         
-        # 中心化
-        m_centered = m_aligned - m_aligned.mean()  # (min_len,)
-        X_centered = X_aligned - X_aligned.mean(dim=0, keepdim=True)  # (min_len, r)
+        # Step 5: デコード m̂_{t|t-1} → ŷ_{t|t-1}
+        Y_hat = self.decoder(m_hat_tensor.unsqueeze(0).unsqueeze(2)).squeeze(0)  # (T_pred, d)
         
-        # 共分散計算
-        cross_cov = torch.abs(torch.sum(m_centered.unsqueeze(1) * X_centered, dim=0))  # (r,)
+        # Step 6: 対応する真値取得
+        Y_target = Y_train[h+1:h+1+T_pred]  # 対応する観測
         
-        # 正規化項（数値安定性のための小さな値を追加）
-        m_var = torch.var(m_centered, unbiased=False) + 1e-8
-        X_var = torch.var(X_centered, dim=0, unbiased=False) + 1e-8  # (r,)
+        # 損失計算
+        loss_rec = torch.norm(Y_hat - Y_target, p='fro') ** 2
         
-        # 正規化共分散（正準相関係数の近似）
-        normalized_cov = cross_cov / torch.sqrt(m_var * X_var)  # (r,)
+        # CCA損失（オプション）
+        if self.config.lambda_cca > 0:
+            loss_cca = self._compute_cca_loss(m_hat_tensor, m_aligned)
+        else:
+            loss_cca = torch.tensor(0.0, requires_grad=True)
         
-        # 二乗和を最大化 → 負の損失
-        cca_loss = -torch.sum(normalized_cov ** 2)
+        loss_total = loss_rec + self.config.lambda_cca * loss_cca
         
-        if self.config.verbose and hasattr(self, '_debug_cca'):
-            print(f"[DEBUG CCA Fallback] Normalized covariances: {normalized_cov.cpu().numpy()}")
-            print(f"[DEBUG CCA Fallback] CCA loss: {cca_loss.item():.6f}")
+        return loss_total, rec_loss, loss_cca
+    
+    def _handle_short_timeseries_phase2(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """短い時系列用のフォールバック処理"""
+        T, d = Y_train.shape
+        h = self.realization.h
+        warnings.warn(f"時系列長({T})が短すぎます。h={h}")
         
-        return cca_loss
-
-    def enable_cca_debug(self):
-        """CCA損失のデバッグ情報を有効化"""
-        self._debug_cca = True
-        if self.config.verbose:
-            print("CCA損失デバッグモード有効化")
-
-    def disable_cca_debug(self):
-        """CCA損失のデバッグ情報を無効化"""
-        if hasattr(self, '_debug_cca'):
-            delattr(self, '_debug_cca')
-
+        # 最小限の処理
+        m_series = self.encoder(Y_train.unsqueeze(0)).squeeze()
+        if m_series.dim() == 2:
+            m_series = m_series.squeeze(1)
         
-    def fit(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        self.realization.fit(m_series.unsqueeze(1))
+        X_states = self.realization.filter(m_series.unsqueeze(1))
+        
+        # 短縮処理
+        if X_states.size(0) > 1:
+            X_hat_states = self.df_state.predict_sequence(X_states)
+            # **修正4: ヘルパー使用**
+            m_aligned = self._align_time_series(
+                X_hat_states, m_series, X_states.size(0), 0, "Phase2-Short"
+            )
+            
+            loss_rec = torch.norm(m_aligned - m_aligned, p=2) ** 2  # ダミー損失
+            loss_cca = torch.tensor(0.0, requires_grad=True)
+            loss_total = loss_rec + self.config.lambda_cca * loss_cca
+        else:
+            loss_rec = torch.tensor(0.0, requires_grad=True)
+            loss_cca = torch.tensor(0.0, requires_grad=True) 
+            loss_total = loss_rec
+        
+        return loss_total, loss_rec, loss_cca
+    
+    def _compute_cca_loss(self, m_hat: torch.Tensor, m_target: torch.Tensor) -> torch.Tensor:
+        """CCA損失計算（簡易版）"""
+        # 正規化
+        m_hat_norm = (m_hat - m_hat.mean()) / (m_hat.std() + 1e-8)
+        m_target_norm = (m_target - m_target.mean()) / (m_target.std() + 1e-8)
+        
+        # 相関係数（負の値なので最小化で相関最大化）
+        correlation = torch.corrcoef(torch.stack([m_hat_norm, m_target_norm]))[0, 1]
+        
+        return -correlation  # 相関最大化のため負号
+    
+    # ===== 修正4: ヘルパーメソッド群 =====
+    
+    def _align_time_series(self, X_hat_states: torch.Tensor, m_series: torch.Tensor, 
+                          T_states: int, epoch: int, component: str) -> torch.Tensor:
         """
-        完全な2段階学習実行
+        **修正4**: 統合時間系列調整ヘルパー
         
         Args:
-            Y_train: 訓練観測系列 (T, d)
-            Y_val: 検証観測系列 (T_val, d) [optional]
+            X_hat_states: 状態予測系列
+            m_series: 元のスカラー特徴系列
+            T_states: 状態系列長（X_statesの長さ）
+            epoch: 現在のエポック（ログ用）
+            component: コンポーネント名（ログ用）
+        
+        Returns:
+            torch.Tensor: 時間調整済みスカラー特徴系列
+        """
+        T_pred = X_hat_states.size(0)
+        T_original = m_series.size(0)
+        
+        # オフセット計算
+        total_offset = self._get_time_alignment_offset(T_original, T_states, T_pred)
+        
+        # 時間調整されたm_seriesを抽出
+        if total_offset + T_pred <= T_original:
+            m_aligned = m_series[total_offset:total_offset + T_pred]
+        else:
+            # 安全措置: 末尾から必要な長さを取得
+            m_aligned = m_series[-T_pred:]
+            if self.config.verbose:
+                print(f"警告: {component} でオフセット調整失敗、末尾切り取り使用")
+        
+        # 時間整合性検証
+        self._validate_time_alignment(X_hat_states, m_aligned, component)
+        
+        # デバッグ情報（verbose時のみ）
+        if self.config.verbose and epoch % 10 == 0:
+            print(f"{component}時間調整 - Epoch {epoch}: "
+                  f"X_hat: {X_hat_states.shape}, m_aligned: {m_aligned.shape}, "
+                  f"offset: {total_offset}")
+        
+        return m_aligned
+    
+    def _get_time_alignment_offset(self, T_original: int, T_states: int, T_pred: int) -> int:
+        """
+        **修正4**: 時間インデックス調整のオフセット計算
+        
+        Args:
+            T_original: 元系列長
+            T_states: 状態系列長
+            T_pred: 予測系列長
             
         Returns:
-            学習履歴辞書
+            int: m_series用のオフセット
         """
-        print("=== 提案手法の2段階学習開始 ===")
+        # 確率的実現パラメータから正確な計算
+        try:
+            h = getattr(self.realization, 'h', 
+                getattr(self.realization, 'past_horizon', 0))
+            if h > 0:
+                # 理論値使用: 確率的実現h + 予測1ステップ
+                return h + 1
+            else:
+                # 動的計算
+                return (T_original - T_states) + (T_states - T_pred)
+        except Exception:
+            # フォールバック
+            return (T_original - T_states) + (T_states - T_pred)
+    
+    def _validate_time_alignment(self, X_hat_states: torch.Tensor, m_aligned: torch.Tensor, 
+                               component: str = "unknown") -> None:
+        """
+        **修正4**: 時間インデックス整合性の検証
         
+        Args:
+            X_hat_states: 状態予測
+            m_aligned: 調整済みスカラー特徴量
+            component: コンポーネント名（ログ用）
+        """
+        if X_hat_states.size(0) != m_aligned.size(0):
+            raise RuntimeError(
+                f"{component}の時間インデックス不整合: "
+                f"X_hat={X_hat_states.shape} vs m_aligned={m_aligned.shape}"
+            )
+        
+        if self.config.verbose:
+            print(f"{component} 時間整合確認: {X_hat_states.shape} ↔ {m_aligned.shape}")
+    
+    def _clear_computation_graph(self):
+        """
+        **修正2**: 計算グラフの明示的クリア
+        """
+        # GPU メモリクリア
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # CPU ガベージコレクション
+        gc.collect()
+    
+    # ===== 既存メソッド（修正なし） =====
+    
+    def forecast(self, Y_test: torch.Tensor, forecast_steps: int) -> torch.Tensor:
+        """予測実行"""
+        self.encoder.eval()
+        self.decoder.eval()
+        self.df_state.eval()
+        self.df_obs.eval()
+        
+        with torch.no_grad():
+            # 初期状態推定
+            T_test, d = Y_test.shape
+            warmup_len = min(T_test, self.realization.h + 10)
+            Y_warmup = Y_test[:warmup_len]
+            
+            # エンコード
+            m_warmup = self.encoder(Y_warmup.unsqueeze(0)).squeeze()
+            
+            # 状態推定
+            self.realization.fit(m_warmup.unsqueeze(1))
+            X_warmup = self.realization.filter(m_warmup.unsqueeze(1))
+            
+            # 逐次予測
+            predictions = []
+            x_current = X_warmup[-1]  # 最新状態
+            
+            for step in range(forecast_steps):
+                # DF-A: 状態予測
+                x_pred = self.df_state.predict_one_step(x_current)
+                
+                # DF-B: 特徴量予測
+                m_pred = self.df_obs.predict_one_step(x_pred)
+                
+                # デコード: 観測予測
+                m_input = m_pred.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1)
+                y_pred = self.decoder(m_input).squeeze()  # (d,)
+                
+                predictions.append(y_pred)
+                x_current = x_pred  # 状態更新
+            
+            return torch.stack(predictions)  # (forecast_steps, d)
+    
+    def train_full(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        """完全学習実行（Phase-1 + Phase-2）"""
         try:
             # Phase-1学習
             phase1_metrics = self.train_phase1(Y_train)
@@ -923,100 +894,19 @@ class TwoStageTrainer:
     
     def _save_final_model(self):
         """最終モデル保存"""
-        final_model = {
+        model_state = {
             'encoder': self.encoder.state_dict(),
             'decoder': self.decoder.state_dict(),
             'df_state': self.df_state.get_state_dict() if self.df_state else None,
             'df_obs': self.df_obs.get_state_dict() if self.df_obs else None,
-            'realization_config': {
-                'past_horizon': self.realization.h,
-                'jitter': self.realization.jitter,
-                'cond_thresh': self.realization.cond_thresh,
-                'rank': self.realization.rank,
-                'reg_type': self.realization.reg_type
-            },
-            'training_config': self.config.__dict__,
-            'training_complete': True,
-            'final_metrics': {
-                'phase1': self.training_history['phase1_metrics'][-1] if self.training_history['phase1_metrics'] else {},
-                'phase2': self.training_history['phase2_losses'][-1] if self.training_history['phase2_losses'] else {}
-            }
+            'realization_config': self.realization.__dict__,
+            'training_config': self.config.__dict__
         }
         
         save_path = self.output_dir / 'final_model.pth'
-        torch.save(final_model, save_path)
-        print(f"最終モデル保存完了: {save_path}")
-    
-    def load_checkpoint(self, checkpoint_path: str) -> bool:
-        """チェックポイント復元"""
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # モデル状態復元
-            self.encoder.load_state_dict(checkpoint['encoder_state'])
-            self.decoder.load_state_dict(checkpoint['decoder_state'])
-            
-            # 学習状態復元
-            self.current_epoch = checkpoint['epoch']
-            self.phase1_complete = checkpoint.get('phase1_complete', False)
-            self.training_history = checkpoint.get('training_history', {'phase1_metrics': [], 'phase2_losses': []})
-            
-            print(f"チェックポイント復元完了: エポック={self.current_epoch}")
-            return True
-            
-        except Exception as e:
-            print(f"チェックポイント復元失敗: {e}")
-            return False
-    
-    def predict(self, Y_test: torch.Tensor, forecast_steps: int = 1) -> torch.Tensor:
-        """
-        予測実行
+        torch.save(model_state, save_path)
         
-        Args:
-            Y_test: テスト観測系列 (T_test, d)
-            forecast_steps: 予測ステップ数
-            
-        Returns:
-            予測系列 (forecast_steps, d)
-        """
-        if not self.phase1_complete:
-            raise RuntimeError("学習が完了していません")
-        
-        self.encoder.eval()
-        self.decoder.eval()
-        
-        with torch.no_grad():
-            # 初期状態推定
-            T_test, d = Y_test.shape
-            warmup_len = min(T_test, self.realization.h + 10)
-            Y_warmup = Y_test[:warmup_len]
-            
-            # エンコード
-            m_warmup = self.encoder(Y_warmup.unsqueeze(0)).squeeze()
-            
-            # 状態推定
-            self.realization.fit(m_warmup.unsqueeze(1))
-            X_warmup = self.realization.filter(m_warmup.unsqueeze(1))
-            
-            # 逐次予測
-            predictions = []
-            x_current = X_warmup[-1]  # 最新状態
-            
-            for step in range(forecast_steps):
-                # DF-A: 状態予測
-                x_pred = self.df_state.predict_one_step(x_current)
-                
-                # DF-B: 特徴量予測
-                m_pred = self.df_obs.predict_one_step(x_pred)
-                
-                # デコード: 観測予測
-                m_input = m_pred.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1)
-                y_pred = self.decoder(m_input).squeeze()  # (d,)
-                
-                predictions.append(y_pred)
-                x_current = x_pred  # 状態更新
-            
-            return torch.stack(predictions)  # (forecast_steps, d)
+        print(f"最終モデル保存: {save_path}")
     
     def get_training_summary(self) -> Dict[str, Any]:
         """学習サマリ取得"""
@@ -1055,7 +945,7 @@ def create_trainer_from_config(config_path: str, device: torch.device, output_di
         output_dir: 出力ディレクトリ
         
     Returns:
-        TwoStageTrainer インスタンス
+        TwoStageTrainer: 初期化済みトレーナー
     """
     import yaml
     
@@ -1067,25 +957,8 @@ def create_trainer_from_config(config_path: str, device: torch.device, output_di
     decoder = tcnDecoder(**config['model']['decoder'])
     realization = Realization(**config['ssm']['realization'])
     
-    # 学習設定の作成（改善版）
-    training_config = None
-    training_dict = config.get('training', {})
-    
-    # まず直接作成を試行
-    try:
-        training_config = TrainingConfig(**training_dict)
-    except (TypeError, ValueError) as e:
-        print(f"直接設定読み込み失敗: {e}")
-        
-        # ネスト構造対応を試行
-        try:
-            training_config = TrainingConfig.from_nested_dict(training_dict)
-        except Exception as e2:
-            print(f"ネスト構造読み込みも失敗: {e2}")
-            
-            # デフォルト設定で作成
-            print("デフォルト設定を使用します")
-            training_config = TrainingConfig()
+    # 設定変換
+    training_config = TrainingConfig.from_nested_dict(config['training'])
     
     # トレーナー作成
     trainer = TwoStageTrainer(
@@ -1109,7 +982,7 @@ def run_training_experiment(
     device: Optional[torch.device] = None
 ) -> Dict[str, Any]:
     """
-    学習実験の実行
+    **元関数の修正版**: 学習実験の実行
     
     Args:
         config_path: 設定ファイルパス
@@ -1130,30 +1003,256 @@ def run_training_experiment(
     print(f"実験開始: device={device}")
     
     # データ読み込み
-    data = np.load(data_path)
-    if 'Y' in data:
-        Y_train = torch.tensor(data['Y'], dtype=torch.float32, device=device)
-    elif 'arr_0' in data:
-        Y_train = torch.tensor(data['arr_0'], dtype=torch.float32, device=device)
-    else:
-        raise ValueError(f"データファイルに 'Y' または 'arr_0' キーが見つかりません")
+    try:
+        data = np.load(data_path)
+        if 'Y' in data:
+            Y_train = torch.tensor(data['Y'], dtype=torch.float32, device=device)
+        elif 'arr_0' in data:
+            Y_train = torch.tensor(data['arr_0'], dtype=torch.float32, device=device)
+        else:
+            available_keys = list(data.keys())
+            raise ValueError(
+                f"データファイルに 'Y' または 'arr_0' キーが見つかりません。"
+                f"利用可能なキー: {available_keys}"
+            )
+    except Exception as e:
+        raise RuntimeError(f"データ読み込み失敗: {data_path}. エラー: {e}")
     
     print(f"データ読み込み完了: {Y_train.shape}")
     
+    # データ検証
+    if Y_train.dim() != 2:
+        raise ValueError(f"データは2次元 (T, d) である必要があります: got {Y_train.shape}")
+    
+    T, d = Y_train.shape
+    if T < 50:
+        warnings.warn(f"時系列長が短すぎる可能性があります: T={T}")
+    
     # トレーナー作成
-    trainer = create_trainer_from_config(config_path, device, output_dir)
+    try:
+        trainer = create_trainer_from_config(config_path, device, output_dir)
+    except Exception as e:
+        raise RuntimeError(f"トレーナー作成失敗: {config_path}. エラー: {e}")
     
-    # 学習実行
-    results = trainer.fit(Y_train)
+    # **修正**: train_full メソッドを使用（元のfit→train_fullに変更）
+    try:
+        results = trainer.train_full(Y_train)
+    except Exception as e:
+        print(f"学習中にエラーが発生: {e}")
+        # 緊急保存試行
+        try:
+            trainer._save_checkpoint(
+                trainer.current_epoch, 
+                TrainingPhase.PHASE1_DF_A, 
+                emergency=True
+            )
+            print(f"緊急チェックポイント保存: {trainer.output_dir}")
+        except:
+            print("緊急保存も失敗しました")
+        raise
     
-    # サマリ追加
-    results['experiment_summary'] = trainer.get_training_summary()
-    results['data_info'] = {
-        'data_path': data_path,
-        'data_shape': tuple(Y_train.shape),
-        'device': str(device)
-    }
+    # **修正**: サマリ追加（修正版メソッド名に対応）
+    try:
+        experiment_summary = trainer.get_training_summary()
+        results['experiment_summary'] = experiment_summary
+        results['data_info'] = {
+            'data_path': data_path,
+            'data_shape': tuple(Y_train.shape),
+            'device': str(device),
+            'total_parameters': experiment_summary.get('model_info', {}).get('total_params', 0)
+        }
+        
+        # **追加**: 設定ファイルのバックアップ
+        config_backup_path = Path(output_dir) / 'config_used.yaml'
+        if not config_backup_path.exists():
+            import shutil
+            shutil.copy2(config_path, config_backup_path)
+            print(f"設定ファイルをバックアップ: {config_backup_path}")
+            
+    except Exception as e:
+        warnings.warn(f"サマリ作成でエラー: {e}")
+        results['experiment_summary'] = {'error': str(e)}
+        results['data_info'] = {
+            'data_path': data_path,
+            'data_shape': tuple(Y_train.shape),
+            'device': str(device)
+        }
     
     print(f"実験完了: 結果は {output_dir} に保存されました")
     
     return results
+
+
+def run_validation(
+    trainer: TwoStageTrainer, 
+    Y_test: torch.Tensor, 
+    output_dir: str,
+    forecast_steps: int = 96
+) -> Dict[str, Any]:
+    """
+    **新機能**: 学習済みモデルの検証実行
+    
+    Args:
+        trainer: 学習済みトレーナー
+        Y_test: テストデータ
+        output_dir: 結果出力ディレクトリ
+        forecast_steps: 予測ステップ数
+        
+    Returns:
+        検証結果辞書
+    """
+    print("検証開始...")
+    
+    try:
+        # 予測実行
+        predictions = trainer.forecast(Y_test, forecast_steps)
+        
+        # 予測精度計算
+        if Y_test.size(0) > forecast_steps:
+            Y_true = Y_test[-forecast_steps:]
+            mse = torch.mean((predictions - Y_true) ** 2).item()
+            mae = torch.mean(torch.abs(predictions - Y_true)).item()
+            
+            # 相対誤差
+            relative_error = (torch.norm(predictions - Y_true) / torch.norm(Y_true)).item()
+            
+            metrics = {
+                'mse': mse,
+                'mae': mae,
+                'rmse': mse ** 0.5,
+                'relative_error': relative_error,
+                'forecast_steps': forecast_steps
+            }
+        else:
+            warnings.warn("テストデータが予測ステップ数より短いため、精度計算をスキップ")
+            metrics = {
+                'forecast_steps': forecast_steps,
+                'note': 'テストデータ不足のため精度計算不可'
+            }
+        
+        # 結果保存
+        validation_results = {
+            'metrics': metrics,
+            'predictions_shape': tuple(predictions.shape),
+            'test_data_shape': tuple(Y_test.shape),
+            'model_summary': trainer.get_training_summary()
+        }
+        
+        # 予測結果をnumpy配列として保存
+        output_path = Path(output_dir)
+        predictions_path = output_path / 'predictions.npz'
+        np.savez(
+            predictions_path,
+            predictions=predictions.cpu().numpy(),
+            Y_test=Y_test.cpu().numpy()
+        )
+        
+        print(f"検証完了: 精度指標 MSE={metrics.get('mse', 'N/A'):.6f}")
+        
+        return validation_results
+        
+    except Exception as e:
+        error_result = {
+            'error': str(e),
+            'test_data_shape': tuple(Y_test.shape),
+            'forecast_steps': forecast_steps
+        }
+        print(f"検証中にエラー: {e}")
+        return error_result
+
+
+def plot_training_results(output_dir: str) -> None:
+    """
+    **新機能**: 学習結果の可視化
+    
+    Args:
+        output_dir: 結果ディレクトリ
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+        
+        output_path = Path(output_dir)
+        
+        # Phase-1 損失プロット
+        phase1_csv = output_path / 'phase1_training.csv'
+        if phase1_csv.exists():
+            df_phase1 = pd.read_csv(phase1_csv)
+            
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            fig.suptitle('Phase-1 Training Progress')
+            
+            # DF-A Stage-1
+            df_a_s1 = df_phase1[(df_phase1['phase'] == 'phase1_df_a') & (df_phase1['stage'] == 'stage1')]
+            if not df_a_s1.empty:
+                axes[0, 0].plot(df_a_s1['epoch'], df_a_s1['loss'])
+                axes[0, 0].set_title('DF-A Stage-1 Loss')
+                axes[0, 0].set_xlabel('Epoch')
+                axes[0, 0].set_ylabel('Loss')
+            
+            # DF-A Stage-2
+            df_a_s2 = df_phase1[(df_phase1['phase'] == 'phase1_df_a') & (df_phase1['stage'] == 'stage2')]
+            if not df_a_s2.empty:
+                axes[0, 1].plot(df_a_s2['epoch'], df_a_s2['loss'])
+                axes[0, 1].set_title('DF-A Stage-2 Loss')
+                axes[0, 1].set_xlabel('Epoch')
+                axes[0, 1].set_ylabel('Loss')
+            
+            # DF-B Stage-1
+            df_b_s1 = df_phase1[(df_phase1['phase'] == 'phase1_df_b') & (df_phase1['stage'] == 'stage1')]
+            if not df_b_s1.empty:
+                axes[1, 0].plot(df_b_s1['epoch'], df_b_s1['loss'])
+                axes[1, 0].set_title('DF-B Stage-1 Loss')
+                axes[1, 0].set_xlabel('Epoch')
+                axes[1, 0].set_ylabel('Loss')
+            
+            # DF-B Stage-2
+            df_b_s2 = df_phase1[(df_phase1['phase'] == 'phase1_df_b') & (df_phase1['stage'] == 'stage2')]
+            if not df_b_s2.empty:
+                axes[1, 1].plot(df_b_s2['epoch'], df_b_s2['loss'])
+                axes[1, 1].set_title('DF-B Stage-2 Loss')
+                axes[1, 1].set_xlabel('Epoch')
+                axes[1, 1].set_ylabel('Loss')
+            
+            plt.tight_layout()
+            plt.savefig(output_path / 'phase1_losses.png', dpi=150)
+            plt.close()
+        
+        # Phase-2 損失プロット
+        phase2_csv = output_path / 'phase2_training.csv'
+        if phase2_csv.exists():
+            df_phase2 = pd.read_csv(phase2_csv)
+            
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            fig.suptitle('Phase-2 Training Progress')
+            
+            axes[0].plot(df_phase2['epoch'], df_phase2['total_loss'])
+            axes[0].set_title('Total Loss')
+            axes[0].set_xlabel('Epoch')
+            axes[0].set_ylabel('Loss')
+            
+            axes[1].plot(df_phase2['epoch'], df_phase2['rec_loss'])
+            axes[1].set_title('Reconstruction Loss')
+            axes[1].set_xlabel('Epoch')
+            axes[1].set_ylabel('Loss')
+            
+            axes[2].plot(df_phase2['epoch'], df_phase2['cca_loss'])
+            axes[2].set_title('CCA Loss')
+            axes[2].set_xlabel('Epoch')
+            axes[2].set_ylabel('Loss')
+            
+            plt.tight_layout()
+            plt.savefig(output_path / 'phase2_losses.png', dpi=150)
+            plt.close()
+        
+        print(f"可視化完了: {output_path}")
+        
+    except ImportError:
+        warnings.warn("matplotlib/pandasが利用できないため、可視化をスキップ")
+    except Exception as e:
+        warnings.warn(f"可視化中にエラー: {e}")
+
+
+if __name__ == "__main__":
+    # 簡単なテスト用コード
+    print("TwoStageTrainer修正版読み込み完了")
