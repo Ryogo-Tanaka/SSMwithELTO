@@ -261,96 +261,107 @@ class DFObservationLayer:
         
         return u_B
     
-    def _freeze_parameters(self, module: nn.Module) -> Dict[str, bool]:
-        """
-        パラメータを完全に固定（requires_grad=False）
-        
-        Args:
-            module: 固定するモジュール
-            
-        Returns:
-            Dict: 元のrequires_grad状態（復元用）
-        """
+    def _freeze_parameters(self, module: nn.Module) -> Dict[str, torch.Tensor]:
+        """パラメータを一時的に固定し、元の状態を保存"""
         original_states = {}
         for name, param in module.named_parameters():
             original_states[name] = param.requires_grad
             param.requires_grad = False
         return original_states
-    
-    def _restore_parameters(self, module: nn.Module, original_states: Dict[str, bool]):
-        """
-        パラメータのrequires_grad状態を復元
-        
-        Args:
-            module: 復元するモジュール
-            original_states: _freeze_parametersで取得した元の状態
-        """
+
+    def _restore_parameters(self, module: nn.Module, original_states: Dict[str, torch.Tensor]):
+        """パラメータの requires_grad 状態を復元"""
         for name, param in module.named_parameters():
             if name in original_states:
                 param.requires_grad = original_states[name]
     
-    # **修正**: Phase-1学習用メソッドの勾配制御を明確化
     def train_stage1_with_gradients(
-        self, 
+        self,
         X_hat_states: torch.Tensor,
         m_features: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
-        T1_iterations: int = 8,  # **追加**: T1反復数パラメータ
+        T1_iterations: int = 1,
         fix_psi_omega: bool = True
     ) -> Dict[str, float]:
         """
-        **修正版**: Stage-1学習 + φ_θ勾配更新（ψ_ω完全固定）
+        **修正版**: Stage-1学習 + φ_θ勾配更新（ψ_ω固定、計算グラフ分離対応）
         
-        資料の学習戦略に対応:
-        V_B = 閉形式解(Φ_prev, Ψ_curr)       # V_B計算（ψ_ω固定）
-        φ_θ ← φ_θ - α∇L1(V_B, φ_θ)         # φ_θ更新（ψ_ω固定）
+        修正内容:
+        - retain_graph=True による複数回backward対応  
+        - ψ_ω固定時の勾配クリア処理
+        - 最後の反復のみ完全グラフ解放
         
         Args:
-            X_hat_states: DF-Aからの状態予測 (T-1, r)
+            X_hat_states: DF-Aからの状態予測 (T, r)
             m_features: スカラー特徴量 (T,)
             optimizer_phi: φ_θ用オプティマイザ
-            fix_psi_omega: ψ_ω を完全固定するか
+            T1_iterations: Stage-1反復回数
+            fix_psi_omega: ψ_ω を固定するか
             
         Returns:
             Dict[str, float]: 損失メトリクス
         """
-        """Stage-1学習: T1回の反復でφ_θを更新（ψ_ω固定）"""
-        if not self.df_state._is_fitted and 'V_A' not in self.df_state._stage1_cache:
-            raise RuntimeError("DF-Aが学習済みである必要があります")
+        T_x = X_hat_states.size(0)
         
-        # ψ_ω パラメータの完全固定
+        # スカラー特徴量の次元調整
+        if m_features.dim() == 2 and m_features.size(1) == 1:
+            m_features = m_features.squeeze(1)
+        elif m_features.dim() != 1:
+            raise ValueError(f"スカラー特徴量は1次元: got {m_features.shape}")
+        
+        if T_x != m_features.size(0):
+            raise ValueError(f"系列長不一致: {T_x} vs {m_features.size(0)}")
+        
+        if T_x < 2:
+            raise ValueError(f"系列が短すぎます: T={T_x}")
+        
+        # **修正**: ψ_ω パラメータの固定処理
         psi_original_states = {}
         if fix_psi_omega:
             psi_original_states = self._freeze_parameters(self.psi_omega)
         
+        total_loss = 0.0
+        
         try:
-            total_loss = 0.0
-            loss_history = []
-            
-            # **修正**: T1回の反復実行（定式化準拠）
-            for iteration in range(T1_iterations):
+            # **修正**: 反復回数制御とretain_graph管理
+            for t in range(T1_iterations):
+                optimizer_phi.zero_grad()
+                
+                # 操作変数特徴量（各反復で新しい計算グラフ）
+                phi_instrument = self.phi_theta(X_hat_states)  # (T, d_A)
+                
+                # 観測特徴量
+                if fix_psi_omega:
+                    # ψ_ω固定: 勾配計算なし
+                    with torch.no_grad():
+                        psi_obs = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+                else:
+                    # ψ_ω更新: 勾配計算あり
+                    psi_obs = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+                
                 # 時間合わせ
-                T_x = X_hat_states.size(0)
-                m_curr = m_features[1:T_x+1]
+                phi_prev = phi_instrument[:-1]  # (T-1, d_A)
+                psi_curr = psi_obs[1:]          # (T-1, d_B)
                 
-                # 観測特徴量の計算（ψ_ω固定）
-                psi_curr = self.psi_omega(m_curr.unsqueeze(1))
+                # Stage-1: V_B推定（閉形式解）
+                with torch.no_grad():
+                    V_B = self._ridge_stage1_vb(phi_prev, psi_curr, self.lambda_B)
                 
-                # φ_θ 勾配ありで操作変数特徴量計算
-                phi_prev = self.phi_theta(X_hat_states)
-                
-                # V_B 推定
-                V_B = self._ridge_stage1_vb(phi_prev, psi_curr, self.lambda_B)
-                
-                # Stage-1 損失
-                psi_pred = (V_B @ phi_prev.T).T
+                # 予測誤差計算
+                psi_pred = (V_B @ phi_prev.T).T  # (T-1, d_B)
                 loss_stage1 = torch.norm(psi_pred - psi_curr, p='fro') ** 2
                 
-                # φ_θ 更新
-                optimizer_phi.zero_grad()
-                loss_stage1.backward()
+                total_loss += loss_stage1.item()
                 
-                # **修正**: 固定されたパラメータの勾配をゼロクリア（安全のため）
+                # **修正**: 計算グラフ管理
+                if t < T1_iterations - 1:
+                    # 最後の反復以外: retain_graph=True
+                    loss_stage1.backward(retain_graph=True)
+                else:
+                    # 最後の反復: 完全解放
+                    loss_stage1.backward()
+                
+                # **修正**: ψ_ω固定時の勾配クリア
                 if fix_psi_omega:
                     for param in self.psi_omega.parameters():
                         if param.grad is not None:
@@ -358,23 +369,39 @@ class DFObservationLayer:
                 
                 optimizer_phi.step()
                 
-                loss_history.append(loss_stage1.item())
-                total_loss += loss_stage1.item()
+                # **追加**: 反復間のメモリクリア
+                if t < T1_iterations - 1:
+                    phi_instrument = phi_instrument.detach()
+                    if not fix_psi_omega:
+                        psi_obs = psi_obs.detach()
             
-            # V_B をキャッシュ（detach で計算グラフ切断）
-            self._stage1_cache['V_B'] = V_B.detach()
-            self._stage1_cache['phi_prev'] = phi_prev.detach()
+            # Stage-1結果をキャッシュ（Stage-2用）
+            with torch.no_grad():
+                phi_final = self.phi_theta(X_hat_states)
+                psi_final = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+                
+                phi_prev_final = phi_final[:-1]
+                psi_curr_final = psi_final[1:]
+                V_B_final = self._ridge_stage1_vb(phi_prev_final, psi_curr_final, self.lambda_B)
+                
+                self._stage1_cache = {
+                    'V_B': V_B_final.detach(),
+                    'phi_prev': phi_prev_final.detach(),
+                    'psi_curr': psi_curr_final.detach(),
+                    'X_hat': X_hat_states.detach()
+                }
             
             return {
                 'stage1_loss': total_loss / T1_iterations,
-                'loss_history': loss_history,
-                'iterations_completed': T1_iterations
+                'iterations_completed': T1_iterations,
+                'final_loss': loss_stage1.item()
             }
             
         finally:
-            # ψ_ω パラメータの復元
+            # **修正**: ψ_ω パラメータの復元
             if fix_psi_omega and psi_original_states:
-                self._restore_parameters(self.psi_omega, psi_original_states)
+                self._restore_parameters(self.psi_omega, psi_original_states)  
+
         
     def train_stage2_with_gradients(
         self,

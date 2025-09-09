@@ -358,78 +358,88 @@ class DFStateLayer:
         
         return loss
     
-    # **修正**: Phase-1学習用メソッドのクロスフィッティング対応
     def train_stage1_with_gradients(
         self,
         X_states: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
-        T1_iterations: int = 8,
-        use_cross_fitting: bool = True
+        T1_iterations: int = 1
     ) -> Dict[str, float]:
         """
-        **完全修正版**: Stage-1学習 + ϕ_θ勾配更新（クロスフィッティング対応）
+        **修正版**: Stage-1学習 + φ_θ勾配更新（計算グラフ分離対応）
         
-        資料の学習戦略に対応:
-        for t = 1 to T1:  # Stage-1
-            V_A^{(-k)} = 閉形式解(Φ_minus, Φ_plus, ϕ_θ固定)  # クロスフィッティング
-            ϕ_θ ← ϕ_θ - α∇L1(V_A^{(-k)}, ϕ_θ)  # ϕ_θ更新
+        修正内容:
+        - retain_graph=True による複数回backward対応
+        - 最後の反復のみ完全グラフ解放
+        - 反復回数の動的制御
         
         Args:
-            X_states: 状態系列 (T, r)
-            optimizer_phi: ϕ_θ用オプティマイザ
-            T1_iterations: T1反復数
-            use_cross_fitting: クロスフィッティングを使用するかどうか
+            X_states: 状態系列 (T, r)  
+            optimizer_phi: φ_θ用オプティマイザ
+            T1_iterations: Stage-1反復回数
             
         Returns:
-            Dict[str, float]: 損失メトリクス（TwoStageTrainer互換）
+            Dict[str, float]: 損失メトリクス
         """
-        T, r = X_states.shape
-        T, r = int(T), int(r)
-        
-        if r != self.state_dim:
-            raise ValueError(f"状態次元不一致: expected {self.state_dim}, got {r}")
-        
-        if T < 2:
-            raise ValueError(f"時系列が短すぎます: T={T}")
+        if X_states.size(0) < 2:
+            raise ValueError(f"状態系列が短すぎます: T={X_states.size(0)}")
         
         total_loss = 0.0
-        loss_history = []
         
-        # **修正**: T1回の反復実行（定式化準拠）
-        for iteration in range(T1_iterations):
-            # 各反復で新しい計算グラフを作成
-            loss_stage1 = self._compute_crossfit_stage1_loss(
-                X_states, 
-                use_simple_fallback=not use_cross_fitting
-            )
-            
-            # 勾配計算・更新
+        # **修正**: 反復回数制御とretain_graph管理
+        for t in range(T1_iterations):
             optimizer_phi.zero_grad()
-            loss_stage1.backward()
+            
+            # 特徴量計算（各反復で新しい計算グラフ）
+            phi_seq = self.phi_theta(X_states)  # (T, d_A)
+            
+            # 過去/未来分割
+            phi_minus = phi_seq[:-1]  # (T-1, d_A)
+            phi_plus = phi_seq[1:]    # (T-1, d_A)
+            
+            # Stage-1: V_A推定（閉形式解）
+            with torch.no_grad():
+                V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
+            
+            # 予測誤差計算
+            phi_pred = (V_A @ phi_minus.T).T  # (T-1, d_A)
+            loss_stage1 = torch.norm(phi_pred - phi_plus, p='fro') ** 2
+            
+            total_loss += loss_stage1.item()
+            
+            # **修正**: 計算グラフ管理
+            if t < T1_iterations - 1:
+                # 最後の反復以外: retain_graph=True
+                loss_stage1.backward(retain_graph=True)
+            else:
+                # 最後の反復: 完全解放
+                loss_stage1.backward()
+            
             optimizer_phi.step()
             
-            loss_history.append(loss_stage1.item())
-            total_loss += loss_stage1.item()
+            # **追加**: 反復間のメモリクリア（安全性向上）
+            if t < T1_iterations - 1:
+                # 中間反復では変数をデタッチ（メモリ効率向上）
+                phi_seq = phi_seq.detach()
         
-        # **重要**: Stage-2用データ準備（detach で計算グラフ切断）
+        # Stage-1結果をキャッシュ（Stage-2用）
         with torch.no_grad():
-            phi_seq = self.phi_theta(X_states)
-            phi_minus = phi_seq[:-1]
-            X_plus = X_states[1:]
+            phi_seq_final = self.phi_theta(X_states)
+            phi_minus_final = phi_seq_final[:-1]
+            phi_plus_final = phi_seq_final[1:]
+            V_A_final = self._ridge_stage1(phi_minus_final, phi_plus_final, self.lambda_A)
             
-            self._stage1_cache['phi_minus'] = phi_minus.detach()
-            self._stage1_cache['X_plus'] = X_plus.detach()
-            
-            # 最新のV_A計算
-            V_A = self._ridge_stage1(phi_minus, phi_seq[1:], self.lambda_A)
-            self._stage1_cache['V_A'] = V_A.detach()
-        
-        # **修正**: 完全な戻り値（TwoStageTrainer互換）
+            self._stage1_cache = {
+                'V_A': V_A_final.detach(),
+                'phi_minus': phi_minus_final.detach(),
+                'phi_plus': phi_plus_final.detach(),
+                'X_plus': X_states[1:].detach()
+            }
+    
         return {
             'stage1_loss': total_loss / T1_iterations,
-            'loss_history': loss_history,
-            'iterations_completed': T1_iterations
-    }
+            'iterations_completed': T1_iterations,
+            'final_loss': loss_stage1.item()
+        }
     
     def train_stage2_closed_form(self) -> Dict[str, float]:
         """
