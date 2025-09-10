@@ -274,20 +274,24 @@ class TwoStageTrainer:
         print(f"TwoStageTrainer初期化完了: {device}")
     
     def _initialize_df_layers(self, X_states: torch.Tensor):
-        """DF layers初期化"""
-        _, r = X_states.shape
-        
+        """DF layers初期化（GPU統一版）"""
         # DF-A初期化
+        _, r = X_states.shape
         self.df_state = DFStateLayer(
             state_dim=r,
             **self.df_state_config
-        ).to(self.device)
+        )
         
-        # DF-B初期化（DF-Aを参照）
+        # DF-Aの内部ニューラルネットワークをGPUに移動
+        self.df_state.phi_theta = self.df_state.phi_theta.to(self.device)
+        
+        # DF-B初期化
         self.df_obs = DFObservationLayer(
             df_state_layer=self.df_state,
             **self.df_obs_config
-        ).to(self.device)
+        )
+        # DF-Bの内部ニューラルネットワークをGPUに移動
+        self.df_obs.psi_omega = self.df_obs.psi_omega.to(self.device)
         
         print(f"DF layers初期化完了: state_dim={r}")
     
@@ -331,6 +335,10 @@ class TwoStageTrainer:
         """
         # 1. エンコード: y_t → m_t
         # バッチ次元追加: (T, d) -> (1, T, d)
+
+        # 入力データをGPUに移動
+        Y_train = self._ensure_device(Y_train)
+
         m_tensor = self.encoder(Y_train.unsqueeze(0))  # (1, T, 1)
         m_series = m_tensor.squeeze()  # (T,)
         
@@ -415,8 +423,11 @@ class TwoStageTrainer:
         metrics = {}
         opt_phi = self.optimizers['phi']
         
+        # **追加**: 入力データをGPUに移動
+        X_states_gpu = X_states.to(self.device)
+        
         # **修正2: 完全にデタッチされた入力で独立グラフ作成**
-        X_states_detached = X_states.detach().requires_grad_(False)
+        X_states_detached = X_states_gpu.detach().requires_grad_(False)
         
         # **修正2: 独立計算コンテキストでDF-A学習**
         with torch.enable_grad():
@@ -462,9 +473,13 @@ class TwoStageTrainer:
         metrics = {}
         opt_phi = self.optimizers['phi']
         opt_psi = self.optimizers['psi']
-        
+
+        # **追加**: 入力データをGPUに移動
+        X_states_gpu = X_states.to(self.device)
+        m_series_gpu = m_series.to(self.device)
+
         # **修正2: 完全にデタッチされた入力で独立グラフ作成**
-        X_states_detached = X_states.detach().requires_grad_(False)
+        X_states_detached = X_states_gpu.detach().requires_grad_(False)
         
         # **修正2: 独立計算コンテキストでDF-B学習**
         with torch.enable_grad():
@@ -520,6 +535,10 @@ class TwoStageTrainer:
         
         return metrics
     
+    def _ensure_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        # テンソルを指定デバイスに移動（必要な場合のみ）
+        return tensor.to(self.device) if tensor.device != self.device else tensor
+
     def train_phase2(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, float]:
         """
         Phase-2: End-to-end微調整
