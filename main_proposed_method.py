@@ -264,7 +264,8 @@ class ProposedMethodTrainer:
         metrics = {}
         
         # DF-Aからの状態予測を取得
-        X_hat_states = self.df_state.predict_sequence(X_states)  # (T-1, r)
+        with torch.no_grad():
+            X_hat_states = self.df_state.predict_sequence(X_states)  # (T-1, r)
         
         # Stage-1: V_B推定 + φ_θ更新 (ψ_ω固定)
         for t in range(self.T1):
@@ -380,7 +381,8 @@ class ProposedMethodTrainer:
         X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
         
         # 3. DF-A予測: x_{t-1} → x̂_{t|t-1}
-        X_hat_states = self.df_state.predict_sequence(X_states)  # (T_eff-1, r)
+        with torch.no_grad():
+            X_hat_states = self.df_state.predict_sequence(X_states)  # (T_eff-1, r)
         
         # 4. DF-B予測: x̂_{t|t-1} → m̂_{t|t-1}
         m_hat_series = []

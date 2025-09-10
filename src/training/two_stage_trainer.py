@@ -483,8 +483,12 @@ class TwoStageTrainer:
         
         # **修正2: 独立計算コンテキストでDF-B学習**
         with torch.enable_grad():
-            # DF-Aからの状態予測を取得
-            X_hat_states = self.df_state.predict_sequence(X_states_detached)
+            # DF-Aからの状態予測を取得（操作変数として推論のみ）
+            with torch.no_grad():
+                X_hat_states = self.df_state.predict_sequence(X_states_detached)
+            
+            # 明示的に勾配グラフから切断
+            X_hat_states = X_hat_states.detach().requires_grad_(False)
             
             # **修正4: ヘルパーメソッドを使用した時間インデックス調整**
             m_aligned = self._align_time_series(

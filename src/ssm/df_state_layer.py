@@ -673,7 +673,7 @@ class DFStateLayer:
         return_features: bool = False
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
-        系列予測: 各時刻でのone-step-ahead予測
+        系列予測: 各時刻でのone-step-ahead予測（推論専用モード）
         
         Args:
             X_states: 状態系列 (T, r)
@@ -690,14 +690,16 @@ class DFStateLayer:
         predictions = []
         features = []
         
-        for t in range(T - 1):
-            x_pred = self.predict_one_step(X_states[t])
-            predictions.append(x_pred)
-            
-            if return_features:
-                phi_prev = self.phi_theta(X_states[t])
-                phi_pred = self.apply_transfer_operator(phi_prev)
-                features.append(phi_pred)
+        # 推論専用モードで実行（勾配グラフを切断）
+        with torch.no_grad():
+            for t in range(T - 1):
+                x_pred = self.predict_one_step(X_states[t])
+                predictions.append(x_pred)
+                
+                if return_features:
+                    phi_prev = self.phi_theta(X_states[t])
+                    phi_pred = self.apply_transfer_operator(phi_prev)
+                    features.append(phi_pred)
         
         pred_tensor = torch.stack(predictions)
         

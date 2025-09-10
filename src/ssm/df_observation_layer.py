@@ -398,6 +398,81 @@ class DFObservationLayer:
             # **修正: ψ_ω パラメータの復元**
             if fix_psi_omega and psi_original_states:
                 self._restore_parameters(self.psi_omega, psi_original_states)
+
+    
+    def train_stage2_with_gradients(
+            self,
+            m_features: torch.Tensor,
+            optimizer_psi: torch.optim.Optimizer,
+            fix_phi_theta: bool = True
+        ) -> Dict[str, float]:
+        """
+        **修正版**: Stage-2学習 + ψ_ω勾配更新（φ_θ完全固定）
+        
+        資料の学習戦略に対応:
+        u_B = 閉形式解(H^{(cf)}_B, m)        # u_B計算（φ_θ固定）
+        ψ_ω ← ψ_ω - α∇L2(u_B, ψ_ω)         # ψ_ω更新（φ_θ固定）
+        
+        Args:
+            m_features: スカラー特徴量 (T,)
+            optimizer_psi: ψ_ω用オプティマイザ
+            fix_phi_theta: φ_θ を完全固定するか
+            
+        Returns:
+            Dict[str, float]: 損失メトリクス
+        """
+        if 'V_B' not in self._stage1_cache:
+            raise RuntimeError("Stage-1が先に実行されている必要があります")
+        
+        # **修正**: φ_θ パラメータの完全固定
+        phi_original_states = {}
+        if fix_phi_theta:
+            phi_original_states = self._freeze_parameters(self.phi_theta)
+        
+        try:
+            # Stage-1からの結果を取得
+            V_B = self._stage1_cache['V_B']
+            phi_prev = self._stage1_cache['phi_prev']
+            T_eff = phi_prev.size(0)
+            
+            # **修正3**: 境界チェック追加
+            if m_features.size(0) < T_eff + 1:
+                raise RuntimeError(f"m_features長不足: required {T_eff+1}, got {m_features.size(0)}")
+            m_curr = m_features[1:T_eff+1]  # (T-1,)
+            
+            # **修正2**: 操作変数特徴量の計算（完全勾配分離）
+            with torch.no_grad():
+                # V_B、phi_prevは既にdetach済みなので安全
+                H = (V_B @ phi_prev.T).T  # (T-1, d_B)
+            
+            # u_B 推定
+            u_B = self._ridge_stage2_ub(H, m_curr, self.lambda_dB)
+            
+            # Stage-2 損失: ||m - H u_B||_2^2
+            m_pred = (H * u_B).sum(dim=1)  # (T-1,)
+            loss_stage2 = torch.norm(m_pred - m_curr, p=2) ** 2
+            
+            # ψ_ω 更新（φ_θ は固定済み）
+            optimizer_psi.zero_grad()
+            loss_stage2.backward()
+            
+            # **修正**: 固定されたパラメータの勾配をゼロクリア（安全のため）
+            if fix_phi_theta:
+                for param in self.phi_theta.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+            
+            optimizer_psi.step()
+            
+            # u_B をキャッシュ
+            self._stage2_cache['u_B'] = u_B.detach()
+            
+            return {'stage2_loss': loss_stage2.item()}
+            
+        finally:
+            # **修正1**: φ_θ パラメータの復元（psi_original_states削除）
+            if fix_phi_theta and phi_original_states:
+                self._restore_parameters(self.phi_theta, phi_original_states)
     
     def fit_two_stage(
         self, 
