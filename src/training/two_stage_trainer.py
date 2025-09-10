@@ -747,29 +747,49 @@ class TwoStageTrainer:
     
     def _get_time_alignment_offset(self, T_original: int, T_states: int, T_pred: int) -> int:
         """
-        **修正4**: 時間インデックス調整のオフセット計算
-        
+        時間インデックス調整のオフセット計算
+        理論: 
+        - 確率的実現出力: x_h, x_{h+1}, ..., x_{h+T_states-1}
+        - DF-A予測: x̂_{h+1|h}, x̂_{h+2|h+1}, ..., x̂_{h+T_pred|h+T_pred-1}
+        - 正しい対応: x̂_{h+1|h} ↔ m_{h+1}
         Args:
             T_original: 元系列長
-            T_states: 状態系列長
+            T_states: 状態系列長  
             T_pred: 予測系列長
             
         Returns:
-            int: m_series用のオフセット
+            int: m_seriesのオフセット (= h + 1)
         """
-        # 確率的実現パラメータから正確な計算
-        try:
-            h = getattr(self.realization, 'h', 
-                getattr(self.realization, 'past_horizon', 0))
-            if h > 0:
-                # 理論値使用: 確率的実現h + 予測1ステップ
-                return h + 1
-            else:
-                # 動的計算
-                return (T_original - T_states) + (T_states - T_pred)
-        except Exception:
-            # フォールバック
-            return (T_original - T_states) + (T_states - T_pred)
+        # h値取得
+        h_candidates = [
+            'h',                    # Realizationの標準属性名
+            'past_horizon',         # 初期化パラメータ名
+            'lags',                 # 別名の可能性
+            'window_size',          # 別名の可能性
+        ]
+        
+        h = None
+        for attr_name in h_candidates:
+            if hasattr(self.realization, attr_name):
+                h = getattr(self.realization, attr_name)
+                if isinstance(h, (int, float)) and h > 0:
+                    h = int(h)
+                    break
+        
+        # フォールバック: T_original, T_statesから逆算
+        if h is None:
+            # T_states = T_original - 2*h + 1 から h を計算
+            h = (T_original - T_states + 1) // 2
+            if self.config.verbose:
+                print(f"警告: h値を逆算で推定しました: h = {h}")
+        
+        # 検証
+        expected_T_states = T_original - 2 * h + 1
+        if abs(T_states - expected_T_states) > 1:  # 1の誤差は許容
+            if self.config.verbose:
+                print(f"警告: h={h}による期待T_states={expected_T_states}が実際値{T_states}と不一致")
+        
+        return h + 1
     
     def _validate_time_alignment(self, X_hat_states: torch.Tensor, m_aligned: torch.Tensor, 
                                component: str = "unknown") -> None:

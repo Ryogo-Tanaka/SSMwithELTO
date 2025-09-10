@@ -75,7 +75,7 @@ class StateFeatureNet(nn.Module):
         return self.net(x)
 
 
-class DFStateLayer:
+class DFStateLayer(nn.Module):
     """
     DF-A: Deep Feature Instrumental Variable for State Process
     
@@ -109,6 +109,7 @@ class DFStateLayer:
             feature_net_config: StateFeatureNetの設定
             cross_fitting_config: CrossFittingManagerの設定
         """
+        super().__init__()
         self.state_dim = int(state_dim)
         self.feature_dim = int(feature_dim)
         self.lambda_A = lambda_A

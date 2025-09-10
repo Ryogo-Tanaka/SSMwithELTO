@@ -61,7 +61,7 @@ class Realization:
     def fit(self, Y: torch.Tensor):
         T, p = Y.shape
         h = self.h
-        N = T - 2*h + 2
+        N = T - 2*h + 1
         if N <= 0:
             # raise RealizationError("Time series too short for horizon h")
             return
@@ -264,7 +264,7 @@ class Realization:
 
     def filter(self, Y: torch.Tensor) -> torch.Tensor:
         h = self.h
-        N = Y.shape[0] - 2*h + 2
+        N = Y.shape[0] - 2*h + 1
         # Yf = torch.stack([Y[i+1 : i+h+1].reshape(-1) for i in range(N)], dim=1)
         Yp = torch.stack([Y[i : i + h].flip(dims=(0, )).reshape(-1) for i in range(N)], dim=1)
         X_state = (self.B @ Yp).T  # shape (N, r), time ; t = h,...,h+N-1

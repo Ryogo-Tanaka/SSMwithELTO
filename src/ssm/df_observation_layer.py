@@ -83,7 +83,7 @@ class ObservationFeatureNet(nn.Module):
             return self.net(m)
 
 
-class DFObservationLayer:
+class DFObservationLayer(nn.Module):
     """
     DF-B: Deep Feature Instrumental Variable for Observation Process
     
@@ -122,6 +122,7 @@ class DFObservationLayer:
         if df_state_layer is None:
             raise ValueError("df_state_layerは必須です。DFStateLayerインスタンスを渡してください。")
         
+        super().__init__()
         self.df_state = df_state_layer
         self.obs_feature_dim = obs_feature_dim
         self.lambda_B = lambda_B
