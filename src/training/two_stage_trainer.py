@@ -466,9 +466,9 @@ class TwoStageTrainer:
         return metrics
     
     def _train_df_b_epoch(self, X_states: torch.Tensor, m_series: torch.Tensor, 
-                         epoch: int) -> Dict[str, float]:
+                        epoch: int) -> Dict[str, float]:
         """
-        **修正2+4統合**: DF-B（観測層）のエポック学習（完全グラフ分離 + ヘルパー使用）
+        **修正版**: DF-B（観測層）のエポック学習（計算グラフ重複使用エラー対応）
         """
         metrics = {}
         opt_phi = self.optimizers['phi']
@@ -515,12 +515,15 @@ class TwoStageTrainer:
         # **修正2: 明示的グラフクリア**
         self._clear_computation_graph()
         
-        # Stage-2: u_B推定 + ψ_ω更新（T2回反復）
+        # Stage-2: u_B推定 + ψ_ω更新（T2回反復、計算グラフ分離）
         stage2_losses = []
         for t in range(self.config.T2_iterations):
             with torch.enable_grad():
+                # **修正**: 各反復で独立した計算グラフを作成
+                m_aligned_independent = m_aligned.detach().requires_grad_(True)
+                
                 stage2_metrics = self.df_obs.train_stage2_with_gradients(
-                    m_aligned,  # **修正2+4: 時間調整済み**
+                    m_aligned_independent,  # ← 修正: 独立したテンソル
                     opt_psi, 
                     fix_phi_theta=True
                 )
