@@ -89,9 +89,9 @@ class OperatorBasedKalmanFilter:
         self.is_initialized = False
         
         # 数値安定性パラメータ
-        self.min_eigenvalue = 1e-8
+        self.min_eigenvalue = 1e-6
         self.condition_threshold = 1e12
-        self.jitter = 1e-6
+        self.jitter = 1e-5
 
     def initialize_state(
         self,
@@ -250,7 +250,7 @@ class OperatorBasedKalmanFilter:
             m_t = self.encoder(observation).squeeze()  # scalar
             
         # 2. イノベーション共分散: S ← H^T Σ⁻ H + R ∈ R
-        S = self.H.T @ Sigma_minus @ self.H + self.R  # scalar
+        S = self.H.mT @ Sigma_minus @ self.H + self.R  # scalar
         
         # 数値安定性チェック
         if S <= 0:
@@ -261,11 +261,11 @@ class OperatorBasedKalmanFilter:
         K = (Sigma_minus @ self.H) / S  # (dA,)
         
         # 4. 状態更新: µ ← µ⁻ + K (m_t - H^T µ⁻)
-        innovation = m_t - self.H.T @ mu_minus  # scalar
+        innovation = m_t - self.H.mT @ mu_minus  # scalar
         mu_plus = mu_minus + K * innovation  # (dA,)
         
         # 5. 共分散更新: Σ ← Σ⁻ - K H^T Σ⁻
-        Sigma_plus = Sigma_minus - torch.outer(K, self.H.T @ Sigma_minus)  # (dA, dA)
+        Sigma_plus = Sigma_minus - torch.outer(K, self.H.mT @ Sigma_minus)  # (dA, dA)
         
         # 正定値性確保
         Sigma_plus = self._regularize_covariance(Sigma_plus)

@@ -168,6 +168,9 @@ class DFStateLayer(nn.Module):
         if N < d_A:
             warnings.warn(f"サンプル数 {N} < 特徴次元 {d_A}。数値不安定の可能性")
         
+        # デバッグプリント追加 debug
+        print(f"DEBUG : After conversion: d_A={d_A}, type={type(d_A)}")
+        
         # グラム行列 + 正則化（d_Aは確実にint）
         XtX = X_features.T @ X_features  # (d_A, d_A)
         XtX_reg = XtX + reg_lambda * torch.eye(d_A, device=X_features.device, dtype=X_features.dtype)
