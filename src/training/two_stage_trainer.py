@@ -360,7 +360,7 @@ class TwoStageTrainer:
         
         # ===== 追加：キャリブレーションデータ分割 =====
         if hasattr(self, 'use_kalman_filtering') and self.use_kalman_filtering:
-            n_calib = int(len(Y_train) * getattr(self, 'calibration_ratio', 0.1))
+            n_calib = int(Y_train.size(0) * getattr(self, 'calibration_ratio', 0.1))
             self.calibration_data = Y_train[:n_calib].clone()
             if self.config.verbose:
                 print(f"Calibration data prepared: {self.calibration_data.shape}")

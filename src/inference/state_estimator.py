@@ -388,7 +388,7 @@ class StateEstimator:
         if self.Q is None or self.R is None:
             # デフォルトノイズ設定
             warnings.warn("Noise covariances not estimated. Using defaults.")
-            dA = self.V_A.size(0)
+            dA = int(self.V_A.size(0))
             self.Q = 0.01 * torch.eye(dA, device=self.device)
             self.R = 0.1
             

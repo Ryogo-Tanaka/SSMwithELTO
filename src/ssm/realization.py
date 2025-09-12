@@ -471,6 +471,9 @@ class Realization:
         """
         T_eff, r = X_initial.shape
         
+        # 明示的な型変換
+        r = int(r)
+        
         # 状態平均はそのまま使用
         X_means = X_initial
         

@@ -83,8 +83,8 @@ class CMEObservation:
           Y_feats:  Tensor[N, p] – encoder feature sequence (time : 0, ..., T)
         """
         self.X = X_states
-        self.n_states = X_states.size(0)
-        n_feats = Y_feats.size(0)
+        self.n_states = int(X_states.size(0))
+        n_feats = int(Y_feats.size(0))
 
         self.Y_mat = Y_feats[self.h : n_feats-self.h+1].T
         K_X = _compute_kernel_matrix(

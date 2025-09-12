@@ -125,8 +125,8 @@ class DFObservationLayer(nn.Module):
         super().__init__()
         self.df_state = df_state_layer
         self.obs_feature_dim = obs_feature_dim
-        self.lambda_B = lambda_B
-        self.lambda_dB = lambda_dB
+        self.lambda_B = float(lambda_B)  # 文字列対応
+        self.lambda_dB = float(lambda_dB)  # 文字列対応
         
         # **重要**: 共有特徴ネットワーク（DF-Aから直接参照）
         self.phi_theta = df_state_layer.phi_theta
@@ -173,11 +173,6 @@ class DFObservationLayer(nn.Module):
         N, d_A = Phi_instrument.shape
         N_t, d_B = Psi_treatment.shape
 
-        N = int(N.item() if hasattr(N, 'item') else N)
-        d_A = int(d_A.item() if hasattr(d_A, 'item') else d_A)
-        N_t = int(N_t.item() if hasattr(N_t, 'item') else N_t)
-        d_B = int(d_B.item() if hasattr(d_B, 'item') else d_B)
-        
         if N != N_t:
             raise ValueError(f"操作変数と観測の サンプル数不一致: {N} vs {N_t}")
         
@@ -230,9 +225,6 @@ class DFObservationLayer(nn.Module):
             torch.Tensor: 観測読み出しベクトル u_B (d_B,)
         """
         N, d_B = H_instrument.shape
-        N = int(N.item() if hasattr(N, 'item') else N)
-        d_B = int(d_B.item() if hasattr(d_B, 'item') else d_B)
-        
         if m_target.size(0) != N:
             raise ValueError(f"操作変数とターゲットのサンプル数不一致: {N} vs {m_target.size(0)}")
         

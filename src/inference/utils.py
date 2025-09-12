@@ -35,6 +35,10 @@ def estimate_noise_covariances(
     """
     T_state, dA = residuals_state.shape
     T_obs, dB = residuals_obs.shape
+    
+    # 明示的な型変換
+    dA = int(dA)
+    dB = int(dB)
     gamma_Q = regularization.get("gamma_Q", 1e-6)
     gamma_R = regularization.get("gamma_R", 1e-6)
     

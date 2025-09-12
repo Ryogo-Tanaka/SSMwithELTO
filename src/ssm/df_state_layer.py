@@ -112,8 +112,8 @@ class DFStateLayer(nn.Module):
         super().__init__()
         self.state_dim = int(state_dim)
         self.feature_dim = int(feature_dim)
-        self.lambda_A = lambda_A
-        self.lambda_B = lambda_B
+        self.lambda_A = float(lambda_A)  # 文字列対応
+        self.lambda_B = float(lambda_B)  # 文字列対応
         
         # 特徴ネットワーク
         feature_config = feature_net_config or {}
@@ -153,12 +153,6 @@ class DFStateLayer(nn.Module):
         N, d_A = X_features.shape
         N_t, d_A_t = Y_targets.shape
         
-        # 明示的な型変換を追加
-        N = int(N.item() if hasattr(N, 'item') else N)
-        d_A = int(d_A.item() if hasattr(d_A, 'item') else d_A)
-        N_t = int(N_t.item() if hasattr(N_t, 'item') else N_t)
-        d_A_t = int(d_A_t.item() if hasattr(d_A_t, 'item') else d_A_t)
-        
         if N != N_t:
             raise ValueError(f"特徴量とターゲットのサンプル数不一致: {N} vs {N_t}")
         
@@ -168,10 +162,7 @@ class DFStateLayer(nn.Module):
         if N < d_A:
             warnings.warn(f"サンプル数 {N} < 特徴次元 {d_A}。数値不安定の可能性")
         
-        # デバッグプリント追加 debug
-        print(f"DEBUG : After conversion: d_A={d_A}, type={type(d_A)}")
-        
-        # グラム行列 + 正則化（d_Aは確実にint）
+        # グラム行列 + 正則化
         XtX = X_features.T @ X_features  # (d_A, d_A)
         XtX_reg = XtX + reg_lambda * torch.eye(d_A, device=X_features.device, dtype=X_features.dtype)
         
@@ -385,7 +376,7 @@ class DFStateLayer(nn.Module):
             Dict[str, float]: 損失メトリクス
         """
         if X_states.size(0) < 2:
-            raise ValueError(f"状態系列が短すぎます: T={X_states.size(0)}")
+            raise ValueError(f"状態系列が短すぎます: T={int(X_states.size(0))}")
         
         total_loss = 0.0
         

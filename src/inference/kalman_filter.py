@@ -76,9 +76,9 @@ class OperatorBasedKalmanFilter:
             param.requires_grad = False
             
         # 次元
-        self.dA = V_A.size(0)  # 特徴空間状態次元
-        self.dB = V_B.size(0)  # 特徴空間観測次元
-        self.r = U_A.size(1)   # 元状態次元
+        self.dA = int(V_A.size(0))  # 特徴空間状態次元
+        self.dB = int(V_B.size(0))  # 特徴空間観測次元
+        self.r = int(U_A.size(1))   # 元状態次元
         
         # 前計算: H ← V_B^T u_B ∈ R^dA
         self.H = self.V_B.T @ self.u_B  # (dA,)
