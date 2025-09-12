@@ -86,6 +86,23 @@ def validate_config(config_path: str) -> dict:
         if ssm_section not in ssm_config:
             raise ValueError(f"ssm.{ssm_section} の設定が必要です")
     
+    data_config = config.get('data', {})
+    if data_config:  # dataセクションがある場合のみ検証
+        if 'normalization' in data_config:
+            valid_methods = ['standard', 'minmax', 'none']
+            if data_config['normalization'] not in valid_methods:
+                raise ValueError(f"無効な正規化方法: {data_config['normalization']}. 有効: {valid_methods}")
+        
+        # 分割比率の検証
+        if 'train_ratio' in data_config:
+            train_ratio = float(data_config.get('train_ratio', 0.7))
+            val_ratio = float(data_config.get('val_ratio', 0.2))
+            test_ratio = float(data_config.get('test_ratio', 0.1))
+            
+            total_ratio = train_ratio + val_ratio + test_ratio
+            if abs(total_ratio - 1.0) > 1e-6:
+                raise ValueError(f"データ分割比率の合計が1.0でありません: {total_ratio}")
+
     print("設定ファイル検証完了")
     return config
 

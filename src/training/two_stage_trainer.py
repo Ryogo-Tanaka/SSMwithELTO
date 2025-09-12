@@ -1237,8 +1237,12 @@ def run_training_experiment(
     Returns:
         実験結果辞書
     """
+    import yaml
     import numpy as np
     from ..utils.gpu_utils import select_device
+
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
     
     # デバイス設定
     if device is None:
@@ -1248,6 +1252,20 @@ def run_training_experiment(
     
     # データ読み込み
     try:
+        from ..utils.data_loader import load_experimental_data
+        
+        # data設定が存在するかチェック
+        if 'data' in config:
+            print(f"📂 統一データローダーでデータ読み込み: {data_path}")
+            data_dict = load_experimental_data(data_path, config['data'])
+            Y_train = data_dict['train'].to(device)
+            print(f"📊 データ形状: {Y_train.shape} (正規化: {data_dict['metadata'].normalization_method})")
+        else:
+            raise ImportError("data設定がないため従来方式を使用")
+            
+    except (ImportError, ModuleNotFoundError, Exception) as e:
+        print(f"⚠️  統一データローダー使用不可、従来方式: {e}")
+        
         data = np.load(data_path)
         if 'Y' in data:
             Y_train = torch.tensor(data['Y'], dtype=torch.float32, device=device)
@@ -1258,9 +1276,7 @@ def run_training_experiment(
             raise ValueError(
                 f"データファイルに 'Y' または 'arr_0' キーが見つかりません。"
                 f"利用可能なキー: {available_keys}"
-            )
-    except Exception as e:
-        raise RuntimeError(f"データ読み込み失敗: {data_path}. エラー: {e}")
+                )
     
     print(f"データ読み込み完了: {Y_train.shape}")
     

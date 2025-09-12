@@ -1,0 +1,267 @@
+# configs/full_experiment_config.yaml
+# タスク3: 実データ学習・評価環境構築 - 完全実験設定
+
+# =====================================
+# データ処理設定
+# =====================================
+data:
+  # データ分割比率
+  train_ratio: 0.7
+  val_ratio: 0.2  
+  test_ratio: 0.1
+  
+  # 正規化方法: "standard", "minmax", "none"
+  normalization: "standard"
+  
+  # 欠損値処理: "interpolate", "forward_fill", "remove"
+  handle_missing: "interpolate"
+  
+  # DataLoader設定
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+
+# =====================================
+# モデル構成
+# =====================================
+model:
+  # TCNエンコーダ設定
+  encoder:
+    input_dim: 7        # データの観測次元数（データに合わせて調整）
+    channels: 64        # TCN隠れ次元
+    layers: 6           # TCN層数
+    kernel_size: 3      # カーネルサイズ
+    activation: "GELU"  # 活性化関数
+    dropout: 0.1        # ドロップアウト率
+
+  # TCNデコーダ設定
+  decoder:
+    output_dim: 7       # 出力観測次元数（input_dimと同じ）
+    window: 8           # Takens埋め込み窓長
+    tau: 1              # 遅延ステップ
+    hidden: 64          # 隠れ次元
+    ma_kernel: 32       # 移動平均窓
+    gru_hidden: 32      # GRU隠れ次元
+    activation: "GELU"
+    dropout: 0.1
+
+# =====================================
+# 状態空間モデル（SSM）設定
+# =====================================
+ssm:
+  # 確率的実現（スカラー特徴量 → 状態）
+  realization:
+    past_horizon: 20    # 過去ブロック長
+    jitter: 1e-4        # 数値安定化パラメータ
+    cond_thresh: 1e12   # 条件数閾値
+    rank: 6             # 状態次元（自動決定される場合もある）
+    reg_type: "sum"     # 特異値正則化タイプ
+
+  # DF-A: 状態層（状態 → 状態予測）
+  df_state:
+    feature_dim: 32     # 状態特徴次元
+    lambda_A: 1e-3      # Stage-1正則化パラメータ
+    lambda_B: 1e-3      # Stage-2正則化パラメータ
+    
+    # 状態特徴ネットワーク φ_θ
+    feature_net:
+      hidden_sizes: [64, 64]
+      activation: "ReLU"
+      dropout: 0.1
+      
+    # クロスフィッティング設定
+    cross_fitting:
+      n_blocks: 5
+      min_block_size: 10
+
+  # DF-B: 観測層（状態予測 → 観測予測）
+  df_observation:
+    obs_feature_dim: 16  # 観測特徴次元
+    lambda_B: 1e-3       # Stage-1正則化
+    lambda_dB: 1e-3      # Stage-2正則化
+    
+    # 観測特徴ネットワーク ψ_ω
+    obs_net:
+      hidden_sizes: [32, 32]
+      activation: "ReLU"
+      dropout: 0.1
+      
+    # クロスフィッティング設定
+    cross_fitting:
+      n_blocks: 5
+      min_block_size: 10
+
+# =====================================
+# 学習設定
+# =====================================
+training:
+  # Kalmanフィルタリング使用フラグ
+  use_kalman_filtering: true
+  
+  # Phase-1設定（DF学習）
+  phase1:
+    epochs: 50          # Phase-1エポック数
+    T1_iterations: 10   # Stage-1反復数
+    T2_iterations: 5    # Stage-2反復数
+    
+    # DF-A設定
+    df_a:
+      warmup_epochs: 10   # DF-Aウォームアップエポック数
+      lr: 1e-3            # 学習率
+      
+    # DF-B設定  
+    df_b:
+      start_epoch: 10     # DF-B開始エポック
+      lr: 1e-3            # 学習率
+
+  # Phase-2設定（End-to-end微調整）
+  phase2:
+    epochs: 100         # Phase-2エポック数
+    lr_encoder: 1e-4    # エンコーダ学習率
+    lr_decoder: 1e-4    # デコーダ学習率
+    lr_phi: 1e-4        # φ_θ学習率
+    lr_psi: 1e-4        # ψ_ω学習率
+    lambda_cca: 0.1     # 正準相関損失重み
+    
+    # 更新戦略: "all", "encoder_decoder", "ssm_only"
+    update_strategy: "all"
+
+  # 一般設定
+  device: "auto"        # "auto", "cuda", "cpu"
+  seed: 42              # 乱数シード
+  gradient_clip: 1.0    # 勾配クリッピング
+  
+  # 早期終了設定
+  early_stopping:
+    patience: 10        # 忍耐エポック数
+    min_delta: 1e-6     # 最小改善幅
+    
+  # チェックポイント設定
+  checkpoint:
+    save_every: 10      # 保存間隔（エポック）
+    keep_best: true     # 最良モデル保持
+
+# =====================================
+# Kalmanフィルタリング設定
+# =====================================
+kalman:
+  # ノイズ推定設定
+  noise_estimation:
+    method: "mle"         # "mle", "map", "moment"
+    obs_noise_init: 1e-2  # 観測ノイズ初期値
+    state_noise_init: 1e-3 # 状態ノイズ初期値
+    min_noise: 1e-6       # ノイズ最小値
+    max_noise: 1e2        # ノイズ最大値
+    
+  # 初期化設定
+  initialization:
+    method: "data_driven"  # "data_driven", "zero", "random"
+    initial_cov_scale: 1.0 # 初期共分散スケール
+    
+  # 数値安定化設定
+  numerical:
+    jitter: 1e-6          # ジッター値
+    regularization: 1e-4   # 正則化パラメータ
+    condition_threshold: 1e12  # 条件数閾値
+
+# =====================================
+# 評価設定
+# =====================================
+evaluation:
+  # 評価指標
+  metrics:
+    - "mse"             # 平均二乗誤差
+    - "mae"             # 平均絶対誤差
+    - "rmse"            # 平方根平均二乗誤差
+    - "mape"            # 平均絶対パーセント誤差
+    - "coverage_rate"   # カバレッジ率（Kalman用）
+    - "log_likelihood"  # 対数尤度
+    
+  # 予測設定
+  forecasting:
+    horizon: 10         # 予測ホライズン
+    n_samples: 100      # サンプル数（不確実性推定）
+    
+  # 可視化設定
+  visualization:
+    n_plot_samples: 200 # プロット用サンプル数
+    plot_dimensions: 3  # プロットする次元数（上位N次元）
+    save_plots: true    # プロット保存フラグ
+
+# =====================================
+# 実験管理設定
+# =====================================
+experiment:
+  # 実験メタデータ
+  name: "full_experiment"
+  version: "v1.0"
+  description: "タスク3: 実データ学習・評価環境構築"
+  
+  # 出力設定
+  output:
+    save_models: true       # モデル保存フラグ
+    save_predictions: true  # 予測結果保存フラグ
+    save_logs: true         # ログ保存フラグ
+    save_plots: true        # プロット保存フラグ
+    compress_results: false # 結果圧縮フラグ
+    
+  # 再現性設定
+  reproducibility:
+    set_deterministic: true   # 決定論的実行
+    log_git_info: true       # Git情報記録
+    save_environment: true   # 環境情報保存
+
+# =====================================
+# ロギング設定
+# =====================================
+logging:
+  level: "INFO"         # ログレベル
+  format: "detailed"    # ログ形式
+  save_to_file: true    # ファイル保存
+  console_output: true  # コンソール出力
+  
+  # 進捗表示設定
+  progress:
+    show_progress_bar: true
+    update_frequency: 10  # 更新頻度（エポック）
+
+# =====================================
+# デバッグ・テスト設定
+# =====================================
+debug:
+  # テスト実行設定
+  test_mode: false      # テストモード（少ないエポック数）
+  quick_run: false      # 高速実行モード
+  
+  # デバッグ出力
+  verbose_training: false    # 詳細学習ログ
+  save_intermediate: false   # 中間結果保存
+  memory_profiling: false    # メモリプロファイリング
+
+# =====================================
+# 環境別オーバーライド設定
+# =====================================
+
+# 開発環境用設定
+development:
+  training:
+    phase1:
+      epochs: 5
+    phase2:
+      epochs: 10
+  debug:
+    test_mode: true
+    verbose_training: true
+
+# 本番環境用設定  
+production:
+  training:
+    phase1:
+      epochs: 100
+    phase2:
+      epochs: 200
+  experiment:
+    output:
+      compress_results: true
+  logging:
+    level: "WARNING"
