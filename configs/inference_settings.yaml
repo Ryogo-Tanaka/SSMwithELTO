@@ -1,0 +1,46 @@
+# configs/inference_settings.yaml
+# 推論専用設定（学習設定と分離）
+
+inference_defaults:
+  # ノイズ推定設定
+  noise_estimation:
+    method: "residual_based"
+    gamma_Q: 1.0e-6
+    gamma_R: 1.0e-6
+    
+  # 初期化設定
+  initialization:
+    method: "data_driven"
+    n_init_samples: 50
+    
+  # 数値安定性
+  numerical:
+    condition_threshold: 1.0e12
+    min_eigenvalue: 1.0e-8
+    jitter: 1.0e-6
+    
+  # ストリーミング設定
+  streaming:
+    buffer_size: 100
+    batch_processing: false
+    anomaly_detection: true
+    anomaly_threshold: 3.0
+    
+  # 出力設定
+  output:
+    save_states: true
+    save_covariances: false
+    save_likelihoods: true
+
+# 環境別設定オーバーライド
+development:
+  numerical:
+    jitter: 1.0e-5  # 開発環境では大きめ
+  streaming:
+    buffer_size: 20  # 開発環境では小さめ
+
+production:
+  numerical:
+    condition_threshold: 1.0e10  # 本番では緩めに
+  streaming:
+    anomaly_detection: false  # 本番では異常検知オフ

@@ -1,5 +1,7 @@
 import torch
 from torch.linalg import cholesky, solve_triangular, eigvalsh, svd
+import warnings
+from typing import Optional, Dict, Any, Tuple
 
 class RealizationError(Exception):
     """
@@ -294,6 +296,380 @@ class Realization:
 
         return sv_weight * _reg
 
+    """
+    For filtering method
+    """
+    def filter_with_kalman(
+        self,
+        m_series: torch.Tensor,
+        df_state_layer,  # DFStateLayerインスタンス
+        df_obs_layer,    # DFObservationLayerインスタンス
+        kalman_config: Optional[Dict[str, Any]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        作用素ベースKalman更新による状態推定
+        
+        既存の決定的実現を拡張し、Algorithm 1による逐次状態推定を実行。
+        状態の不確実性（共分散）も出力。
+        
+        Args:
+            m_series: スカラー特徴量系列 (T,)
+            df_state_layer: 学習済みDF-A層
+            df_obs_layer: 学習済みDF-B層  
+            kalman_config: Kalman Filter設定
+            
+        Returns:
+            X_means: 状態平均系列 (T, r)
+            X_covariances: 状態共分散系列 (T, r, r)
+        """
+        if kalman_config is None:
+            kalman_config = {
+                'noise_estimation': {'gamma_Q': 1e-6, 'gamma_R': 1e-6},
+                'initialization': {'method': 'data_driven'},
+                'device': 'cpu'
+            }
+        
+        # 1. 従来のfilter()で初期状態推定
+        if m_series.dim() == 1:
+            m_input = m_series.unsqueeze(1)  # (T,) → (T, 1)
+        else:
+            m_input = m_series
+            
+        X_initial = self.filter(m_input)  # (T_eff, r)
+        T_eff, r = X_initial.shape
+        
+        print(f"Initial state estimation: {X_initial.shape}")
+        
+        # 2. 演算子抽出と推論エンジン作成  
+        try:
+            estimator = self._create_kalman_estimator(
+                df_state_layer, df_obs_layer, kalman_config
+            )
+        except Exception as e:
+            warnings.warn(f"Kalman estimator creation failed: {e}. Using deterministic fallback.")
+            return self._deterministic_fallback(X_initial)
+        
+        # 3. Algorithm 1実行
+        try:
+            # キャリブレーションデータ準備（初期部分を使用）
+            n_calib = min(20, len(m_series) // 3)
+            calib_data = self._prepare_calibration_data(m_series[:n_calib])
+            
+            # ノイズ推定と初期化
+            estimator.estimate_noise_covariances(calib_data)
+            estimator.initialize_filtering(calib_data[:10] if len(calib_data) > 10 else calib_data)
+            
+            # 観測系列準備（スカラー特徴量→多変量観測へのダミー変換）
+            observations = self._prepare_observations_for_kalman(m_series)
+            
+            # バッチフィルタリング実行
+            X_means, X_covariances = estimator.filter_sequence(observations)
+            
+            print(f"Kalman filtering completed: X_means={X_means.shape}, X_covariances={X_covariances.shape}")
+            
+            return X_means, X_covariances
+            
+        except Exception as e:
+            warnings.warn(f"Kalman filtering failed: {e}. Using deterministic fallback.")
+            return self._deterministic_fallback(X_initial)
+
+    def _create_kalman_estimator(
+        self,
+        df_state_layer,
+        df_obs_layer,
+        kalman_config: Dict[str, Any]
+    ):
+        """Kalman推論エンジンの作成"""
+        from ..inference.state_estimator import StateEstimator
+        
+        # 転送作用素の抽出確認
+        if not (hasattr(df_state_layer, 'V_A') and df_state_layer.V_A is not None):
+            raise RuntimeError("V_A not found in DF-A layer")
+        if not (hasattr(df_state_layer, 'U_A') and df_state_layer.U_A is not None):
+            raise RuntimeError("U_A not found in DF-A layer")
+        if not (hasattr(df_obs_layer, 'V_B') and df_obs_layer.V_B is not None):
+            raise RuntimeError("V_B not found in DF-B layer")  
+        if not (hasattr(df_obs_layer, 'u_B') and df_obs_layer.u_B is not None):
+            raise RuntimeError("u_B not found in DF-B layer")
+        
+        # StateEstimator設定
+        estimator_config = {
+            'device': kalman_config.get('device', 'cpu'),
+            'model': {
+                'df_state': {
+                    'state_dim': df_state_layer.state_dim,
+                    'feature_dim': df_state_layer.feature_dim
+                },
+                'df_obs': {
+                    'obs_feature_dim': df_obs_layer.obs_feature_dim
+                },
+                'encoder': {
+                    'input_dim': 1  # スカラー特徴量
+                }
+            },
+            'noise_estimation': kalman_config.get('noise_estimation', {}),
+            'initialization': kalman_config.get('initialization', {}),
+            'numerical': kalman_config.get('numerical', {})
+        }
+        
+        # StateEstimator作成
+        estimator = StateEstimator(estimator_config)
+        
+        # 学習済みコンポーネントを手動設定
+        estimator.df_state_layer = df_state_layer
+        estimator.df_obs_layer = df_obs_layer
+        
+        # エンコーダは簡易版（恒等写像）
+        class IdentityEncoder(torch.nn.Module):
+            def forward(self, x):
+                if x.dim() == 1:
+                    return x.unsqueeze(0)  # (T,) → (1, T)
+                return x.squeeze(-1) if x.size(-1) == 1 else x.mean(dim=-1)
+        
+        estimator.encoder = IdentityEncoder()
+        
+        # 演算子抽出
+        estimator.V_A = df_state_layer.V_A.clone().detach()
+        estimator.V_B = df_obs_layer.V_B.clone().detach() 
+        estimator.U_A = df_state_layer.U_A.clone().detach()
+        estimator.u_B = df_obs_layer.u_B.clone().detach()
+        
+        return estimator
+
+    def _prepare_calibration_data(self, m_series: torch.Tensor) -> torch.Tensor:
+        """キャリブレーション用データの準備"""
+        # スカラー特徴量を多変量観測にダミー変換
+        if m_series.dim() == 1:
+            # 遅延埋め込みによる多変量化
+            n_delays = 5
+            calib_data = []
+            for i in range(len(m_series)):
+                delayed = []
+                for d in range(n_delays):
+                    if i - d >= 0:
+                        delayed.append(m_series[i - d])
+                    else:
+                        delayed.append(torch.zeros_like(m_series[0]))
+                calib_data.append(torch.stack(delayed))
+            return torch.stack(calib_data)  # (T, n_delays)
+        else:
+            return m_series
+
+    def _prepare_observations_for_kalman(self, m_series: torch.Tensor) -> torch.Tensor:
+        """Kalman Filter用観測データの準備"""
+        return self._prepare_calibration_data(m_series)
+
+    def _deterministic_fallback(
+        self, 
+        X_initial: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        決定的フォールバック
+        
+        Kalman更新が失敗した場合の代替手段。
+        決定的推定値に固定共分散を付与。
+        """
+        T_eff, r = X_initial.shape
+        
+        # 状態平均はそのまま使用
+        X_means = X_initial
+        
+        # 共分散は固定値（小さな不確実性）
+        base_covariance = 0.01 * torch.eye(r, dtype=X_initial.dtype, device=X_initial.device)
+        X_covariances = base_covariance.unsqueeze(0).expand(T_eff, r, r).clone()
+        
+        warnings.warn("Using deterministic fallback with fixed covariances")
+        
+        return X_means, X_covariances
+
+    # =====================================
+    # 既存機能の改善と追加ユーティリティ
+    # =====================================
+
+    def get_state_statistics(self) -> Dict[str, Any]:
+        """
+        状態推定の統計情報取得
+        
+        Returns:
+            Dict: 統計情報
+        """
+        if not hasattr(self, 'X_state_torch') or self.X_state_torch is None:
+            return {"status": "not_fitted"}
+        
+        X = self.X_state_torch
+        
+        return {
+            "state_shape": X.shape,
+            "state_dimension": X.size(1),
+            "sequence_length": X.size(0),
+            "state_statistics": {
+                "mean": torch.mean(X, dim=0).tolist(),
+                "std": torch.std(X, dim=0).tolist(),
+                "min": torch.min(X, dim=0)[0].tolist(),
+                "max": torch.max(X, dim=0)[0].tolist()
+            },
+            "singular_values": {
+                "values": self._L_vals.tolist() if hasattr(self, '_L_vals') and self._L_vals is not None else None,
+                "condition_number": (self._L_vals.max() / self._L_vals.min()).item() if hasattr(self, '_L_vals') and self._L_vals is not None else None
+            }
+        }
+
+    def predict_states(
+        self,
+        n_steps: int = 1,
+        method: str = "linear"
+    ) -> torch.Tensor:
+        """
+        状態の将来予測
+        
+        Args:
+            n_steps: 予測ステップ数
+            method: 予測手法 ("linear" | "last_value")
+            
+        Returns:
+            torch.Tensor: 予測状態 (n_steps, r)
+        """
+        if not hasattr(self, 'X_state_torch') or self.X_state_torch is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+        
+        X = self.X_state_torch
+        T, r = X.shape
+        
+        if method == "linear":
+            # 線形外挿
+            if T >= 2:
+                trend = X[-1] - X[-2]  # 最新のトレンド
+                predictions = []
+                for step in range(1, n_steps + 1):
+                    pred = X[-1] + step * trend
+                    predictions.append(pred)
+                return torch.stack(predictions)
+            else:
+                method = "last_value"  # フォールバック
+        
+        if method == "last_value":
+            # 最後の値を繰り返し
+            last_state = X[-1]
+            return last_state.unsqueeze(0).expand(n_steps, r).clone()
+        
+        else:
+            raise ValueError(f"Unknown prediction method: {method}")
+
+    def validate_kalman_compatibility(
+        self,
+        df_state_layer,
+        df_obs_layer
+    ) -> Dict[str, Any]:
+        """
+        Kalman更新との互換性検証
+        
+        Args:
+            df_state_layer: DF-A層
+            df_obs_layer: DF-B層
+            
+        Returns:
+            Dict: 検証結果
+        """
+        validation = {
+            "compatible": True,
+            "issues": [],
+            "requirements_met": {},
+            "recommendations": []
+        }
+        
+        # 必須コンポーネントの存在確認
+        requirements = [
+            ("df_state_layer.V_A", hasattr(df_state_layer, 'V_A') and df_state_layer.V_A is not None),
+            ("df_state_layer.U_A", hasattr(df_state_layer, 'U_A') and df_state_layer.U_A is not None),
+            ("df_obs_layer.V_B", hasattr(df_obs_layer, 'V_B') and df_obs_layer.V_B is not None),
+            ("df_obs_layer.u_B", hasattr(df_obs_layer, 'u_B') and df_obs_layer.u_B is not None),
+            ("realization_fitted", hasattr(self, 'X_state_torch') and self.X_state_torch is not None)
+        ]
+        
+        for req_name, req_met in requirements:
+            validation["requirements_met"][req_name] = req_met
+            if not req_met:
+                validation["compatible"] = False
+                validation["issues"].append(f"Missing requirement: {req_name}")
+        
+        # 次元整合性チェック
+        if validation["compatible"]:
+            try:
+                r_realization = self.rank if self.rank is not None else self.X_state_torch.size(1)
+                r_df_state = df_state_layer.state_dim
+                
+                if r_realization != r_df_state:
+                    validation["issues"].append(f"State dimension mismatch: realization={r_realization}, df_state={r_df_state}")
+                    validation["compatible"] = False
+                    
+                # 特徴次元
+                dA = df_state_layer.feature_dim
+                dB = df_obs_layer.obs_feature_dim
+                
+                validation["dimensions"] = {
+                    "state_dim": r_realization,
+                    "feature_dim_A": dA,
+                    "feature_dim_B": dB
+                }
+                
+                # 推奨事項
+                if dA < 2 * r_realization:
+                    validation["recommendations"].append(f"Consider increasing feature_dim_A (current: {dA}, recommended: >={2*r_realization})")
+                    
+            except Exception as e:
+                validation["compatible"] = False
+                validation["issues"].append(f"Dimension check failed: {e}")
+        
+        return validation
+
+    # =====================================
+    # 設定ファイル対応
+    # =====================================
+
+    def create_kalman_config(
+        self,
+        **overrides
+    ) -> Dict[str, Any]:
+        """
+        Kalman Filter用設定作成
+        
+        Args:
+            **overrides: 設定上書き
+            
+        Returns:
+            Dict: Kalman設定
+        """
+        default_config = {
+            'noise_estimation': {
+                'method': 'residual_based',
+                'gamma_Q': 1e-6,
+                'gamma_R': 1e-6
+            },
+            'initialization': {
+                'method': 'data_driven',
+                'n_init_samples': 10
+            },
+            'numerical': {
+                'condition_threshold': 1e12,
+                'min_eigenvalue': 1e-8,
+                'jitter': 1e-6
+            },
+            'device': 'cpu'
+        }
+        
+        # 上書き適用
+        def deep_update(base_dict, update_dict):
+            for key, value in update_dict.items():
+                if isinstance(value, dict) and key in base_dict:
+                    deep_update(base_dict[key], value)
+                else:
+                    base_dict[key] = value
+        
+        config = default_config.copy()
+        deep_update(config, overrides)
+        
+        return config
+    
 
 def build_realization(cfg) -> Realization:
     """

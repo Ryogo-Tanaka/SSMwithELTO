@@ -235,7 +235,11 @@ class TwoStageTrainer:
     
     def __init__(self, encoder: nn.Module, decoder: nn.Module, realization: Realization,
                  df_state_config: Dict[str, Any], df_obs_config: Dict[str, Any],
-                 training_config: TrainingConfig, device: torch.device, output_dir: str):
+                 training_config: TrainingConfig, device: torch.device, output_dir: str,
+                 use_kalman_filtering: bool = True,
+                calibration_ratio: float = 0.1,
+                auto_inference_setup: bool = True):
+        
         # 基本設定
         self.encoder = encoder.to(device)
         self.decoder = decoder.to(device)
@@ -248,6 +252,15 @@ class TwoStageTrainer:
         # **修正4: 時間調整用の状態管理**
         self._last_X_states_length = None  # 状態系列長キャッシュ
         
+        # ===== 追加：Kalman関連設定 =====
+        self.use_kalman_filtering = use_kalman_filtering
+        self.calibration_ratio = calibration_ratio
+        self.auto_inference_setup = auto_inference_setup
+        
+        # ===== 追加：Kalman用データ =====
+        self.calibration_data: Optional[torch.Tensor] = None
+        self.inference_model: Optional[Any] = None
+
         # DF layers設定保存
         self.df_state_config = df_state_config
         self.df_obs_config = df_obs_config
@@ -345,12 +358,44 @@ class TwoStageTrainer:
         if m_series.dim() == 0:  # スカラーの場合
             m_series = m_series.unsqueeze(0)
         
+        # ===== 追加：キャリブレーションデータ分割 =====
+        if hasattr(self, 'use_kalman_filtering') and self.use_kalman_filtering:
+            n_calib = int(len(Y_train) * getattr(self, 'calibration_ratio', 0.1))
+            self.calibration_data = Y_train[:n_calib].clone()
+            if self.config.verbose:
+                print(f"Calibration data prepared: {self.calibration_data.shape}")
+        
         if self.config.verbose:
             print(f"エンコード完了: {Y_train.shape} -> {m_series.shape}")
         
         # 2. 確率的実現: m_t → x_t
         self.realization.fit(m_series.unsqueeze(1))  # (T,) -> (T, 1)
-        X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
+
+        # ===== 追加：Kalman使用時の分岐処理 =====
+        if (hasattr(self, 'use_kalman_filtering') and self.use_kalman_filtering and 
+            hasattr(self, 'phase1_complete') and self.phase1_complete and
+            hasattr(self, 'df_state') and self.df_state is not None and
+            hasattr(self, 'df_obs') and self.df_obs is not None):
+            
+            try:
+                X_means, X_covariances = self.realization.filter_with_kalman(
+                    m_series, self.df_state, self.df_obs
+                )
+                if self.config.verbose:
+                    print(f"Kalman filtering applied: {X_means.shape}")
+                
+                # ===== 重要：共分散は内部保存、戻り値は既存形式 =====
+                self._last_covariances = X_covariances  # 新しい内部属性
+                X_states = X_means  # 既存変数名で返す
+                
+            except Exception as e:
+                warnings.warn(f"Kalman filtering failed, using deterministic: {e}")
+                X_states = self.realization.filter(m_series.unsqueeze(1))
+                self._last_covariances = None
+        else:
+            # 従来の決定的推定
+            X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
+            self._last_covariances = None
         
         # **修正4: 状態系列長を記録（時間調整用）**
         self._last_X_states_length = X_states.size(0)
@@ -979,6 +1024,158 @@ class TwoStageTrainer:
             summary['final_losses']['phase2'] = self.training_history['phase2_losses'][-1]
         
         return summary
+    
+    """
+    学習後の推論環境自動セットアップ
+    """
+    def post_training_setup(self, Y_train: torch.Tensor) -> Dict[str, Any]:
+        if not self.use_kalman_filtering:
+            return {"status": "kalman_disabled"}
+        
+        if not self.phase1_complete:
+            return {"status": "phase1_incomplete"}
+        
+        print("Setting up post-training inference environment...")
+        
+        try:
+            # 推論設定読み込み（後述の設定ファイルベース手法使用）
+            inference_config = self._load_inference_config()
+            
+            # 一時的なモデル保存
+            temp_model_path = self.output_dir / "temp_inference_model.pth"
+            self._save_inference_ready_model(temp_model_path)
+            
+            # InferenceModel初期化
+            from ..models.inference_model import InferenceModel
+            
+            self.inference_model = InferenceModel(
+                trained_model_path=temp_model_path,
+                inference_config=inference_config
+            )
+            
+            # 推論環境セットアップ
+            self.inference_model.setup_inference(calibration_data=self.calibration_data)
+            
+            # 最終エクスポート
+            self.inference_model.export_for_deployment(
+                export_path=self.output_dir / "inference_deployment"
+            )
+            
+            # 一時ファイル削除
+            if temp_model_path.exists():
+                temp_model_path.unlink()
+            
+            return {"status": "success", "inference_model": self.inference_model}
+            
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
+
+    def _save_inference_ready_model(self, save_path):
+        """推論用モデル保存"""
+        model_state = {
+            'config': {
+                'ssm': {
+                    'realization': {
+                        'past_horizon': self.realization.h,
+                        'rank': self.realization.rank,
+                        'jitter': getattr(self.realization, 'jitter', 1e-3)
+                    },
+                    'df_state': {
+                        'feature_dim': self.df_state.feature_dim,
+                        'state_dim': self.df_state.state_dim
+                    },
+                    'df_observation': {
+                        'obs_feature_dim': self.df_obs.obs_feature_dim
+                    }
+                },
+                'model': {
+                    'encoder': {
+                        'input_dim': getattr(self.encoder, 'input_dim', 7)
+                    }
+                }
+            },
+            'model_state_dict': {
+                'encoder': self.encoder.state_dict(),
+                'decoder': self.decoder.state_dict(),
+                'df_state': {
+                    'phi_theta': self.df_state.phi_theta.state_dict(),
+                    'V_A': self.df_state.V_A,
+                    'U_A': self.df_state.U_A
+                },
+                'df_obs': {
+                    'psi_omega': self.df_obs.psi_omega.state_dict(),
+                    'V_B': self.df_obs.V_B,
+                    'u_B': self.df_obs.u_B
+                }
+            }
+        }
+        torch.save(model_state, save_path)
+
+    def _load_inference_config(self) -> Dict[str, Any]:
+        """推論設定の読み込み（警告のみ版）"""
+        try:
+            from ..config.inference_config_loader import load_inference_config
+            
+            environment = "production" if not self.config.verbose else "development"
+            inference_config = load_inference_config(environment=environment)
+            inference_config["device"] = str(self.device)
+            
+            if self.config.verbose:
+                print(f"推論設定読み込み完了（環境: {environment}）")
+            
+            return inference_config
+            
+        except ImportError as e:
+            warnings.warn(f"InferenceConfigLoaderモジュールが見つかりません: {e}. 内蔵デフォルト値を使用します。")
+            return self._use_builtin_defaults()
+            
+        except FileNotFoundError as e:
+            warnings.warn(f"推論設定ファイルが見つかりません: {e}. 内蔵デフォルト値を使用します。")
+            return self._use_builtin_defaults()
+            
+        except Exception as e:
+            warnings.warn(f"推論設定読み込み中にエラーが発生: {e}. 内蔵デフォルト値を使用します。")
+            return self._use_builtin_defaults()
+
+    def _use_builtin_defaults(self) -> Dict[str, Any]:
+        """内蔵デフォルト値を直接使用"""
+        try:
+            from ..config.inference_config_loader import InferenceConfigLoader
+            
+            # クラスのデフォルト値メソッドを直接使用
+            loader = InferenceConfigLoader.__new__(InferenceConfigLoader)  # __init__回避
+            
+            config = {
+                'device': str(self.device),
+                'noise_estimation': loader._get_default_section('noise_estimation'),
+                'initialization': loader._get_default_section('initialization'),
+                'numerical': loader._get_default_section('numerical'),
+                # streamingとoutputは設定ファイル固有なので直接定義
+                'streaming': {
+                    'buffer_size': 100,
+                    'batch_processing': False,
+                    'anomaly_detection': True,
+                    'anomaly_threshold': 3.0
+                },
+                'output': {
+                    'save_states': True,
+                    'save_covariances': False,
+                    'save_likelihoods': True
+                }
+            }
+            
+            if self.config.verbose:
+                print("内蔵デフォルト値を使用して推論設定を初期化しました")
+            
+            return config
+            
+        except Exception as nested_e:
+            # この場合はクラス自体に問題があるので、エラーを発生させる
+            raise RuntimeError(
+                f"内蔵デフォルト値の取得にも失敗しました: {nested_e}. "
+                f"InferenceConfigLoaderクラスの実装を確認してください。"
+            ) from nested_e
+
 
 
 # ユーティリティ関数
