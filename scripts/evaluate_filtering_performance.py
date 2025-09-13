@@ -27,7 +27,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from src.models.inference_model import InferenceModel
 from src.evaluation.filtering_analysis import FilteringAnalyzer
-from src.evaluation.uncertainty_evaluation import UncertaintyEvaluator
+from src.evaluation.uncertainly_evaluation import UncertaintyEvaluator
 from src.utils.data_loader import load_experimental_data
 
 
