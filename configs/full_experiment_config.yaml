@@ -27,7 +27,7 @@ data:
 model:
   # TCNエンコーダ設定
   encoder:
-    input_dim: 7        # データの観測次元数（データに合わせて調整）
+    input_dim: 6        # データの観測次元数（データに合わせて調整）
     channels: 64        # TCN隠れ次元
     layers: 6           # TCN層数
     kernel_size: 3      # カーネルサイズ
@@ -36,7 +36,7 @@ model:
 
   # TCNデコーダ設定
   decoder:
-    output_dim: 7       # 出力観測次元数（input_dimと同じ）
+    output_dim: 6       # 出力観測次元数（input_dimと同じ）
     window: 8           # Takens埋め込み窓長
     tau: 1              # 遅延ステップ
     hidden: 64          # 隠れ次元

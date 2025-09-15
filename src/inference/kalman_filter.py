@@ -39,6 +39,7 @@ class OperatorBasedKalmanFilter:
         Q: torch.Tensor,             # 状態ノイズ共分散 (dA, dA)
         R: Union[torch.Tensor, float], # 観測ノイズ分散（スカラーまたは行列）
         encoder: nn.Module,          # エンコーダネットワーク（frozen）
+        df_obs_layer: nn.Module = None,  # DF-B層（学習済みψ_ω含む）
         device: str = 'cpu'
     ):
         """
@@ -68,10 +69,16 @@ class OperatorBasedKalmanFilter:
             self.R = torch.tensor(R, dtype=torch.float32, device=self.device)
         else:
             self.R = R.to(self.device)
+            # R can be scalar (univariate) or matrix (multivariate) observation noise
             
         # エンコーダ（推論時は勾配なし）
         self.encoder = encoder
         self.encoder.eval()
+
+        # DF-B層（学習済みψ_ω観測特徴ネットワーク含む）
+        self.df_obs_layer = df_obs_layer
+        if self.df_obs_layer is not None:
+            self.df_obs_layer.eval()
         for param in self.encoder.parameters():
             param.requires_grad = False
             
@@ -80,8 +87,8 @@ class OperatorBasedKalmanFilter:
         self.dB = int(V_B.size(0))  # 特徴空間観測次元
         self.r = int(U_A.size(1))   # 元状態次元
         
-        # 前計算: H ← V_B^T u_B ∈ R^dA
-        self.H = self.V_B.T @ self.u_B  # (dA,)
+        # 定式化では V_B を直接使用する（式51-53）
+        # H = V_B.T @ u_B は旧実装で、新定式化では不要
         
         # 内部状態（逐次処理用）
         self.mu: Optional[torch.Tensor] = None      # µ ∈ R^dA
@@ -245,27 +252,55 @@ class OperatorBasedKalmanFilter:
         """
         # 1. 現在観測のエンコード: m_t ← u_η(y_t) ∈ R
         with torch.no_grad():
+            # TCNエンコーダ用の形状調整: [d] → [1, 1, d]
             if observation.dim() == 1:
-                observation = observation.unsqueeze(0)  # (1, n)
+                observation = observation.unsqueeze(0).unsqueeze(0)  # (1, 1, d)
+            elif observation.dim() == 2:
+                observation = observation.unsqueeze(1)  # (B, 1, d)
             m_t = self.encoder(observation).squeeze()  # scalar
-            
-        # 2. イノベーション共分散: S ← H^T Σ⁻ H + R ∈ R
-        S = self.H.mT @ Sigma_minus @ self.H + self.R  # scalar
+
+            # 1.5. 観測特徴の生成: ψ_ω(m_t) ∈ ℝ^{d_B} (式54で使用)
+            # 簡易実装: 学習済み観測特徴マッピングを近似
+            psi_omega_m_t = self._generate_obs_features_from_scalar(m_t)  # (dB,)
+
+        # 2. 観測予測 (Observation prediction): 式51
+        # ハット{ψ}^{-}_{t} = V_B μ^-_{t} ∈ ℝ^{d_B}
+        psi_pred = self.V_B @ mu_minus  # (dB,)
+
+        # 3. イノベーション共分散 (Innovation covariance): 式52
+        # S_t = V_B Σ^-_t V_B^T + R ∈ ℝ^{d_B × d_B}
+        S = self.V_B @ Sigma_minus @ self.V_B.T + self.R  # (dB, dB)
+
+        # 数値安定性チェック (Check positive definiteness)
+        try:
+            eigenvalues = torch.linalg.eigvals(S).real
+            if torch.any(eigenvalues <= 0):
+                warnings.warn(f"Non-positive definite innovation covariance matrix detected")
+                # Add jitter to diagonal for regularization
+                S = S + self.jitter * torch.eye(S.size(0), device=self.device)
+        except Exception as e:
+            warnings.warn(f"Failed to check positive definiteness: {e}")
+            S = S + self.jitter * torch.eye(S.size(0), device=self.device)
+
+        # 4. Kalmanゲイン (Kalman gain): 式53
+        # K_t = Σ^-_t V_B^T S_t^{-1} ∈ ℝ^{d_A × d_B}
+        try:
+            S_inv = torch.linalg.inv(S)  # (dB, dB)
+            K = Sigma_minus @ self.V_B.T @ S_inv  # (dA, dB)
+        except Exception as e:
+            warnings.warn(f"Failed to invert innovation covariance: {e}")
+            # Use pseudo-inverse as fallback
+            S_pinv = torch.linalg.pinv(S)
+            K = Sigma_minus @ self.V_B.T @ S_pinv  # (dA, dB)
         
-        # 数値安定性チェック
-        if S <= 0:
-            warnings.warn(f"Non-positive innovation covariance: S = {S}")
-            S = torch.tensor(self.jitter, device=self.device)
-            
-        # 3. Kalmanゲイン: K ← Σ⁻ H S^(-1) ∈ R^(dA×1)
-        K = (Sigma_minus @ self.H) / S  # (dA,)
+        # 5. イノベーション更新 (Innovation update): 式54
+        # μ^+_t = μ^-_t + K_t(ψ_ω(m_t) - ハット{ψ}^{-}_t) ∈ ℝ^{d_A}
+        innovation = psi_omega_m_t - psi_pred  # (dB,)
+        mu_plus = mu_minus + K @ innovation  # (dA,) = (dA, dB) @ (dB,)
         
-        # 4. 状態更新: µ ← µ⁻ + K (m_t - H^T µ⁻)
-        innovation = m_t - self.H.mT @ mu_minus  # scalar
-        mu_plus = mu_minus + K * innovation  # (dA,)
-        
-        # 5. 共分散更新: Σ ← Σ⁻ - K H^T Σ⁻
-        Sigma_plus = Sigma_minus - torch.outer(K, self.H.mT @ Sigma_minus)  # (dA, dA)
+        # 6. 共分散更新 (Covariance update): 式55
+        # Σ^+_t = Σ^-_t - K_t V_B Σ^-_t ∈ ℝ^{d_A × d_A}
+        Sigma_plus = Sigma_minus - K @ self.V_B @ Sigma_minus  # (dA, dA)
         
         # 正定値性確保
         Sigma_plus = self._regularize_covariance(Sigma_plus)
@@ -510,3 +545,52 @@ class OperatorBasedKalmanFilter:
             }
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    def _generate_obs_features_from_scalar(self, m_t: torch.Tensor) -> torch.Tensor:
+        """
+        スカラー特徴から観測特徴を生成: ψ_ω(m_t) ∈ ℝ^{d_B}
+
+        定式化の式54で必要な観測特徴ベクトルを生成。
+        学習済みDF-B層のψ_ωネットワークが必須。
+
+        Args:
+            m_t: スカラー特徴 (エンコーダ出力) - 0次元または1要素の1次元テンソル
+
+        Returns:
+            psi_omega_m_t: 観測特徴ベクトル (dB,)
+
+        Raises:
+            RuntimeError: DF-B層またはψ_ωネットワークが存在しない場合
+        """
+        with torch.no_grad():
+            # DF-B層とψ_ωネットワークの存在確認（必須）
+            if self.df_obs_layer is None or not hasattr(self.df_obs_layer, 'psi_omega'):
+                raise RuntimeError(
+                    "DF-B layer with psi_omega network is required for observation feature generation. "
+                    "Cannot proceed without learned ψ_ω(m_t) transformation."
+                )
+
+            # m_t の形状を ψ_ω の入力形式に調整
+            # スカラー(0次元) → (1,), 1要素1次元はそのまま
+            if m_t.dim() == 0:
+                m_t_input = m_t.unsqueeze(0)  # (1,)
+            elif m_t.numel() == 1:
+                m_t_input = m_t.flatten()  # 確実に(1,)形状
+            else:
+                raise ValueError(f"m_t must be scalar-like tensor, got shape: {m_t.shape}")
+
+            # 学習済みψ_ωネットワークで観測特徴生成
+            psi_omega_m_t = self.df_obs_layer.psi_omega(m_t_input)  # (dB,) or (1, dB)
+
+            # 出力を(dB,)形状に正規化
+            while psi_omega_m_t.dim() > 1 and psi_omega_m_t.size(0) == 1:
+                psi_omega_m_t = psi_omega_m_t.squeeze(0)
+
+            # 最終確認: 1次元テンソルであることを保証
+            if psi_omega_m_t.dim() != 1:
+                raise RuntimeError(
+                    f"psi_omega output has unexpected shape: {psi_omega_m_t.shape}. "
+                    f"Expected 1D tensor (dB,) for observation features."
+                )
+
+            return psi_omega_m_t

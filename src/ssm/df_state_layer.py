@@ -168,8 +168,8 @@ class DFStateLayer(nn.Module):
         if N < d_A:
             warnings.warn(f"サンプル数 {N} < 特徴次元 {d_A}。数値不安定の可能性")
         
-        # デバッグプリント追加 debug
-        print(f"DEBUG : After conversion: d_A={d_A}, type={type(d_A)}")
+        # デバッグプリント追加 debug - コメントアウト
+        # print(f"DEBUG : After conversion: d_A={d_A}, type={type(d_A)}")
         
         # グラム行列 + 正則化（d_Aは確実にint）
         XtX = X_features.T @ X_features  # (d_A, d_A)
@@ -755,3 +755,35 @@ class DFStateLayer(nn.Module):
             state_dict['stage2_cache'] = self._stage2_cache.copy()
             
         return state_dict
+    
+    def get_inference_state_dict(self) -> Dict[str, Any]:
+        """推論用のstate_dictを取得（filtering評価用にV_A/U_Aを含める）"""
+        state_dict = {
+            'phi_theta': self.phi_theta.state_dict(),
+        }
+
+        # filtering評価では学習済みV_A, U_Aが必要なので含める
+        if hasattr(self, 'V_A') and self.V_A is not None:
+            state_dict['V_A'] = self.V_A
+        if hasattr(self, 'U_A') and self.U_A is not None:
+            state_dict['U_A'] = self.U_A
+
+        # configは除外（推論時には設定ファイルから読み込むため不要）
+        # キャッシュも推論には不要なので除外
+
+        return state_dict
+
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
+        """カスタムload_state_dict: V_A/U_Aも適切に設定"""
+        # V_A, U_Aを別途処理
+        v_a = state_dict.pop('V_A', None)
+        u_a = state_dict.pop('U_A', None)
+
+        # 通常のパラメータを読み込み
+        super().load_state_dict(state_dict, strict=strict)
+
+        # V_A, U_Aを設定
+        if v_a is not None:
+            self.V_A = v_a.to(self.device) if hasattr(self, 'device') else v_a
+        if u_a is not None:
+            self.U_A = u_a.to(self.device) if hasattr(self, 'device') else u_a

@@ -35,9 +35,10 @@ import sys
 import argparse
 import yaml
 import json
+import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # プロジェクト設定
 sys.path.append(str(Path(__file__).parent.parent))
@@ -95,12 +96,47 @@ class Task4EvaluationPipeline:
         for subdir in subdirs:
             (self.output_dir / subdir).mkdir(exist_ok=True)
     
-    def _load_config(self) -> Dict[str, Any]:
-        """設定ファイル読み込み"""
+    def _load_config(self, mode: str = 'standard') -> Dict[str, Any]:
+        """設定ファイル読み込み - 複数ドキュメント対応"""
         try:
             with open(self.config_path, 'r') as f:
-                config = yaml.safe_load(f)
+                # 複数ドキュメントを全て読み込み
+                documents = list(yaml.safe_load_all(f))
+            
+            # メイン設定から推論設定を取得
+            main_config = documents[0] if documents else {}
+            inference_config = main_config.get('inference', {})
+            
+            # mode別ドキュメント選択
+            if mode == 'quick':
+                # 2つ目のドキュメント: quick_test_evaluation
+                if len(documents) >= 2 and 'quick_test_evaluation' in documents[1]:
+                    config = documents[1]['quick_test_evaluation']
+                    print(f"📝 クイックテスト設定を使用")
+                else:
+                    print(f"⚠️  クイック設定が見つかりません。デフォルト設定を使用")
+                    config = documents[0] if documents else self._get_default_config()
+                    
+            elif mode == 'comprehensive':
+                # 3つ目のドキュメント: comprehensive_evaluation
+                if len(documents) >= 3 and 'comprehensive_evaluation' in documents[2]:
+                    config = documents[2]['comprehensive_evaluation']
+                    print(f"📝 包括的評価設定を使用")
+                else:
+                    print(f"⚠️  包括的設定が見つかりません。デフォルト設定を使用")
+                    config = documents[0] if documents else self._get_default_config()
+                    
+            else:  # mode == 'standard'
+                # 1つ目のドキュメント: デフォルト設定
+                config = documents[0] if documents else self._get_default_config()
+                print(f"📝 標準設定を使用")
+            
+            # 推論設定をマージ
+            if inference_config and 'inference' not in config:
+                config['inference'] = inference_config
+                
             return config
+            
         except Exception as e:
             print(f"⚠️  設定ファイル読み込みエラー: {e}")
             print("📝 デフォルト設定を使用")
@@ -144,8 +180,9 @@ class Task4EvaluationPipeline:
         
         evaluation_results = {}
         
-        # モード別設定調整
-        adjusted_config = self._adjust_config_for_mode(mode)
+        # モード別設定選択・調整
+        mode_config = self._load_config(mode)
+        adjusted_config = self._adjust_config_for_mode(mode, mode_config)
         
         # Stage 1: フィルタリング性能評価
         filtering_results = self._run_filtering_performance_evaluation(
@@ -173,29 +210,63 @@ class Task4EvaluationPipeline:
         
         return evaluation_results
     
-    def _adjust_config_for_mode(self, mode: str) -> Dict[str, Any]:
+    def _adjust_config_for_mode(self, mode: str, base_config: Dict[str, Any] = None) -> Dict[str, Any]:
         """モード別設定調整"""
-        config = self.config.copy()
+        if base_config is None:
+            config = self.config.copy()
+        else:
+            config = base_config.copy()
         
         if mode == 'quick':
             # クイックモード：高速化のための設定
-            config['evaluation']['save_detailed_results'] = False
-            config['evaluation']['create_visualizations'] = False
-            config['evaluation']['data']['max_evaluation_length'] = 100
-            config['uncertainty_analysis']['enabled'] = False
-            config['visualization']['enabled'] = False
+            # 安全な辞書アクセスで既存設定を尊重
+            if 'evaluation' not in config:
+                config['evaluation'] = {}
+            config['evaluation']['save_detailed_results'] = config.get('evaluation', {}).get('save_detailed_results', False)
+            config['evaluation']['create_visualizations'] = config.get('evaluation', {}).get('create_visualizations', False)
+            
+            # データ設定の安全なアクセス
+            if 'evaluation' not in config:
+                config['evaluation'] = {}
+            if 'data' not in config['evaluation']:
+                config['evaluation']['data'] = {}
+            # 実際のYAML構造から値を取得
+            max_len = config.get('data', {}).get('max_evaluation_length', 100)
+            config['evaluation']['data']['max_evaluation_length'] = max_len
+            
+            # その他の設定
+            if 'uncertainty_analysis' not in config:
+                config['uncertainty_analysis'] = {}
+            config['uncertainty_analysis']['enabled'] = config.get('uncertainty_analysis', {}).get('enabled', False)
+            
+            if 'visualization' not in config:
+                config['visualization'] = {}
+            config['visualization']['enabled'] = config.get('visualization', {}).get('enabled', False)
             
         elif mode == 'comprehensive':
-            # 包括モード：最詳細設定
+            # 包括モード：最詳細設定（安全なアクセス）
+            if 'evaluation' not in config:
+                config['evaluation'] = {}
             config['evaluation']['save_detailed_results'] = True
             config['evaluation']['create_visualizations'] = True
+            
+            if 'uncertainty_analysis' not in config:
+                config['uncertainty_analysis'] = {}
             config['uncertainty_analysis']['enabled'] = True
             config['uncertainty_analysis']['temporal_analysis'] = {
                 'trend_analysis': True,
                 'volatility_analysis': True,
                 'autocorr_analysis': True
             }
+            
+            if 'visualization' not in config:
+                config['visualization'] = {}
             config['visualization']['enabled'] = True
+            
+            if 'output' not in config:
+                config['output'] = {}
+            if 'compression' not in config['output']:
+                config['output']['compression'] = {}
             config['output']['compression']['enabled'] = True
             
         # else: 'standard' - デフォルト設定をそのまま使用
@@ -227,12 +298,16 @@ class Task4EvaluationPipeline:
                 'experiment_name', 'filtering_performance'
             )
             
+            # 設定構造の違いを考慮した安全なアクセス
+            evaluation_config = config.get('evaluation', {})
+            data_config = config.get('data', evaluation_config.get('data', {}))
+            
             results = performance_evaluator.evaluate_comprehensive(
                 data_path=data_path,
                 experiment_name=experiment_name,
-                data_split=config['evaluation']['data']['test_split'],
-                save_detailed_results=config['evaluation']['save_detailed_results'],
-                create_visualizations=config['evaluation']['create_visualizations']
+                data_split=data_config.get('test_split', 'test'),
+                save_detailed_results=evaluation_config.get('save_detailed_results', True),
+                create_visualizations=evaluation_config.get('create_visualizations', True)
             )
             
             stage_duration = (datetime.now() - stage_start).total_seconds()
@@ -250,6 +325,8 @@ class Task4EvaluationPipeline:
             
         except Exception as e:
             print(f"❌ Stage 1エラー: {e}")
+            print("❌ 詳細スタックトレース:")
+            traceback.print_exc()
             self.experiment_log['stages'].append({
                 'stage': 1,
                 'name': 'filtering_performance',
@@ -284,11 +361,15 @@ class Task4EvaluationPipeline:
                 'experiment_name', 'method_comparison'
             ) + '_comparison'
             
+            # 設定構造の違いを考慮した安全なアクセス
+            evaluation_config = config.get('evaluation', {})
+            data_config = config.get('data', evaluation_config.get('data', {}))
+            
             results = method_comparator.compare_methods(
                 data_path=data_path,
                 experiment_name=experiment_name,
-                data_split=config['evaluation']['data']['test_split'],
-                save_results=config['evaluation']['save_detailed_results']
+                data_split=data_config.get('test_split', 'test'),
+                save_results=evaluation_config.get('save_detailed_results', True)
             )
             
             stage_duration = (datetime.now() - stage_start).total_seconds()
@@ -306,6 +387,8 @@ class Task4EvaluationPipeline:
             
         except Exception as e:
             print(f"❌ Stage 2エラー: {e}")
+            print("❌ 詳細スタックトレース:")
+            traceback.print_exc()
             self.experiment_log['stages'].append({
                 'stage': 2,
                 'name': 'method_comparison',
@@ -349,6 +432,8 @@ class Task4EvaluationPipeline:
             
         except Exception as e:
             print(f"❌ Stage 3エラー: {e}")
+            print("❌ 詳細スタックトレース:")
+            traceback.print_exc()
             return {'error': str(e), 'status': 'failed'}
     
     def _compute_summary_statistics(self, results: Dict[str, Any]) -> Dict[str, Any]:
@@ -607,12 +692,23 @@ class Task4EvaluationPipeline:
     
     def _make_json_serializable(self, obj):
         """JSON対応形式に変換"""
+        import torch
+        import numpy as np
+
         if isinstance(obj, dict):
             return {k: self._make_json_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._make_json_serializable(v) for v in obj]
         elif isinstance(obj, Path):
             return str(obj)
+        elif isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy().tolist()
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif hasattr(obj, '__float__'):  # numpy scalars
+            return float(obj)
+        elif hasattr(obj, '__int__'):  # numpy int scalars
+            return int(obj)
         else:
             return obj
 
@@ -646,17 +742,21 @@ def main():
     
     args = parser.parse_args()
     
-    # 引数検証
+    # 引数検証 - 必須ファイルのみチェック（configは除外）
     required_files = [
         ('model', args.model),
-        ('data', args.data),
-        ('config', args.config)
+        ('data', args.data)
     ]
     
     for name, filepath in required_files:
         if not Path(filepath).exists():
             print(f"❌ {name}ファイルが見つかりません: {filepath}")
             return 1
+    
+    # 設定ファイルは任意 - 存在しない場合はデフォルト設定を使用
+    if not Path(args.config).exists():
+        print(f"⚠️  設定ファイルが存在しません: {args.config}")
+        print("📝 デフォルト設定で実行します")
     
     print(f"🚀 タスク4統合評価パイプライン")
     print(f"📊 モード: {args.mode}")
@@ -685,7 +785,7 @@ def main():
         return 130
     except Exception as e:
         print(f"\n❌ 評価中にエラーが発生: {e}")
-        import traceback
+        print("❌ 詳細スタックトレース:")
         traceback.print_exc()
         return 1
 

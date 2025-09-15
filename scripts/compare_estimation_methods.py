@@ -19,7 +19,6 @@ import torch
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-import yaml
 import json
 import csv
 from typing import Dict, List, Any
@@ -70,38 +69,19 @@ class EstimationMethodComparator:
         try:
             # 1. Kalman推論モデル
             print("  📊 Kalman推論モデル読み込み...")
-            self.models['kalman'] = InferenceModel.from_trained_model(
+            self.models['kalman'] = InferenceModel(
                 str(self.model_path), str(self.config_path)
             )
             
             # 2. 決定的推論用にトレーナーも読み込み（決定的実現用）
             print("  📈 決定的推論用トレーナー読み込み...")
-            # 設定読み込み
-            with open(self.config_path, 'r') as f:
-                config_dict = yaml.safe_load(f)
-            
-            # 決定的推論用の設定を作成（use_kalman_filtering=False）
-            deterministic_config = config_dict.copy()
-            if 'training' not in deterministic_config:
-                deterministic_config['training'] = {}
-            if 'kalman_filtering' not in deterministic_config['training']:
-                deterministic_config['training']['kalman_filtering'] = {}
-            deterministic_config['training']['kalman_filtering']['enabled'] = False
-            
-            # トレーナー作成（決定的推論用）
-            trainer_config = self._create_trainer_config(deterministic_config)
-            self.deterministic_trainer = TwoStageTrainer(trainer_config, str(self.output_dir / 'temp'))
-            
-            # 学習済み重みを読み込み
-            checkpoint = torch.load(str(self.model_path), map_location=self.device)
-            if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
-                
-            # 必要なコンポーネントに重みを読み込み
-            self.deterministic_trainer.encoder.load_state_dict(state_dict.get('encoder', {}))
-            self.deterministic_trainer.decoder.load_state_dict(state_dict.get('decoder', {}))
+
+            # パラメータから構造を検出して初期化（設定ファイル不要）
+            self.deterministic_trainer = TwoStageTrainer.from_trained_model(
+                str(self.model_path),
+                device=self.device,
+                output_dir=str(self.output_dir / 'temp')
+            )
             
             print("✅ モデル準備完了")
             
@@ -109,15 +89,6 @@ class EstimationMethodComparator:
             print(f"❌ モデル準備エラー: {e}")
             raise
     
-    def _create_trainer_config(self, config_dict: dict):
-        """トレーナー設定の作成"""
-        # 設定から必要な部分を抽出してTrainerConfigオブジェクトを作成
-        # 簡略版実装
-        class TrainerConfig:
-            def __init__(self, config_dict):
-                self.__dict__.update(config_dict)
-                
-        return TrainerConfig(config_dict)
     
     def compare_methods(
         self,
@@ -274,11 +245,31 @@ class EstimationMethodComparator:
             }
             
         except Exception as e:
+            import traceback
+            error_details = {
+                'error_message': str(e),
+                'error_type': type(e).__name__,
+                'full_traceback': traceback.format_exc(),
+                'model_type': type(self.models['kalman']).__name__,
+                'available_methods': [m for m in dir(self.models['kalman']) if not m.startswith('_')],
+                'filter_methods': [m for m in dir(self.models['kalman']) if not m.startswith('_') and 'filter' in m.lower()],
+                'test_data_shape': list(test_data.shape),
+                'model_setup_status': getattr(self.models['kalman'], 'is_setup', 'unknown')
+            }
+
             print(f"  ❌ Kalman推定エラー: {e}")
+            print(f"  🔍 エラータイプ: {type(e).__name__}")
+            print(f"  📊 データ形状: {test_data.shape}")
+            print(f"  🎯 モデルタイプ: {type(self.models['kalman']).__name__}")
+            print(f"  🔧 利用可能なfilterメソッド: {error_details['filter_methods']}")
+            print(f"  ⚙️  モデルセットアップ状況: {error_details['model_setup_status']}")
+            print(f"  📝 詳細トレース:\n{traceback.format_exc()}")
+
             return {
                 'success': False,
                 'method_name': 'Kalman Filtering',
-                'error': str(e)
+                'error': str(e),
+                'error_details': error_details
             }
     
     def _run_deterministic_estimation(self, test_data: torch.Tensor, true_states: torch.Tensor) -> dict:
@@ -294,11 +285,23 @@ class EstimationMethodComparator:
                 self.deterministic_trainer.encoder.eval()
                 encoded = self.deterministic_trainer.encoder(test_data.unsqueeze(0)).squeeze(0)
                 
-                # 実現化による状態推定（簡略版）
-                # 注意：これは簡略実装です。実際の決定的実現の詳細実装が必要です。
+                # 実現化による状態推定（形状調整版）
+                # realization用の2次元形状調整: [T, feature_dim] → [T, d]
                 if hasattr(self.deterministic_trainer, 'realization'):
-                    self.deterministic_trainer.realization.fit(encoded.unsqueeze(1))
-                    X_estimated = self.deterministic_trainer.realization.filter(encoded.unsqueeze(1))
+                    # encodedが[T, feature_dim]の場合、適切に2次元に調整
+                    if encoded.dim() == 2:
+                        if encoded.shape[1] == 1:
+                            encoded_2d = encoded  # [T, 1] ← 既に正しい
+                        else:
+                            # feature_dimが複数の場合、1次元に調整（最初の特徴量を使用）
+                            encoded_2d = encoded[:, :1]  # [T, 1]
+                    elif encoded.dim() == 1:
+                        encoded_2d = encoded.unsqueeze(1)  # [T, 1]
+                    else:
+                        raise ValueError(f"Unexpected encoded dimension: {encoded.dim()}, shape: {encoded.shape}")
+
+                    self.deterministic_trainer.realization.fit(encoded_2d)
+                    X_estimated = self.deterministic_trainer.realization.filter(encoded_2d)
                 else:
                     # フォールバック：エンコード結果をそのまま状態として使用
                     X_estimated = encoded
@@ -326,11 +329,31 @@ class EstimationMethodComparator:
             }
             
         except Exception as e:
+            import traceback
+            error_details = {
+                'error_message': str(e),
+                'error_type': type(e).__name__,
+                'full_traceback': traceback.format_exc(),
+                'trainer_type': type(self.deterministic_trainer).__name__,
+                'available_methods': [m for m in dir(self.deterministic_trainer) if not m.startswith('_')],
+                'realization_methods': [m for m in dir(self.deterministic_trainer) if not m.startswith('_') and 'realization' in m.lower()],
+                'test_data_shape': list(test_data.shape),
+                'has_realization': hasattr(self.deterministic_trainer, 'realization')
+            }
+
             print(f"  ❌ 決定的推定エラー: {e}")
+            print(f"  🔍 エラータイプ: {type(e).__name__}")
+            print(f"  📊 データ形状: {test_data.shape}")
+            print(f"  🎯 トレーナータイプ: {type(self.deterministic_trainer).__name__}")
+            print(f"  🔧 利用可能なrealizationメソッド: {error_details['realization_methods']}")
+            print(f"  ⚙️  realization存在: {error_details['has_realization']}")
+            print(f"  📝 詳細トレース:\n{traceback.format_exc()}")
+
             return {
                 'success': False,
                 'method_name': 'Deterministic Realization',
-                'error': str(e)
+                'error': str(e),
+                'error_details': error_details
             }
     
     def _analyze_method_comparison(self, method_results: dict, true_states: torch.Tensor) -> dict:
@@ -665,8 +688,17 @@ def main():
             data_split=args.data_split,
             save_results=not args.no_save
         )
-        
+
         print(f"\n🎉 推定手法比較完了！")
+        print(f"📊 比較結果: {len(results.get('method_results', {}))}個の手法を比較")
+
+        # 簡潔なサマリー表示
+        if 'method_results' in results:
+            for method_name, result in results['method_results'].items():
+                status = "✅ 成功" if result.get('success', False) else "❌ 失敗"
+                print(f"  • {method_name}: {status}")
+                if not result.get('success', False) and 'error' in result:
+                    print(f"    エラー: {result['error'][:100]}...")
         
     except Exception as e:
         print(f"\n❌ 比較中にエラーが発生: {e}")

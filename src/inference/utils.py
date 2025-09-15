@@ -59,11 +59,10 @@ def estimate_noise_covariances(
     # 正定値性確保
     Q = regularize_covariance(Q)
     R = regularize_covariance(R)
-    
-    # スカラー観測の場合はスカラーに変換
-    if dB == 1:
-        R = R.squeeze().item()
-        
+
+    # R は常にテンソル形式を保持（多変量観測対応）
+    # スカラー観測の場合でも (1,1) 行列として扱う
+
     return Q, R
 
 

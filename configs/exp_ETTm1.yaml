@@ -9,7 +9,7 @@ model:
   # encoder_class: 'models.encoder._mlpEncoder'    # 文字列でクラス名を指定
   encoder:
     type: "_mlp"
-    input_dim:  7
+    input_dim:  6
     output_dim: 8
     hidden_sizes: !!seq [!!int 64, !!int 64, !!int 64]
     activation: "Tanh"
@@ -18,7 +18,7 @@ model:
   decoder:
     type: "_mlp"
     input_dim:  8
-    output_dim: 7
+    output_dim: 6
     hidden_sizes: !!seq [!!int 64, !!int 64, !!int 64]
     activation: "Tanh"
 

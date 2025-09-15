@@ -122,13 +122,60 @@ class Realization:
             W64  = torch.linalg.solve_triangular(
                       L64, torch.eye(dim_H, device=device, dtype=torch.float64), upper=False)
         except RuntimeError as e:
-            print("real.fit failed cholesky decom.")
-            eigvals, eigvecs = torch.linalg.eig(Tp64)   # eigvals: (n,), eigvecs: (n,n) complex
-            eigvals = eigvals.real                   # 形状 (n,)
-            eigvecs = eigvecs.real                   # 形状 (n,n)
-            inv_sqrt = eigvals.rsqrt()       # (n,)
-            D = torch.diag(inv_sqrt)                  # (n, n)
-            W64 = eigvecs @ D @ eigvecs.T               # (n, n)
+            print(f"real.fit failed cholesky decom: {e}")
+            
+            # ========================================
+            # 数値安定性失敗時の対応方針メモ:
+            # 
+            # 選択肢1: 微分可能な変換で数値修正
+            #   - torch.nn.functional.softplus(eigvals, beta=10) + eps_chol
+            #   - 勾配は保持されるが、手法の数学的意味が変わる可能性
+            # 
+            # 選択肢2: 例外エポックスキップ（現在の方針）
+            #   - RealizationErrorを投げてトレーナー側でエポック継続
+            #   - 手法の学習戦略に破綻しない
+            #
+            # 選択肢3: 正則化による事前防止
+            #   - 学習時に固有値負値化を防ぐ正則化項
+            #   - 根本的解決だが実装が複雑
+            # ========================================
+            
+            # NaN/Inf チェック - これ自体が数値破綻の兆候
+            if not torch.isfinite(Tp64).all():
+                print("Critical: Tp64 contains non-finite values.")
+                raise RealizationError("Matrix contains non-finite values - numerical breakdown")
+            
+            # 対称性と固有値分解の最後の試行
+            try:
+                # 対称性チェック
+                is_symmetric = torch.allclose(Tp64, Tp64.T, atol=1e-8)
+                
+                if is_symmetric:
+                    eigvals, eigvecs = torch.linalg.eigh(Tp64)
+                else:
+                    print("Warning: Matrix is not symmetric")
+                    eigvals_complex, eigvecs_complex = torch.linalg.eig(Tp64)
+                    eigvals = eigvals_complex.real
+                    eigvecs = eigvecs_complex.real
+                
+                # 固有値の数値安定性チェック
+                if torch.any(eigvals <= 0) or not torch.isfinite(eigvals).all():
+                    print(f"Unstable eigenvalues: min={eigvals.min().item()}, has_inf={not torch.isfinite(eigvals).all()}")
+                    raise RealizationError("Eigenvalues are numerically unstable")
+                
+                # TODO: 方針変更時はここで eigvals のクリップ等を実装
+                # eigvals = torch.clamp(eigvals, min=eps_chol)  # 勾配途切れ注意
+                
+                inv_sqrt = eigvals.rsqrt()
+                D = torch.diag(inv_sqrt)
+                W64 = eigvecs @ D @ eigvecs.T
+                
+                if not torch.isfinite(W64).all():
+                    raise RealizationError("Final W64 matrix contains non-finite values")
+                    
+            except (RuntimeError, torch.linalg.LinAlgError) as inner_e:
+                print(f"All numerical recovery attempts failed: {inner_e}")
+                raise RealizationError(f"Complete numerical breakdown in realization: {inner_e}")
         
         # 4. ── 正規化 Hankel (float64) --------------------------
         T64 = W64.T @ (H32.to(torch.float64) @ W64)
@@ -419,14 +466,13 @@ class Realization:
         estimator.df_state_layer = df_state_layer
         estimator.df_obs_layer = df_obs_layer
         
-        # エンコーダは簡易版（恒等写像）
-        class IdentityEncoder(torch.nn.Module):
-            def forward(self, x):
-                if x.dim() == 1:
-                    return x.unsqueeze(0)  # (T,) → (1, T)
-                return x.squeeze(-1) if x.size(-1) == 1 else x.mean(dim=-1)
-        
-        estimator.encoder = IdentityEncoder()
+        # エンコーダは学習済みを使用する必要がある
+        # 簡易実装のIdentityEncoderは不適切
+        raise RuntimeError(
+            "Realization-based Kalman filtering requires a trained encoder. "
+            "IdentityEncoder cannot properly replace the learned TCN encoder. "
+            "Use StateEstimator.load_from_checkpoint() with trained components instead."
+        )
         
         # 演算子抽出
         estimator.V_A = df_state_layer.V_A.clone().detach()
@@ -437,23 +483,16 @@ class Realization:
         return estimator
 
     def _prepare_calibration_data(self, m_series: torch.Tensor) -> torch.Tensor:
-        """キャリブレーション用データの準備"""
-        # スカラー特徴量を多変量観測にダミー変換
-        if m_series.dim() == 1:
-            # 遅延埋め込みによる多変量化
-            n_delays = 5
-            calib_data = []
-            for i in range(len(m_series)):
-                delayed = []
-                for d in range(n_delays):
-                    if i - d >= 0:
-                        delayed.append(m_series[i - d])
-                    else:
-                        delayed.append(torch.zeros_like(m_series[0]))
-                calib_data.append(torch.stack(delayed))
-            return torch.stack(calib_data)  # (T, n_delays)
-        else:
-            return m_series
+        """
+        キャリブレーション用データの準備
+
+        注意: ダミー変換は不適切。実際の観測データを使用すべき。
+        """
+        raise RuntimeError(
+            "Dummy calibration data conversion is inappropriate. "
+            "Realization-based filtering should use proper observation data, "
+            "not artificial delay embedding of scalar features."
+        )
 
     def _prepare_observations_for_kalman(self, m_series: torch.Tensor) -> torch.Tensor:
         """Kalman Filter用観測データの準備"""

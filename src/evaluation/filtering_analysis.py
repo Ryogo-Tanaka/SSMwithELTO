@@ -122,10 +122,21 @@ class FilteringAnalyzer:
         start_time = datetime.now()
         
         try:
-            # 推論実行
-            filtering_result = inference_model.filter_sequence(
-                test_data, return_likelihood=True
-            )
+            # 推論実行（防御的チェック付き）
+            if hasattr(inference_model, 'filter_sequence'):
+                filtering_result = inference_model.filter_sequence(
+                    test_data, return_likelihood=True
+                )
+            else:
+                # フォールバック: inference_batchを使用
+                batch_result = inference_model.inference_batch(test_data, return_format='dict')
+                X_means = torch.tensor(batch_result['summary']['mean_trajectory'])
+                X_covariances = torch.tensor(batch_result['summary']['covariance_trajectory'])
+                if 'likelihood' in batch_result['statistics']:
+                    likelihoods = torch.tensor(batch_result['statistics']['likelihood']['likelihood_trajectory'])
+                    filtering_result = (X_means, X_covariances, likelihoods)
+                else:
+                    filtering_result = (X_means, X_covariances)
             
             if len(filtering_result) == 3:
                 X_means, X_covariances, likelihoods = filtering_result
@@ -142,9 +153,33 @@ class FilteringAnalyzer:
                 print(f"  📏 共分散形状: {X_covariances.shape}")
                 
         except Exception as e:
+            import traceback
+            error_details = {
+                'error_message': str(e),
+                'error_type': type(e).__name__,
+                'full_traceback': traceback.format_exc(),
+                'inference_model_type': type(inference_model).__name__,
+                'available_methods': [m for m in dir(inference_model) if not m.startswith('_')],
+                'filter_methods': [m for m in dir(inference_model) if not m.startswith('_') and 'filter' in m.lower()],
+                'test_data_shape': list(test_data.shape),
+                'test_data_type': str(test_data.dtype),
+                'model_setup_status': getattr(inference_model, 'is_setup', 'unknown')
+            }
+
             if verbose:
                 print(f"  ❌ バッチフィルタリングエラー: {e}")
-            return {'error': str(e), 'success': False}
+                print(f"  🔍 エラータイプ: {type(e).__name__}")
+                print(f"  📊 データ形状: {test_data.shape} (dtype: {test_data.dtype})")
+                print(f"  🎯 モデルタイプ: {type(inference_model).__name__}")
+                print(f"  🔧 利用可能なfilterメソッド: {error_details['filter_methods']}")
+                print(f"  ⚙️  モデルセットアップ状況: {error_details['model_setup_status']}")
+                print(f"  📝 詳細トレース:\n{traceback.format_exc()}")
+
+            return {
+                'error': str(e),
+                'success': False,
+                'error_details': error_details
+            }
         
         # 性能評価
         metrics = self.metrics_evaluator.compute_all_metrics(
@@ -174,8 +209,16 @@ class FilteringAnalyzer:
         if verbose:
             print("\n📱 オンラインフィルタリング分析...")
             
-        # フィルタ状態リセット
-        inference_model.reset_state()
+        # フィルタ状態リセット（防御的チェック付き）
+        if hasattr(inference_model, 'reset_state'):
+            inference_model.reset_state()
+        else:
+            # フォールバック: 推論環境の再セットアップ
+            if hasattr(inference_model, 'setup_inference') and inference_model.calibration_data is not None:
+                inference_model.setup_inference(
+                    calibration_data=inference_model.calibration_data,
+                    method='data_driven'
+                )
         
         # 逐次処理
         start_time = datetime.now()
@@ -218,9 +261,37 @@ class FilteringAnalyzer:
                 print(f"  ⚡ 平均ステップ時間: {np.mean(step_times):.4f}秒")
                 
         except Exception as e:
+            import traceback
+            error_details = {
+                'error_message': str(e),
+                'error_type': type(e).__name__,
+                'full_traceback': traceback.format_exc(),
+                'inference_model_type': type(inference_model).__name__,
+                'available_methods': [m for m in dir(inference_model) if not m.startswith('_')],
+                'reset_methods': [m for m in dir(inference_model) if not m.startswith('_') and 'reset' in m.lower()],
+                'streaming_methods': [m for m in dir(inference_model) if not m.startswith('_') and 'streaming' in m.lower()],
+                'test_data_shape': list(test_data.shape),
+                'test_data_type': str(test_data.dtype),
+                'model_setup_status': getattr(inference_model, 'is_setup', 'unknown'),
+                'streaming_estimator_exists': hasattr(inference_model, 'streaming_estimator') and inference_model.streaming_estimator is not None
+            }
+
             if verbose:
                 print(f"  ❌ オンラインフィルタリングエラー: {e}")
-            return {'error': str(e), 'success': False}
+                print(f"  🔍 エラータイプ: {type(e).__name__}")
+                print(f"  📊 データ形状: {test_data.shape} (dtype: {test_data.dtype})")
+                print(f"  🎯 モデルタイプ: {type(inference_model).__name__}")
+                print(f"  🔧 利用可能なresetメソッド: {error_details['reset_methods']}")
+                print(f"  🌊 利用可能なstreamingメソッド: {error_details['streaming_methods']}")
+                print(f"  ⚙️  モデルセットアップ状況: {error_details['model_setup_status']}")
+                print(f"  🔗 StreamingEstimator存在: {error_details['streaming_estimator_exists']}")
+                print(f"  📝 詳細トレース:\n{traceback.format_exc()}")
+
+            return {
+                'error': str(e),
+                'success': False,
+                'error_details': error_details
+            }
         
         # 性能評価
         metrics = self.metrics_evaluator.compute_all_metrics(

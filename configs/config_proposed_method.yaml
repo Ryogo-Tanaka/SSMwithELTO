@@ -7,7 +7,7 @@
 model:
   # TCNエンコーダ: multivariate → scalar feature
   encoder:
-    input_dim: 7        # 入力観測次元 d
+    input_dim: 6        # 入力観測次元 d
     channels: 64        # TCN隠れ次元
     layers: 6           # TCN層数
     kernel_size: 3      # カーネルサイズ
@@ -16,7 +16,7 @@ model:
 
   # TCNデコーダ: scalar feature → multivariate observation  
   decoder:
-    output_dim: 7       # 出力観測次元 d
+    output_dim: 6       # 出力観測次元 d
     window: 8           # Takens窓長
     tau: 1              # 遅延ステップ
     hidden: 64          # 隠れ次元

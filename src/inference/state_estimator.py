@@ -22,6 +22,7 @@ from .utils import (
     initialize_state_data_driven,
     format_filter_results
 )
+from ..ssm.realization import Realization
 
 
 class StateEstimator:
@@ -50,8 +51,9 @@ class StateEstimator:
         
         # コンポーネント
         self.df_state_layer = None      # DF-A
-        self.df_obs_layer = None        # DF-B  
+        self.df_obs_layer = None        # DF-B
         self.encoder = None             # エンコーダ
+        self.realization = None         # 状態空間実現
         self.kalman_filter = None       # Kalman Filter
         
         # 学習済みパラメータ
@@ -137,6 +139,19 @@ class StateEstimator:
         except Exception as e:
             raise RuntimeError(f"Failed to load model components: {e}")
 
+    def _flatten_nested_state_dict(self, nested_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """ネストしたstate_dictを平坦化"""
+        flattened = {}
+        for key, value in nested_dict.items():
+            if isinstance(value, dict) and hasattr(value, 'keys'):
+                # OrderedDict等の辞書形式の場合、キーを結合
+                for sub_key, sub_value in value.items():
+                    flattened[f"{key}.{sub_key}"] = sub_value
+            else:
+                # 通常の値はそのまま
+                flattened[key] = value
+        return flattened
+
     def _load_df_state_component(self, df_state_dict: Dict[str, Any]):
         """DF-A コンポーネント読み込み"""
         from ..ssm.df_state_layer import DFStateLayer
@@ -148,10 +163,14 @@ class StateEstimator:
             state_dim=state_config.get('state_dim', 5),
             feature_dim=state_config.get('feature_dim', 16),
             lambda_A=state_config.get('lambda_A', 1e-3),
-            lambda_B=state_config.get('lambda_B', 1e-3)
+            lambda_B=state_config.get('lambda_B', 1e-3),
+            feature_net_config=state_config.get('feature_net'),
+            cross_fitting_config=state_config.get('cross_fitting')
         ).to(self.device)
         
-        self.df_state_layer.load_state_dict(df_state_dict)
+        # ネストしたstate_dictを平坦化
+        flattened_state_dict = self._flatten_nested_state_dict(df_state_dict)
+        self.df_state_layer.load_state_dict(flattened_state_dict)
         self.df_state_layer.eval()
 
     def _load_df_obs_component(self, df_obs_dict: Dict[str, Any]):
@@ -164,10 +183,15 @@ class StateEstimator:
             df_state_layer=self.df_state_layer,  # DF-A参照
             obs_feature_dim=obs_config.get('obs_feature_dim', 8),
             lambda_B=obs_config.get('lambda_B', 1e-3),
-            lambda_dB=obs_config.get('lambda_dB', 1e-3)
+            lambda_dB=obs_config.get('lambda_dB', 1e-3),
+            obs_net_config=obs_config.get('obs_net'),
+            cross_fitting_config=obs_config.get('cross_fitting')
         ).to(self.device)
         
-        self.df_obs_layer.load_state_dict(df_obs_dict)
+        # ネストしたstate_dictを平坦化
+        flattened_obs_dict = self._flatten_nested_state_dict(df_obs_dict)
+        # phi_thetaは既にdf_state_layerから共有参照されるため、strict=Falseで読み込み
+        self.df_obs_layer.load_state_dict(flattened_obs_dict, strict=False)
         self.df_obs_layer.eval()
 
     def _load_encoder_component(self, encoder_dict: Dict[str, Any]):
@@ -176,15 +200,36 @@ class StateEstimator:
         
         encoder_config = self.config.get('model', {}).get('encoder', {})
         
+        # 保存されたパラメータから実際の構造を逆算
+        actual_channels = self._detect_encoder_channels(encoder_dict)
+        actual_layers = self._detect_encoder_layers(encoder_dict)
+        
+        print(f"DEBUG: Detected encoder - channels: {actual_channels}, layers: {actual_layers}")
+        
         self.encoder = tcnEncoder(
-            input_dim=encoder_config.get('input_dim', 7),
+            input_dim=encoder_config.get('input_dim', 6),
             output_dim=1,  # スカラー特徴量
-            channels=encoder_config.get('channels', 64),
-            layers=encoder_config.get('layers', 6)
+            channels=actual_channels,
+            layers=actual_layers
         ).to(self.device)
         
         self.encoder.load_state_dict(encoder_dict)
         self.encoder.eval()
+    
+    def _detect_encoder_channels(self, encoder_dict: Dict[str, Any]) -> int:
+        """保存されたパラメータからchannels数を検出"""
+        if 'in_proj.weight' in encoder_dict:
+            return encoder_dict['in_proj.weight'].shape[0]
+        return 64  # デフォルト
+    
+    def _detect_encoder_layers(self, encoder_dict: Dict[str, Any]) -> int:
+        """保存されたパラメータからlayers数を検出"""
+        tcn_layers = []
+        for key in encoder_dict.keys():
+            if key.startswith('tcn.') and '.conv.weight' in key:
+                layer_num = int(key.split('.')[1])
+                tcn_layers.append(layer_num)
+        return max(tcn_layers) + 1 if tcn_layers else 6  # デフォルト
         
         # 推論時は勾配なし
         for param in self.encoder.parameters():
@@ -257,11 +302,33 @@ class StateEstimator:
         with torch.no_grad():
             # 1. エンコード: {y_t} → {m_t}
             m_series = self.encoder(calibration_data.unsqueeze(0)).squeeze()  # (T_cal,)
-            
-            # 2. 特徴写像適用: {m_t} → {φ_t}, {ψ_t}
-            # 注意: 実際には学習済みφ_θ, ψ_ωを使用
-            phi_sequence = self._apply_state_feature_mapping(m_series)      # (T_cal+1, dA)
-            psi_sequence = self._apply_obs_feature_mapping(m_series)        # (T_cal+1, dB)
+
+            # 2. 状態空間実現: {m_t} → {x_t}
+            if self.realization is None:
+                # 設定からrealizationパラメータを取得
+                realization_config = self.config.get('ssm', {}).get('realization', {})
+                self.realization = Realization(
+                    past_horizon=realization_config.get('past_horizon', 10),
+                    jitter=realization_config.get('jitter', 1e-6),
+                    cond_thresh=realization_config.get('cond_thresh', 1e10),
+                    rank=realization_config.get('rank', 4),
+                    reg_type=realization_config.get('reg_type', 'sum')
+                )
+                # スカラー系列を (T_cal, 1) に変換してfit
+                self.realization.fit(m_series.unsqueeze(-1))
+
+            # realizationで状態系列を生成: (N, rank) where N = T_cal - 2*h + 1
+            x_series = self.realization.filter(m_series.unsqueeze(-1))
+
+            # 時間対応を合わせるため、m_seriesも同じ範囲を使用
+            # realization.filter は時点 h から h+N-1 に対応
+            h = self.realization.h
+            m_series_aligned = m_series[h:h + x_series.size(0)]  # (N,)
+
+            # 3. 特徴写像適用: {x_t} → {φ_t}, {ψ_t}
+            # 状態系列x_tをφ_θに、対応する時間範囲のスカラー系列m_tをψ_ωに渡す
+            phi_sequence = self._apply_state_feature_mapping(x_series)           # (N+1, dA)
+            psi_sequence = self._apply_obs_feature_mapping(m_series_aligned)     # (N+1, dB)
             
             # 3. 残差計算
             residuals_state, residuals_obs = compute_residuals_from_operators(
@@ -286,87 +353,105 @@ class StateEstimator:
             
         return Q, R
 
-    def _apply_state_feature_mapping(self, m_series: torch.Tensor) -> torch.Tensor:
+    def _apply_state_feature_mapping(self, x_series: torch.Tensor) -> torch.Tensor:
         """
         状態特徴写像 φ_θ の適用
-        
-        注意: 簡易実装。実際は学習済みφ_θを使用する必要がある。
-        
+
+        学習済みDF-A層のφ_θネットワークが必須。
+
         Args:
-            m_series: スカラー特徴系列 (T,)
-            
+            x_series: 状態系列 (N, rank) - realization.filter()の出力
+
         Returns:
-            torch.Tensor: 状態特徴系列 (T+1, dA)
+            torch.Tensor: 状態特徴系列 (N+1, dA)
+
+        Raises:
+            RuntimeError: DF-A層またはφ_θネットワークが存在しない場合
         """
-        T = m_series.size(0)
-        dA = self.V_A.size(0)
-        
-        # 簡易実装: 線形変換 + 遅延埋め込み
-        features = []
-        for t in range(T + 1):
-            if t < T:
-                # 遅延埋め込み
-                delays = []
-                for d in range(min(5, dA)):
-                    if t - d >= 0:
-                        delays.append(m_series[t - d])
-                    else:
-                        delays.append(torch.zeros_like(m_series[0]))
-                feature = torch.stack(delays)
-                
-                # パディング
-                if len(delays) < dA:
-                    padding = torch.zeros(dA - len(delays), device=self.device)
-                    feature = torch.cat([feature, padding])
-                elif len(delays) > dA:
-                    feature = feature[:dA]
-            else:
-                # 最後のサンプル（予測用）
-                feature = features[-1]  # 前のサンプルをコピー
-                
-            features.append(feature[:dA])
-            
-        return torch.stack(features)  # (T+1, dA)
+        # DF-A層とφ_θネットワークの存在確認（必須）
+        if self.df_state_layer is None or not hasattr(self.df_state_layer, 'phi_theta'):
+            raise RuntimeError(
+                "DF-A layer with phi_theta network is required for state feature generation. "
+                "Cannot proceed without learned φ_θ(m_t) transformation."
+            )
+
+        N = x_series.size(0)
+
+        with torch.no_grad():
+            phi_sequence = []
+            for t in range(N + 1):
+                if t < N:
+                    # 学習済みφ_θネットワークで状態特徴生成
+                    x_t_input = x_series[t]  # (rank,) - 状態ベクトル
+                    phi_t = self.df_state_layer.phi_theta(x_t_input)  # (dA,)
+                else:
+                    # 最後の値を使用（予測時）
+                    x_t_input = x_series[-1]  # (rank,) - 状態ベクトル
+                    phi_t = self.df_state_layer.phi_theta(x_t_input)  # (dA,)
+
+                # 出力を(dA,)形状に正規化
+                while phi_t.dim() > 1 and phi_t.size(0) == 1:
+                    phi_t = phi_t.squeeze(0)
+
+                if phi_t.dim() != 1:
+                    raise RuntimeError(
+                        f"phi_theta output has unexpected shape: {phi_t.shape}. "
+                        f"Expected 1D tensor (dA,) for state features."
+                    )
+
+                phi_sequence.append(phi_t)
+
+            return torch.stack(phi_sequence)  # (T+1, dA)
 
     def _apply_obs_feature_mapping(self, m_series: torch.Tensor) -> torch.Tensor:
         """
         観測特徴写像 ψ_ω の適用
-        
+
+        学習済みDF-B層のψ_ωネットワークが必須。
+
         Args:
             m_series: スカラー特徴系列 (T,)
-            
+
         Returns:
             torch.Tensor: 観測特徴系列 (T+1, dB)
+
+        Raises:
+            RuntimeError: DF-B層またはψ_ωネットワークが存在しない場合
         """
-        # 実際の実装では学習済みψ_ωを使用
+        # DF-B層とψ_ωネットワークの存在確認（必須）
+        if self.df_obs_layer is None or not hasattr(self.df_obs_layer, 'psi_omega'):
+            raise RuntimeError(
+                "DF-B layer with psi_omega network is required for observation feature generation. "
+                "Cannot proceed without learned ψ_ω(m_t) transformation."
+            )
+
         T = m_series.size(0)
-        dB = self.V_B.size(0)
-        
-        # 簡易実装
-        if hasattr(self.df_obs_layer, 'psi_omega'):
-            with torch.no_grad():
-                psi_sequence = []
-                for t in range(T + 1):
-                    if t < T:
-                        psi_t = self.df_obs_layer.psi_omega(m_series[t:t+1])  # (dB,)
-                    else:
-                        psi_t = self.df_obs_layer.psi_omega(m_series[-1:])   # 最後の値
-                    psi_sequence.append(psi_t)
-                return torch.stack(psi_sequence)  # (T+1, dB)
-        else:
-            # フォールバック: 線形変換
-            features = []
+
+        with torch.no_grad():
+            psi_sequence = []
             for t in range(T + 1):
                 if t < T:
-                    base = m_series[t]
+                    # 学習済みψ_ωネットワークで観測特徴生成
+                    m_t_input = m_series[t]  # (r,) - 正しい入力次元を保持
+                    psi_t = self.df_obs_layer.psi_omega(m_t_input)  # (dB,)
                 else:
-                    base = m_series[-1]
-                feature = torch.cat([
-                    base.unsqueeze(0),
-                    torch.randn(dB - 1, device=self.device) * 0.1
-                ])
-                features.append(feature)
-            return torch.stack(features)
+                    # 最後の値を使用（予測時）
+                    m_t_input = m_series[-1]  # (r,) - 正しい入力次元を保持
+                    psi_t = self.df_obs_layer.psi_omega(m_t_input)  # (dB,)
+
+                # 出力を(dB,)形状に正規化
+                while psi_t.dim() > 1 and psi_t.size(0) == 1:
+                    psi_t = psi_t.squeeze(0)
+
+                if psi_t.dim() != 1:
+                    raise RuntimeError(
+                        f"psi_omega output has unexpected shape: {psi_t.shape}. "
+                        f"Expected 1D tensor (dB,) for observation features."
+                    )
+
+                psi_sequence.append(psi_t)
+
+            return torch.stack(psi_sequence)  # (T+1, dB)
 
     def initialize_filtering(
         self,
@@ -382,7 +467,7 @@ class StateEstimator:
             initial_data: 初期化用データ (N0, n) or None
             method: 初期化方法 ("data_driven" | "zero")
         """
-        if not all([self.V_A, self.V_B, self.U_A, self.u_B]):
+        if not all([self.V_A is not None, self.V_B is not None, self.U_A is not None, self.u_B is not None]):
             raise RuntimeError("Operators not extracted. Call load_components() first.")
             
         if self.Q is None or self.R is None:
@@ -404,7 +489,7 @@ class StateEstimator:
             for warning in validation["warnings"]:
                 warnings.warn(warning)
                 
-        # Kalman Filter作成
+        # Kalman Filter作成（学習済みDF-B層を渡す）
         self.kalman_filter = OperatorBasedKalmanFilter(
             V_A=self.V_A,
             V_B=self.V_B,
@@ -413,6 +498,7 @@ class StateEstimator:
             Q=self.Q,
             R=self.R,
             encoder=self.encoder,
+            df_obs_layer=self.df_obs_layer,  # 学習済みψ_ω含む
             device=str(self.device)
         )
         

@@ -38,11 +38,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / 'src'))
 
 # 統一データローダー
-from ..utils.data_loader import load_experimental_data, DataMetadata
+from src.utils.data_loader import load_experimental_data, DataMetadata
 
 # 既存の学習クラス
-from ..training.two_stage_trainer import TwoStageTrainer
-from ..utils.gpu_utils import select_device
+from src.training.two_stage_trainer import TwoStageTrainer
+from src.utils.gpu_utils import select_device
 
 
 class FullExperimentPipeline:
@@ -118,6 +118,23 @@ class FullExperimentPipeline:
         print(f"  - 検証データ: {data_dict['val'].shape}")
         print(f"  - テストデータ: {data_dict['test'].shape}")
         
+        # データの次元数を取得して設定を動的に更新
+        data_dim = data_dict['train'].shape[1]  # (T, d) の d を取得
+        if 'model' in self.config:
+            # エンコーダーの入力次元をデータに合わせて更新
+            if 'encoder' in self.config['model']:
+                original_input_dim = self.config['model']['encoder'].get('input_dim', data_dim)
+                self.config['model']['encoder']['input_dim'] = data_dim
+                if original_input_dim != data_dim:
+                    print(f"🔧 エンコーダー入力次元を自動調整: {original_input_dim} → {data_dim}")
+            
+            # デコーダーの出力次元をデータに合わせて更新
+            if 'decoder' in self.config['model']:
+                original_output_dim = self.config['model']['decoder'].get('output_dim', data_dim)
+                self.config['model']['decoder']['output_dim'] = data_dim
+                if original_output_dim != data_dim:
+                    print(f"🔧 デコーダー出力次元を自動調整: {original_output_dim} → {data_dim}")
+        
         # データをデバイスに移動
         for key in ['train', 'val', 'test']:
             data_dict[key] = data_dict[key].to(self.device)
@@ -176,9 +193,11 @@ class FullExperimentPipeline:
         use_kalman = self.config.get('training', {}).get('use_kalman_filtering', False)
         print(f"🔧 Kalmanフィルタリング: {'有効' if use_kalman else '無効'}")
         
+        # 設定辞書を使用してTwoStageTrainerを直接初期化
         trainer = TwoStageTrainer(
             config=self.config,
             device=self.device,
+            output_dir=str(self.output_dir),
             use_kalman_filtering=use_kalman
         )
         
@@ -186,10 +205,7 @@ class FullExperimentPipeline:
         print("🏃‍♂️ Phase-1学習開始...")
         phase1_start = datetime.now()
         
-        phase1_results = trainer.train_phase1(
-            train_data=data_dict['train'],
-            val_data=data_dict['val']
-        )
+        phase1_results = trainer.train_phase1(data_dict['train'])
         
         phase1_elapsed = (datetime.now() - phase1_start).total_seconds()
         print(f"✅ Phase-1完了 ({phase1_elapsed:.1f}秒)")
@@ -198,10 +214,7 @@ class FullExperimentPipeline:
         print("🏃‍♂️ Phase-2学習開始...")
         phase2_start = datetime.now()
         
-        phase2_results = trainer.train_phase2(
-            train_data=data_dict['train'],
-            val_data=data_dict['val']
-        )
+        phase2_results = trainer.train_phase2(data_dict['train'], data_dict['val'])
         
         phase2_elapsed = (datetime.now() - phase2_start).total_seconds()
         print(f"✅ Phase-2完了 ({phase2_elapsed:.1f}秒)")
@@ -296,7 +309,7 @@ class FullExperimentPipeline:
         
         # 最終モデル保存
         model_path = self.output_dir / 'models' / 'final_model.pth'
-        trainer.save_model(str(model_path))
+        trainer._save_inference_ready_model(str(model_path))
         print(f"💾 最終モデル保存: {model_path}")
         
         # 実験設定保存
@@ -324,39 +337,39 @@ class FullExperimentPipeline:
     def _plot_data_overview(self, data_dict: Dict[str, torch.Tensor]):
         """データ概要プロット"""
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle('データ概要', fontsize=14)
+        fig.suptitle('Data Overview', fontsize=14)
         
         # 訓練データの時系列プロット（最初の3次元）
         train_data = data_dict['train'].cpu().numpy()
         for i in range(min(3, train_data.shape[1])):
-            axes[0, 0].plot(train_data[:, i], label=f'特徴量 {i+1}')
-        axes[0, 0].set_title('訓練データ時系列')
+            axes[0, 0].plot(train_data[:, i], label=f'Feature {i+1}')
+        axes[0, 0].set_title('Training Data Time Series')
         axes[0, 0].legend()
         axes[0, 0].grid(True)
         
         # データ分割比率
         sizes = [data_dict['train'].shape[0], data_dict['val'].shape[0], data_dict['test'].shape[0]]
-        axes[0, 1].pie(sizes, labels=['訓練', '検証', 'テスト'], autopct='%1.1f%%')
-        axes[0, 1].set_title('データ分割比率')
+        axes[0, 1].pie(sizes, labels=['Train', 'Val', 'Test'], autopct='%1.1f%%')
+        axes[0, 1].set_title('Data Split Ratio')
         
         # 特徴量分布（訓練データ）
         axes[1, 0].hist(train_data.flatten(), bins=50, alpha=0.7)
-        axes[1, 0].set_title('特徴量値分布')
-        axes[1, 0].set_xlabel('値')
-        axes[1, 0].set_ylabel('頻度')
+        axes[1, 0].set_title('Feature Value Distribution')
+        axes[1, 0].set_xlabel('Value')
+        axes[1, 0].set_ylabel('Frequency')
         axes[1, 0].grid(True)
         
         # データ統計
         stats_text = f"""
-        データ形状: {train_data.shape}
-        平均: {train_data.mean():.3f}
-        標準偏差: {train_data.std():.3f}
-        最小値: {train_data.min():.3f}
-        最大値: {train_data.max():.3f}
+        Data Shape: {train_data.shape}
+        Mean: {train_data.mean():.3f}
+        Std: {train_data.std():.3f}
+        Min: {train_data.min():.3f}
+        Max: {train_data.max():.3f}
         """
         axes[1, 1].text(0.1, 0.5, stats_text, transform=axes[1, 1].transAxes,
                         verticalalignment='center', fontsize=10)
-        axes[1, 1].set_title('データ統計')
+        axes[1, 1].set_title('Data Statistics')
         axes[1, 1].axis('off')
         
         plt.tight_layout()
@@ -366,13 +379,13 @@ class FullExperimentPipeline:
     def _plot_training_progress(self, results: Dict[str, Any]):
         """学習過程可視化"""
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle('学習進捗', fontsize=14)
+        fig.suptitle('Training Progress', fontsize=14)
         
         # Phase-1損失推移（例：実際のresultsから取得）
         if 'phase1' in results and 'losses' in results['phase1']:
             phase1_losses = results['phase1']['losses']
             axes[0, 0].plot(phase1_losses)
-            axes[0, 0].set_title('Phase-1損失推移')
+            axes[0, 0].set_title('Phase-1 Loss')
             axes[0, 0].set_xlabel('Epoch')
             axes[0, 0].set_ylabel('Loss')
             axes[0, 0].grid(True)
@@ -381,7 +394,7 @@ class FullExperimentPipeline:
         if 'phase2' in results and 'losses' in results['phase2']:
             phase2_losses = results['phase2']['losses']
             axes[0, 1].plot(phase2_losses)
-            axes[0, 1].set_title('Phase-2損失推移')
+            axes[0, 1].set_title('Phase-2 Loss')
             axes[0, 1].set_xlabel('Epoch')
             axes[0, 1].set_ylabel('Loss')
             axes[0, 1].grid(True)
@@ -389,19 +402,19 @@ class FullExperimentPipeline:
         # 学習時間比較
         times = [results.get('phase1_time', 0), results.get('phase2_time', 0)]
         axes[1, 0].bar(['Phase-1', 'Phase-2'], times)
-        axes[1, 0].set_title('学習時間比較')
-        axes[1, 0].set_ylabel('時間（秒）')
+        axes[1, 0].set_title('Training Time Comparison')
+        axes[1, 0].set_ylabel('Time (seconds)')
         
         # 学習設定情報
         info_text = f"""
-        Phase-1時間: {results.get('phase1_time', 0):.1f}秒
-        Phase-2時間: {results.get('phase2_time', 0):.1f}秒
-        総時間: {results.get('total_time', 0):.1f}秒
-        Kalman使用: {results.get('use_kalman', False)}
+        Phase-1 Time: {results.get('phase1_time', 0):.1f}s
+        Phase-2 Time: {results.get('phase2_time', 0):.1f}s
+        Total Time: {results.get('total_time', 0):.1f}s
+        Kalman Used: {results.get('use_kalman', False)}
         """
         axes[1, 1].text(0.1, 0.5, info_text, transform=axes[1, 1].transAxes,
                         verticalalignment='center', fontsize=10)
-        axes[1, 1].set_title('学習情報')
+        axes[1, 1].set_title('Training Info')
         axes[1, 1].axis('off')
         
         plt.tight_layout()
@@ -489,21 +502,21 @@ class FullExperimentPipeline:
                         plt.figure(figsize=(10, 6))
                         
                         plt.subplot(1, 2, 1)
-                        plt.plot(encoded[:, 0].cpu().numpy(), label='状態次元1')
-                        plt.plot(encoded[:, 1].cpu().numpy(), label='状態次元2')
-                        plt.title('状態軌跡（時系列）')
-                        plt.xlabel('時間')
-                        plt.ylabel('状態値')
+                        plt.plot(encoded[:, 0].cpu().numpy(), label='State Dim 1')
+                        plt.plot(encoded[:, 1].cpu().numpy(), label='State Dim 2')
+                        plt.title('State Trajectory (Time Series)')
+                        plt.xlabel('Time')
+                        plt.ylabel('State Value')
                         plt.legend()
                         plt.grid(True)
                         
                         plt.subplot(1, 2, 2)
                         plt.scatter(encoded[:, 0].cpu().numpy(), encoded[:, 1].cpu().numpy(), 
                                   c=np.arange(len(encoded)), cmap='viridis', alpha=0.6)
-                        plt.colorbar(label='時間')
-                        plt.title('状態空間プロット')
-                        plt.xlabel('状態次元1')
-                        plt.ylabel('状態次元2')
+                        plt.colorbar(label='Time')
+                        plt.title('State Space Plot')
+                        plt.xlabel('State Dim 1')
+                        plt.ylabel('State Dim 2')
                         plt.grid(True)
                         
                         plt.tight_layout()

@@ -66,7 +66,7 @@ class FilteringPerformanceEvaluator:
         """推論モデルの読み込み"""
         try:
             print(f"📂 モデル読み込み: {self.model_path}")
-            self.inference_model = InferenceModel.from_trained_model(
+            self.inference_model = InferenceModel(
                 str(self.model_path), str(self.config_path)
             )
             print("✅ モデル読み込み完了")

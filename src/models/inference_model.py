@@ -25,8 +25,7 @@ from ..inference.utils import format_filter_results
 @dataclass
 class InferenceConfig:
     """推論設定の構造化"""
-    # モデル読み込み
-    model_path: str
+    # デバイス設定
     device: str = 'auto'
     
     # フィルタリング設定
@@ -78,11 +77,17 @@ class InferenceModel:
         """
         self.model_path = Path(trained_model_path)
         
-        # 設定の解析
+        # 設定の解析 - 複数ドキュメント対応
         if isinstance(inference_config, (str, Path)):
             with open(inference_config, 'r') as f:
-                config_dict = yaml.safe_load(f)
-            self.config = InferenceConfig(**config_dict.get('inference', config_dict))
+                documents = list(yaml.safe_load_all(f))
+                # 最初のドキュメントをデフォルト設定として使用
+                config_dict = documents[0] if documents else {}
+            # 推論設定のみを抽出
+            inference_settings = config_dict.get('inference', {})
+            if not inference_settings:
+                print("⚠️  'inference'セクションが見つかりません。デフォルト設定を使用します。")
+            self.config = InferenceConfig(**inference_settings)
         elif isinstance(inference_config, dict):
             self.config = InferenceConfig(**inference_config)
         elif isinstance(inference_config, InferenceConfig):
@@ -109,7 +114,8 @@ class InferenceModel:
     def setup_inference(
         self,
         calibration_data: Optional[torch.Tensor] = None,
-        config_override: Optional[Dict[str, Any]] = None
+        config_override: Optional[Dict[str, Any]] = None,
+        method: Optional[str] = None
     ):
         """
         推論環境のセットアップ
@@ -119,6 +125,7 @@ class InferenceModel:
         Args:
             calibration_data: キャリブレーション用データ (T_cal, n)
             config_override: 設定上書き用辞書
+            method: 初期化方法の動的オーバーライド ("data_driven", "zero", etc.)
         """
         print("Setting up inference environment...")
         
@@ -127,6 +134,10 @@ class InferenceModel:
             for key, value in config_override.items():
                 if hasattr(self.config, key):
                     setattr(self.config, key, value)
+        
+        # 初期化方法の動的オーバーライド
+        if method is not None:
+            self.config.initialization_method = method
                     
         # StateEstimator作成
         estimator_config = {
@@ -207,18 +218,30 @@ class InferenceModel:
         if 'ssm' in train_config and 'df_state' in train_config['ssm']:
             df_state_config = train_config['ssm']['df_state']
             if hasattr(self.state_estimator, 'config'):
-                self.state_estimator.config['model']['df_state'].update({
+                df_state_update = {
                     'feature_dim': df_state_config.get('feature_dim', 16),
                     'state_dim': train_config['ssm']['realization'].get('rank', 5)
-                })
+                }
+                
+                # feature_net設定も更新
+                if 'feature_net' in df_state_config:
+                    df_state_update['feature_net'] = df_state_config['feature_net']
+                
+                self.state_estimator.config['model']['df_state'].update(df_state_update)
                 
         # DF-B設定
         if 'ssm' in train_config and 'df_observation' in train_config['ssm']:
             df_obs_config = train_config['ssm']['df_observation']
             if hasattr(self.state_estimator, 'config'):
-                self.state_estimator.config['model']['df_obs'].update({
+                df_obs_update = {
                     'obs_feature_dim': df_obs_config.get('obs_feature_dim', 8)
-                })
+                }
+                
+                # obs_net設定も更新
+                if 'obs_net' in df_obs_config:
+                    df_obs_update['obs_net'] = df_obs_config['obs_net']
+                
+                self.state_estimator.config['model']['df_obs'].update(df_obs_update)
                 
         # エンコーダ設定
         if 'model' in train_config and 'encoder' in train_config['model']:
@@ -567,6 +590,75 @@ if __name__ == '__main__':
             diagnostics['streaming_metrics'] = self.streaming_estimator.get_performance_metrics()
             
         return diagnostics
+
+    def filter_sequence(
+        self,
+        observations: torch.Tensor,
+        return_likelihood: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        系列フィルタリング（評価スクリプト用インターフェース）
+
+        注: 類似機能としてinference_batch()が存在しますが、戻り値形式が異なります
+             - inference_batch(): 詳細な統計情報付きの辞書形式
+             - filter_sequence(): 評価スクリプト用のシンプルなタプル形式
+
+        Args:
+            observations: 観測系列 (T, d)
+            return_likelihood: 尤度も返すかどうか
+
+        Returns:
+            (X_means, X_covariances) or (X_means, X_covariances, likelihoods)
+        """
+        if not self.is_setup:
+            raise RuntimeError("Inference not setup. Call setup_inference() first.")
+
+        # StateEstimatorのfilter_sequenceメソッドを直接使用
+        result = self.state_estimator.filter_sequence(observations, return_likelihood=return_likelihood)
+
+        return result
+
+    def filter_online(
+        self,
+        observation: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """
+        オンライン単一ステップフィルタリング（評価スクリプト用インターフェース）
+
+        注: 既存のinference_streaming()はストリーミング用ジェネレータですが、
+             こちらは評価での単一ステップ処理用です
+
+        Args:
+            observation: 単一観測値 (d,)
+
+        Returns:
+            (x_hat, Sigma_x, likelihood): 状態推定、共分散、尤度
+        """
+        if not self.is_setup:
+            raise RuntimeError("Inference not setup. Call setup_inference() first.")
+
+        # StateEstimatorのfilter_onlineメソッドを直接使用
+        result = self.state_estimator.filter_online(observation)
+
+        return result
+
+    def reset_state(self):
+        """
+        フィルタ状態のリセット（オンライン処理用）
+
+        注: inference_streaming()はストリーミング用ですが、
+             こちらはオンライン評価での状態リセット専用です
+        """
+        if not self.is_setup:
+            raise RuntimeError("Inference not setup. Call setup_inference() first.")
+
+        # StateEstimatorの状態リセット
+        if hasattr(self.state_estimator, 'reset_filter_state'):
+            self.state_estimator.reset_filter_state()
+
+        # StreamingEstimatorがある場合もリセット（安全にチェック）
+        if self.streaming_estimator and hasattr(self.streaming_estimator, 'reset'):
+            self.streaming_estimator.reset()
 
     def __repr__(self) -> str:
         status = "setup" if self.is_setup else "not setup"

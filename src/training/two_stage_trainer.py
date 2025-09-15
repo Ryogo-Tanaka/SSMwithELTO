@@ -56,7 +56,7 @@ import gc
 # コンポーネントインポート
 from ..ssm.df_state_layer import DFStateLayer
 from ..ssm.df_observation_layer import DFObservationLayer
-from ..ssm.realization import Realization
+from ..ssm.realization import Realization, RealizationError
 from ..models.architectures.tcn import tcnEncoder, tcnDecoder
 
 
@@ -88,7 +88,7 @@ class TrainingConfig:
     lr_decoder: float = 1e-4 # デコーダ学習率
     
     # ログ・保存設定
-    log_interval: int = 1    # ログ出力間隔（エポック）
+    log_interval: int = 5    # ログ出力間隔（エポック）
     save_interval: int = 10  # モデル保存間隔（エポック）
     verbose: bool = True     # 詳細ログ
     
@@ -118,6 +118,37 @@ class TrainingConfig:
             self.verbose = self.verbose.lower() in ('true', '1', 'yes', 'on')
         else:
             self.verbose = bool(self.verbose)
+
+    @classmethod
+    def from_nested_dict(cls, config_dict: Dict[str, Any]) -> 'TrainingConfig':
+        """入れ子設定辞書から平坦なTrainingConfigを作成"""
+        # デフォルト値を設定
+        phase1_config = config_dict.get('phase1', {})
+        phase2_config = config_dict.get('phase2', {})
+        
+        return cls(
+            # Phase-1設定
+            phase1_epochs=phase1_config.get('epochs', 50),
+            T1_iterations=phase1_config.get('T1_iterations', 10),
+            T2_iterations=phase1_config.get('T2_iterations', 5),
+            df_a_warmup_epochs=phase1_config.get('df_a', {}).get('warmup_epochs', 5),
+            
+            # Phase-2設定
+            phase2_epochs=phase2_config.get('epochs', 100),
+            lambda_cca=phase2_config.get('lambda_cca', 0.1),
+            update_strategy=phase2_config.get('update_strategy', "all"),
+            
+            # 学習率（Phase-2内またはトップレベルから取得）
+            lr_phi=phase2_config.get('lr_phi', phase1_config.get('df_a', {}).get('lr', 1e-3)),
+            lr_psi=phase2_config.get('lr_psi', phase1_config.get('df_b', {}).get('lr', 1e-3)),
+            lr_encoder=phase2_config.get('lr_encoder', 1e-4),
+            lr_decoder=phase2_config.get('lr_decoder', 1e-4),
+            
+            # ログ・保存設定（トップレベルから）
+            log_interval=config_dict.get('log_interval', 5),
+            save_interval=config_dict.get('checkpoint', {}).get('save_every', 10),
+            verbose=config_dict.get('verbose', True)
+        )
 
 
 class TrainingLogger:
@@ -233,13 +264,152 @@ class TwoStageTrainer:
     4. 時間インデックス調整とメモリ効率化
     """
     
-    def __init__(self, encoder: nn.Module, decoder: nn.Module, realization: Realization,
-                 df_state_config: Dict[str, Any], df_obs_config: Dict[str, Any],
-                 training_config: TrainingConfig, device: torch.device, output_dir: str,
+    def __init__(self, encoder: nn.Module = None, decoder: nn.Module = None, realization: Realization = None,
+                 df_state_config: Dict[str, Any] = None, df_obs_config: Dict[str, Any] = None,
+                 training_config: TrainingConfig = None, device: torch.device = None, output_dir: str = None,
                  use_kalman_filtering: bool = True,
                 calibration_ratio: float = 0.1,
-                auto_inference_setup: bool = True):
+                auto_inference_setup: bool = True,
+                config: Dict[str, Any] = None):
         
+        # config引数が渡された場合は設定から初期化
+        if config is not None:
+            self._init_from_config(config, device, output_dir, use_kalman_filtering)
+        else:
+            # 従来の個別引数からの初期化
+            self._init_from_args(encoder, decoder, realization, df_state_config, df_obs_config,
+                               training_config, device, output_dir, use_kalman_filtering,
+                               calibration_ratio, auto_inference_setup)
+    
+    def _init_from_config(self, config: Dict[str, Any], device: torch.device, output_dir: str, 
+                         use_kalman_filtering: bool):
+        """設定辞書からの初期化"""
+        # モデル初期化
+        encoder = tcnEncoder(**config['model']['encoder'])
+        decoder = tcnDecoder(**config['model']['decoder'])
+        realization = Realization(**config['ssm']['realization'])
+        
+        # 設定変換
+        training_config = TrainingConfig.from_nested_dict(config['training'])
+        
+        # 個別引数での初期化に委譲
+        self._init_from_args(encoder, decoder, realization,
+                           config['ssm']['df_state'], config['ssm']['df_observation'],
+                           training_config, device, output_dir, use_kalman_filtering)
+
+    @classmethod
+    def from_trained_model(cls, model_path: str, device: torch.device = None,
+                          output_dir: str = None) -> 'TwoStageTrainer':
+        """学習済みモデルから推論専用インスタンス作成（設定ファイル不要）"""
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if output_dir is None:
+            output_dir = 'temp_inference'
+
+        # 学習済みモデル読み込み
+        checkpoint = torch.load(model_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+
+        # パラメータから構造検出
+        encoder_config = cls._detect_encoder_structure(state_dict.get('encoder', {}))
+        decoder_config = cls._detect_decoder_structure(state_dict.get('decoder', {}))
+
+        # 検出された構造でモデル初期化
+        encoder = tcnEncoder(**encoder_config)
+        decoder = tcnDecoder(**decoder_config)
+
+        # 最小限の設定で初期化
+        realization = Realization(past_horizon=10, rank=3)
+        df_state_config = {'feature_dim': 16}
+        df_obs_config = {'obs_feature_dim': 8}
+        training_config = TrainingConfig()
+
+        # インスタンス作成
+        instance = cls._init_from_args_direct(
+            encoder, decoder, realization, df_state_config, df_obs_config,
+            training_config, device, output_dir, use_kalman_filtering=False
+        )
+
+        # 重みを読み込み
+        instance.encoder.load_state_dict(state_dict.get('encoder', {}))
+        instance.decoder.load_state_dict(state_dict.get('decoder', {}))
+
+        return instance
+
+    @classmethod
+    def _detect_encoder_structure(cls, encoder_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """エンコーダパラメータから構造検出"""
+        # channels検出
+        channels = 32  # デフォルト
+        if 'in_proj.weight' in encoder_dict:
+            channels = encoder_dict['in_proj.weight'].shape[0]
+
+        # layers検出
+        layers = 3  # デフォルト
+        tcn_layers = [int(k.split('.')[1]) for k in encoder_dict.keys()
+                     if k.startswith('tcn.') and '.conv.weight' in k]
+        if tcn_layers:
+            layers = max(tcn_layers) + 1
+
+        # input_dim検出
+        input_dim = 6  # デフォルト
+        if 'in_proj.weight' in encoder_dict:
+            input_dim = encoder_dict['in_proj.weight'].shape[1]
+
+        return {
+            'input_dim': input_dim,
+            'channels': channels,
+            'layers': layers,
+            'kernel_size': 3,
+            'activation': 'GELU',
+            'dropout': 0.1
+        }
+
+    @classmethod
+    def _detect_decoder_structure(cls, decoder_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """デコーダパラメータから構造検出"""
+        # output_dim検出
+        output_dim = 6  # デフォルト
+        if 'out_proj.weight' in decoder_dict:
+            output_dim = decoder_dict['out_proj.weight'].shape[0]
+
+        # hidden検出
+        hidden = 32  # デフォルト
+        if 'takens_proj.weight' in decoder_dict:
+            hidden = decoder_dict['takens_proj.weight'].shape[0]
+
+        return {
+            'output_dim': output_dim,
+            'window': 8,
+            'tau': 1,
+            'hidden': hidden,
+            'ma_kernel': 16,
+            'gru_hidden': 16,
+            'activation': 'GELU',
+            'dropout': 0.1
+        }
+
+    @classmethod
+    def _init_from_args_direct(cls, encoder, decoder, realization, df_state_config,
+                              df_obs_config, training_config, device, output_dir,
+                              use_kalman_filtering):
+        """直接初期化（クラスメソッド用）"""
+        instance = cls.__new__(cls)
+        instance._init_from_args(encoder, decoder, realization, df_state_config,
+                               df_obs_config, training_config, device, output_dir,
+                               use_kalman_filtering, calibration_ratio=0.1,
+                               auto_inference_setup=False)
+        return instance
+    
+    def _init_from_args(self, encoder: nn.Module, decoder: nn.Module, realization: Realization,
+                       df_state_config: Dict[str, Any], df_obs_config: Dict[str, Any],
+                       training_config: TrainingConfig, device: torch.device, output_dir: str,
+                       use_kalman_filtering: bool, calibration_ratio: float = 0.1,
+                       auto_inference_setup: bool = True):
+        """個別引数からの初期化"""
         # 基本設定
         self.encoder = encoder.to(device)
         self.decoder = decoder.to(device)
@@ -292,7 +462,11 @@ class TwoStageTrainer:
         _, r = X_states.shape
         self.df_state = DFStateLayer(
             state_dim=r,
-            **self.df_state_config
+            feature_dim=self.df_state_config['feature_dim'],
+            lambda_A=self.df_state_config['lambda_A'],
+            lambda_B=self.df_state_config['lambda_B'],
+            feature_net_config=self.df_state_config.get('feature_net'),
+            cross_fitting_config=self.df_state_config.get('cross_fitting')
         )
         
         # DF-Aの内部ニューラルネットワークをGPUに移動
@@ -301,7 +475,11 @@ class TwoStageTrainer:
         # DF-B初期化
         self.df_obs = DFObservationLayer(
             df_state_layer=self.df_state,
-            **self.df_obs_config
+            obs_feature_dim=self.df_obs_config['obs_feature_dim'],
+            lambda_B=self.df_obs_config['lambda_B'],
+            lambda_dB=self.df_obs_config['lambda_dB'],
+            obs_net_config=self.df_obs_config.get('obs_net'),
+            cross_fitting_config=self.df_obs_config.get('cross_fitting')
         )
         # DF-Bの内部ニューラルネットワークをGPUに移動
         self.df_obs.psi_omega = self.df_obs.psi_omega.to(self.device)
@@ -369,7 +547,12 @@ class TwoStageTrainer:
             print(f"エンコード完了: {Y_train.shape} -> {m_series.shape}")
         
         # 2. 確率的実現: m_t → x_t
-        self.realization.fit(m_series.unsqueeze(1))  # (T,) -> (T, 1)
+        try:
+            self.realization.fit(m_series.unsqueeze(1))  # (T,) -> (T, 1)
+        except RealizationError as e:
+            print(f"⚠️ RealizationError発生: {e}")
+            # RealizationErrorを上位に再投げして完全エポックスキップを実行
+            raise RealizationError(f"Phase1 realization failed: {e}") from e
 
         # ===== 追加：Kalman使用時の分岐処理 =====
         if (hasattr(self, 'use_kalman_filtering') and self.use_kalman_filtering and 
@@ -456,11 +639,83 @@ class TwoStageTrainer:
             if epoch % self.config.save_interval == 0:
                 self._save_checkpoint(epoch, TrainingPhase.PHASE1_DF_A)
         
+        # Phase-1完了後: DFLayerのfit()でV_A/V_B/U_A/u_Bを計算
+        print("🔄 最終作用素（V_A/V_B/U_A/u_B）計算中...")
+        self._compute_final_operators(Y_train)
+
         self.phase1_complete = True
         print("Phase-1 学習完了")
-        
+
         return self.training_history['phase1_metrics']
-    
+
+    def _compute_final_operators(self, Y_train: torch.Tensor):
+        """Phase-1完了後に最終作用素V_A/V_B/U_A/u_Bを計算"""
+        # データ準備
+        m_series, X_states = self._prepare_data(Y_train)
+
+        # DFStateLayer用データ準備
+        with torch.no_grad():
+            # 状態特徴量計算: φ_θ(x_t)
+            Phi_full = self.df_state.phi_theta(X_states)  # (T, d_A)
+
+            # 時間シフトしたデータ準備（元の学習と同じ時間対応）
+            Phi_minus = Phi_full[:-1]  # φ(x_{t-1}): t=0,...,T-2
+            Phi_plus = Phi_full[1:]    # φ(x_t): t=1,...,T-1
+            X_plus = X_states[1:]      # x_{t}: t=1,...,T-1 (元の学習と同じ)
+
+        # DF-A: V_A, U_A計算
+        print("  🔄 DF-A作用素（V_A/U_A）計算中...")
+        if hasattr(self.df_state, 'cf_config') and self.df_state.cf_config:
+            self.df_state._fit_with_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=True)
+        else:
+            self.df_state._fit_without_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=True)
+
+        print(f"  ✅ V_A shape: {self.df_state.V_A.shape}, U_A shape: {self.df_state.U_A.shape}")
+
+        # DFObservationLayer用データ準備（DF-Aの結果を使用）
+        if hasattr(self, 'df_obs') and self.df_obs is not None:
+            print("  🔄 DF-B作用素（V_B/u_B）計算中...")
+
+            # DF-Aによる1ステップ予測とエンコーダ出力の正しい使用
+            with torch.no_grad():
+                # 1ステップ予測: x̂_{t|t-1} = U_A^T V_A φ(x_{t-1})
+                X_pred = (self.df_state.U_A.T @ (self.df_state.V_A @ Phi_minus.T)).T  # (T-1, d_x)
+                # 予測を特徴量化: φ_θ(x̂_{t|t-1})
+                Phi_pred = self.df_state.phi_theta(X_pred)  # (T-1, d_A)
+
+                # realizationの時間短縮を考慮したエンコーダ出力の取得
+                # realization: T -> T_eff = T - 2*h + 1の短縮
+                h = self.realization.h
+                T_states = X_states.shape[0]  # realization後の状態系列長
+
+                # エンコーダ出力h_tの正しい範囲（realizationと同じ時間範囲）
+                H_curr = m_series[h:h+T_states]  # h_t: realization範囲と一致
+
+                # 観測特徴量: ψ_ω(h_t)
+                Psi_curr = self.df_obs.psi_omega(H_curr.unsqueeze(-1))  # (T_states, d_B)
+
+                # 同時刻の観測
+                m_curr = m_series[h:h+T_states]  # m_t
+
+                # データサイズ調整（最小サイズに合わせる）
+                min_size = min(Phi_pred.shape[0], Psi_curr.shape[0], m_curr.shape[0])
+                Phi_pred = Phi_pred[:min_size]  # φ_θ(x̂_{t|t-1})
+                Psi_curr = Psi_curr[:min_size]  # ψ_ω(h_t)
+                m_curr = m_curr[:min_size]     # m_t
+
+            print(f"    📊 DF-B学習データ: Phi_pred={Phi_pred.shape}, Psi_curr={Psi_curr.shape}, m_curr={m_curr.shape}")
+            print(f"    🕐 時間範囲: h={h}, T_states={T_states}, range=[{h}:{h+T_states}]")
+
+            # DF-B: V_B, u_B計算 (φ_θ(x̂_{t|t-1}) → ψ_ω(h_t)の写像学習)
+            if hasattr(self.df_obs, 'cf_config') and self.df_obs.cf_config:
+                self.df_obs._fit_with_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=True)
+            else:
+                self.df_obs._fit_without_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=True)
+
+            print(f"  ✅ V_B shape: {self.df_obs.V_B.shape}, u_B shape: {self.df_obs.u_B.shape}")
+
+        print("🔄 最終作用素計算完了")
+
     def _train_df_a_epoch(self, X_states: torch.Tensor, epoch: int) -> Dict[str, float]:
         """
         **修正2統合**: DF-A（状態層）のエポック学習（完全グラフ分離版）
@@ -615,13 +870,19 @@ class TwoStageTrainer:
         for epoch in range(self.config.phase2_epochs):
             self.current_epoch = self.config.phase1_epochs + epoch
             
-            # 前向き推論と損失計算
-            loss_total, rec_loss, cca_loss = self._forward_and_loss_phase2(Y_train)
-            
-            # 逆伝播
-            opt_e2e.zero_grad()
-            loss_total.backward()
-            opt_e2e.step()
+            try:
+                # 前向き推論と損失計算
+                loss_total, rec_loss, cca_loss = self._forward_and_loss_phase2(Y_train)
+                
+                # 逆伝播
+                opt_e2e.zero_grad()
+                loss_total.backward()
+                opt_e2e.step()
+                
+            except RealizationError as e:
+                print(f"🔄 Epoch {epoch} スキップ (Phase2数値実現失敗): {e}")
+                # このエポックを完全スキップして次のエポックに進む
+                continue
             
             # ログ記録
             lr_dict = {f'lr_{name}': group['lr'] for name, group in 
@@ -665,7 +926,12 @@ class TwoStageTrainer:
             m_series = m_series.squeeze(1)
         
         # Step 2: 確率的実現 m_t → x_t
-        self.realization.fit(m_series.unsqueeze(1))
+        try:
+            self.realization.fit(m_series.unsqueeze(1))
+        except RealizationError as e:
+            print(f"⚠️ Phase2 RealizationError発生: {e}")
+            # RealizationErrorを上位に再投げして完全エポックスキップを実行
+            raise RealizationError(f"Phase2 realization failed: {e}") from e
         X_states = self.realization.filter(m_series.unsqueeze(1))  # (T_eff, r)
         T_eff = X_states.size(0)
         
@@ -715,7 +981,12 @@ class TwoStageTrainer:
         if m_series.dim() == 2:
             m_series = m_series.squeeze(1)
         
-        self.realization.fit(m_series.unsqueeze(1))
+        try:
+            self.realization.fit(m_series.unsqueeze(1))
+        except RealizationError as e:
+            print(f"⚠️ Evaluation RealizationError発生: {e}")
+            # 評価時はエラーを上位に投げて処理をスキップ
+            raise RealizationError(f"Evaluation realization failed: {e}") from e
         X_states = self.realization.filter(m_series.unsqueeze(1))
         
         # 短縮処理
@@ -782,11 +1053,11 @@ class TwoStageTrainer:
         # 時間整合性検証
         self._validate_time_alignment(X_hat_states, m_aligned, component)
         
-        # デバッグ情報（verbose時のみ）
-        if self.config.verbose and epoch % 10 == 0:
-            print(f"{component}時間調整 - Epoch {epoch}: "
-                  f"X_hat: {X_hat_states.shape}, m_aligned: {m_aligned.shape}, "
-                  f"offset: {total_offset}")
+        # デバッグ情報（verbose時のみ） - コメントアウト
+        # if self.config.verbose and epoch % 10 == 0:
+        #     print(f"{component}時間調整 - Epoch {epoch}: "
+        #           f"X_hat: {X_hat_states.shape}, m_aligned: {m_aligned.shape}, "
+        #           f"offset: {total_offset}")
         
         return m_aligned
     
@@ -852,8 +1123,9 @@ class TwoStageTrainer:
                 f"X_hat={X_hat_states.shape} vs m_aligned={m_aligned.shape}"
             )
         
-        if self.config.verbose:
-            print(f"{component} 時間整合確認: {X_hat_states.shape} ↔ {m_aligned.shape}")
+        # 時間整合確認メッセージ - コメントアウト
+        # if self.config.verbose:
+        #     print(f"{component} 時間整合確認: {X_hat_states.shape} ↔ {m_aligned.shape}")
     
     def _clear_computation_graph(self):
         """
@@ -885,7 +1157,12 @@ class TwoStageTrainer:
             m_warmup = self.encoder(Y_warmup.unsqueeze(0)).squeeze()
             
             # 状態推定
-            self.realization.fit(m_warmup.unsqueeze(1))
+            try:
+                self.realization.fit(m_warmup.unsqueeze(1))
+            except RealizationError as e:
+                print(f"⚠️ Warmup RealizationError発生: {e}")
+                # ウォームアップ時はエラーを上位に投げて処理をスキップ
+                raise RealizationError(f"Warmup realization failed: {e}") from e
             X_warmup = self.realization.filter(m_warmup.unsqueeze(1))
             
             # 逐次予測
@@ -986,19 +1263,134 @@ class TwoStageTrainer:
     
     def _save_final_model(self):
         """最終モデル保存"""
+        print("DEBUG: _save_final_model called")
+        # 学習時の完全な設定を復元
+        complete_config = self._build_complete_config()
+        
         model_state = {
             'encoder': self.encoder.state_dict(),
             'decoder': self.decoder.state_dict(),
-            'df_state': self.df_state.get_state_dict() if self.df_state else None,
-            'df_obs': self.df_obs.get_state_dict() if self.df_obs else None,
+            'df_state': self.df_state.get_inference_state_dict() if self.df_state else None,
+            'df_obs': self.df_obs.get_inference_state_dict() if self.df_obs else None,
             'realization_config': self.realization.__dict__,
-            'training_config': self.config.__dict__
+            'training_config': self.config.__dict__,
+            'config': complete_config  # 推論時に使用される完全な設定
         }
         
         save_path = self.output_dir / 'final_model.pth'
         torch.save(model_state, save_path)
         
         print(f"最終モデル保存: {save_path}")
+    
+    def _build_complete_config(self) -> Dict[str, Any]:
+        """学習時の完全な設定を構築（推論時に使用）"""
+        print("DEBUG: _build_complete_config called")
+        
+        complete_config = {
+            'model': {
+                'encoder': {
+                    'input_dim': getattr(self.encoder, 'input_dim', 6),
+                    'channels': getattr(self.encoder, 'channels', 64),
+                    'layers': getattr(self.encoder, 'layers', 8),
+                    'kernel_size': getattr(self.encoder, 'kernel_size', 3),
+                    'activation': getattr(self.encoder, 'activation', 'GELU'),
+                    'dropout': getattr(self.encoder, 'dropout', 0.1)
+                },
+                'decoder': {
+                    'output_dim': getattr(self.decoder, 'output_dim', 6),
+                    'window': getattr(self.decoder, 'window', 12),
+                    'tau': getattr(self.decoder, 'tau', 1),
+                    'hidden': getattr(self.decoder, 'hidden', 64),
+                    'ma_kernel': getattr(self.decoder, 'ma_kernel', 24),
+                    'gru_hidden': getattr(self.decoder, 'gru_hidden', 32),
+                    'activation': getattr(self.decoder, 'activation', 'GELU'),
+                    'dropout': getattr(self.decoder, 'dropout', 0.1)
+                }
+            },
+            'ssm': {
+                'realization': self.realization.__dict__,
+                'df_state': self._extract_df_state_config(),
+                'df_observation': self._extract_df_obs_config()
+            }
+        }
+        
+        print("DEBUG: _build_complete_config completed")
+        return complete_config
+    
+    def _extract_df_state_config(self) -> Dict[str, Any]:
+        """実際のDFStateLayerから設定を抽出"""
+        base_config = self.df_state_config.copy()
+        
+        print(f"DEBUG: df_state exists: {self.df_state is not None}")
+        
+        # 実際のDFStateLayerから詳細設定を抽出
+        if self.df_state and hasattr(self.df_state, 'phi_theta'):
+            print("DEBUG: df_state has phi_theta")
+            # StateFeatureNetの構造を解析
+            phi_theta = self.df_state.phi_theta
+            print(f"DEBUG: phi_theta type: {type(phi_theta)}")
+            print(f"DEBUG: phi_theta has net: {hasattr(phi_theta, 'net')}")
+            
+            if hasattr(phi_theta, 'net') and len(phi_theta.net) > 0:
+                print(f"DEBUG: phi_theta.net length: {len(phi_theta.net)}")
+                print(f"DEBUG: phi_theta.net layers: {[type(layer).__name__ for layer in phi_theta.net]}")
+                
+                # ネットワーク構造から hidden_sizes を逆算
+                hidden_sizes = []
+                for i, layer in enumerate(phi_theta.net):
+                    print(f"DEBUG: Layer {i}: {type(layer).__name__}")
+                    if hasattr(layer, 'out_features'):
+                        print(f"DEBUG: Layer {i} out_features: {layer.out_features}")
+                        hidden_sizes.append(layer.out_features)
+                
+                print(f"DEBUG: Raw hidden_sizes: {hidden_sizes}")
+                
+                # 最後の層は除く（出力層）
+                if len(hidden_sizes) > 1:
+                    hidden_sizes = hidden_sizes[:-1]
+                    print(f"DEBUG: Final hidden_sizes: {hidden_sizes}")
+                
+                # feature_net 設定を構築
+                base_config['feature_net'] = {
+                    'hidden_sizes': hidden_sizes,
+                    'activation': getattr(phi_theta, 'activation', 'ReLU'),
+                    'dropout': getattr(phi_theta, 'dropout', 0.1)
+                }
+                print(f"DEBUG: Created feature_net config: {base_config['feature_net']}")
+            else:
+                print("DEBUG: phi_theta.net not found or empty")
+        else:
+            print("DEBUG: df_state doesn't have phi_theta")
+        
+        print(f"DEBUG: Final base_config keys: {list(base_config.keys())}")
+        return base_config
+    
+    def _extract_df_obs_config(self) -> Dict[str, Any]:
+        """実際のDFObservationLayerから設定を抽出"""
+        base_config = self.df_obs_config.copy()
+        
+        # 実際のDFObservationLayerから詳細設定を抽出
+        if self.df_obs and hasattr(self.df_obs, 'psi_omega'):
+            psi_omega = self.df_obs.psi_omega
+            if hasattr(psi_omega, 'net') and len(psi_omega.net) > 0:
+                # ネットワーク構造から hidden_sizes を逆算
+                hidden_sizes = []
+                for layer in psi_omega.net:
+                    if hasattr(layer, 'out_features'):
+                        hidden_sizes.append(layer.out_features)
+                
+                # 最後の層は除く（出力層）
+                if len(hidden_sizes) > 1:
+                    hidden_sizes = hidden_sizes[:-1]
+                
+                # obs_net 設定を構築
+                base_config['obs_net'] = {
+                    'hidden_sizes': hidden_sizes,
+                    'activation': getattr(psi_omega, 'activation', 'ReLU'),
+                    'dropout': getattr(psi_omega, 'dropout', 0.1)
+                }
+        
+        return base_config
     
     def get_training_summary(self) -> Dict[str, Any]:
         """学習サマリ取得"""
@@ -1072,6 +1464,8 @@ class TwoStageTrainer:
 
     def _save_inference_ready_model(self, save_path):
         """推論用モデル保存"""
+        print("DEBUG: _save_inference_ready_model called")
+        
         model_state = {
             'config': {
                 'ssm': {
@@ -1080,13 +1474,8 @@ class TwoStageTrainer:
                         'rank': self.realization.rank,
                         'jitter': getattr(self.realization, 'jitter', 1e-3)
                     },
-                    'df_state': {
-                        'feature_dim': self.df_state.feature_dim,
-                        'state_dim': self.df_state.state_dim
-                    },
-                    'df_observation': {
-                        'obs_feature_dim': self.df_obs.obs_feature_dim
-                    }
+                    'df_state': self._extract_df_state_config(),
+                    'df_observation': self._extract_df_obs_config()
                 },
                 'model': {
                     'encoder': {
@@ -1097,16 +1486,8 @@ class TwoStageTrainer:
             'model_state_dict': {
                 'encoder': self.encoder.state_dict(),
                 'decoder': self.decoder.state_dict(),
-                'df_state': {
-                    'phi_theta': self.df_state.phi_theta.state_dict(),
-                    'V_A': self.df_state.V_A,
-                    'U_A': self.df_state.U_A
-                },
-                'df_obs': {
-                    'psi_omega': self.df_obs.psi_omega.state_dict(),
-                    'V_B': self.df_obs.V_B,
-                    'u_B': self.df_obs.u_B
-                }
+                'df_state': self.df_state.get_inference_state_dict(),
+                'df_obs': self.df_obs.get_inference_state_dict()
             }
         }
         torch.save(model_state, save_path)
@@ -1114,7 +1495,7 @@ class TwoStageTrainer:
     def _load_inference_config(self) -> Dict[str, Any]:
         """推論設定の読み込み（警告のみ版）"""
         try:
-            from ..config.inference_config_loader import load_inference_config
+            from configs.inference_config_loader import load_inference_config
             
             environment = "production" if not self.config.verbose else "development"
             inference_config = load_inference_config(environment=environment)
@@ -1140,7 +1521,7 @@ class TwoStageTrainer:
     def _use_builtin_defaults(self) -> Dict[str, Any]:
         """内蔵デフォルト値を直接使用"""
         try:
-            from ..config.inference_config_loader import InferenceConfigLoader
+            from configs.inference_config_loader import InferenceConfigLoader
             
             # クラスのデフォルト値メソッドを直接使用
             loader = InferenceConfigLoader.__new__(InferenceConfigLoader)  # __init__回避

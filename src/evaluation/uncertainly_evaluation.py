@@ -421,9 +421,9 @@ class UncertaintyEvaluator:
         
         plt.subplot(2, 3, 1)
         plt.hist(uncertainties.flatten().cpu().numpy(), bins=50, alpha=0.7, color='skyblue')
-        plt.title('不確実性分布')
-        plt.xlabel('不確実性')
-        plt.ylabel('頻度')
+        plt.title('Uncertainty Distribution')
+        plt.xlabel('Uncertainty')
+        plt.ylabel('Frequency')
         plt.grid(True, alpha=0.3)
         
         # 2. 時系列不確実性
@@ -433,9 +433,9 @@ class UncertaintyEvaluator:
         else:
             temporal_unc = uncertainties.cpu().numpy()
         plt.plot(temporal_unc, color='orange', linewidth=2)
-        plt.title('不確実性の時系列変化')
-        plt.xlabel('時間')
-        plt.ylabel('平均不確実性')
+        plt.title('Uncertainty Time Series')
+        plt.xlabel('Time')
+        plt.ylabel('Mean Uncertainty')
         plt.grid(True, alpha=0.3)
         
         if true_values is not None:
@@ -450,9 +450,9 @@ class UncertaintyEvaluator:
                 uncertainties_flat = uncertainties.cpu().numpy()
             
             plt.scatter(uncertainties_flat, errors_flat, alpha=0.6, color='green')
-            plt.xlabel('不確実性')
-            plt.ylabel('絶対誤差')
-            plt.title('不確実性 vs 誤差')
+            plt.xlabel('Uncertainty')
+            plt.ylabel('Absolute Error')
+            plt.title('Uncertainty vs Error')
             plt.grid(True, alpha=0.3)
             
             # 4. 信頼区間プロット（サンプル）
@@ -478,13 +478,13 @@ class UncertaintyEvaluator:
                 color='blue',
                 alpha=0.6,
                 capsize=3,
-                label='予測±95%信頼区間'
+                label='Prediction ±95% CI'
             )
             plt.scatter(x_pos.cpu().numpy(), sample_true.cpu().numpy(), 
-                       color='red', s=20, label='真値', zorder=5)
-            plt.title('信頼区間サンプル')
-            plt.xlabel('サンプル')
-            plt.ylabel('値')
+                       color='red', s=20, label='True Value', zorder=5)
+            plt.title('Confidence Interval Sample')
+            plt.xlabel('Sample')
+            plt.ylabel('Value')
             plt.legend()
             plt.grid(True, alpha=0.3)
             
@@ -509,11 +509,11 @@ class UncertaintyEvaluator:
                     expected.append(value['expected_coverage'])
                     actual.append(value['actual_coverage'])
             
-            plt.plot(levels, expected, 'r--', label='期待カバレッジ', linewidth=2)
-            plt.plot(levels, actual, 'b-o', label='実際カバレッジ', linewidth=2)
-            plt.xlabel('信頼水準 (%)')
-            plt.ylabel('カバレッジ率')
-            plt.title('カバレッジ率評価')
+            plt.plot(levels, expected, 'r--', label='Expected Coverage', linewidth=2)
+            plt.plot(levels, actual, 'b-o', label='Actual Coverage', linewidth=2)
+            plt.xlabel('Confidence Level (%)')
+            plt.ylabel('Coverage Rate')
+            plt.title('Coverage Rate Evaluation')
             plt.legend()
             plt.grid(True, alpha=0.3)
         
@@ -548,11 +548,11 @@ class UncertaintyEvaluator:
             
             empirical_coverage.append(coverage)
         
-        plt.plot(confidence_levels, confidence_levels, 'r--', label='完全キャリブレーション')
-        plt.plot(confidence_levels, empirical_coverage, 'b-o', label='実際')
-        plt.xlabel('期待カバレッジ')
-        plt.ylabel('実際カバレッジ')
-        plt.title('キャリブレーション曲線')
+        plt.plot(confidence_levels, confidence_levels, 'r--', label='Perfect Calibration')
+        plt.plot(confidence_levels, empirical_coverage, 'b-o', label='Actual')
+        plt.xlabel('Expected Coverage')
+        plt.ylabel('Actual Coverage')
+        plt.title('Calibration Curve')
         plt.legend()
         plt.grid(True, alpha=0.3)
     

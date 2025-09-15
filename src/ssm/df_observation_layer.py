@@ -682,3 +682,36 @@ class DFObservationLayer(nn.Module):
             state_dict['stage2_cache'] = self._stage2_cache.copy()
             
         return state_dict
+    
+    def get_inference_state_dict(self) -> Dict[str, Any]:
+        """推論用のstate_dictを取得（filtering評価用にV_B/u_Bを含める）"""
+        state_dict = {
+            'psi_omega': self.psi_omega.state_dict(),
+        }
+
+        # filtering評価では学習済みV_B, u_Bが必要なので含める
+        if hasattr(self, 'V_B') and self.V_B is not None:
+            state_dict['V_B'] = self.V_B
+        if hasattr(self, 'u_B') and self.u_B is not None:
+            state_dict['u_B'] = self.u_B
+
+        # phi_theta は推論時にdf_state_layerから共有参照されるため保存不要
+        # configは除外（推論時には設定ファイルから読み込むため不要）
+        # キャッシュも推論には不要なので除外
+
+        return state_dict
+
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
+        """カスタムload_state_dict: V_B/u_Bも適切に設定"""
+        # V_B, u_Bを別途処理
+        v_b = state_dict.pop('V_B', None)
+        u_b = state_dict.pop('u_B', None)
+
+        # 通常のパラメータを読み込み
+        super().load_state_dict(state_dict, strict=strict)
+
+        # V_B, u_Bを設定
+        if v_b is not None:
+            self.V_B = v_b.to(self.device) if hasattr(self, 'device') else v_b
+        if u_b is not None:
+            self.u_B = u_b.to(self.device) if hasattr(self, 'device') else u_b
