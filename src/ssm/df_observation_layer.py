@@ -204,7 +204,114 @@ class DFObservationLayer(nn.Module):
                 V_B = PsiTPhi @ PhiTPhi_inv
         
         return V_B
-    
+
+    def _ridge_stage1_vb_with_grad(
+        self,
+        Phi_instrument: torch.Tensor,
+        Psi_treatment: torch.Tensor,
+        reg_lambda: float
+    ) -> torch.Tensor:
+        """
+        Stage-1 Ridge回帰（勾配計算あり）: φ_θ更新用
+
+        V_B = (Ψ^T Φ)(Φ^T Φ + λI)^{-1}
+        """
+        N, d_A = Phi_instrument.shape
+        N_t, d_B = Psi_treatment.shape
+
+        if N != N_t:
+            raise ValueError(f"特徴量とターゲットのサンプル数不一致: {N} vs {N_t}")
+
+        # グラム行列 + 正則化（勾配計算あり）
+        PhiPhi = Phi_instrument.T @ Phi_instrument  # (d_A, d_A)
+        PhiPhi_reg = PhiPhi + reg_lambda * torch.eye(d_A, device=Phi_instrument.device, dtype=Phi_instrument.dtype)
+
+        # クロス共分散（勾配計算あり）
+        PsiPhi = Psi_treatment.T @ Phi_instrument  # (d_B, d_A)
+
+        # 逆行列計算（勾配計算あり）
+        try:
+            PhiPhi_inv = torch.linalg.inv(PhiPhi_reg)
+            V_B = PsiPhi @ PhiPhi_inv
+        except torch.linalg.LinAlgError:
+            # フォールバック：疑似逆行列
+            PhiPhi_inv = torch.linalg.pinv(PhiPhi_reg)
+            V_B = PsiPhi @ PhiPhi_inv
+
+        return V_B
+
+    def _compute_cross_fitting_prediction_vb(
+        self,
+        phi_prev: torch.Tensor,
+        psi_curr: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        **理論準拠**: V_B用クロスフィッティングでout-of-fold予測計算
+
+        Args:
+            phi_prev: 操作変数特徴量 (T-1, d_A)
+            psi_curr: 観測特徴量 (T-1, d_B)
+
+        Returns:
+            tuple: (psi_pred_cf, V_B_final)
+                - psi_pred_cf: out-of-fold予測 (T-1, d_B)
+                - V_B_final: 最終V_B行列 (d_B, d_A)
+        """
+        T_eff = phi_prev.size(0)
+
+        # クロスフィッティング設定取得
+        n_blocks = getattr(self, 'cf_config', {}).get('n_blocks', 6)
+        min_block_size = getattr(self, 'cf_config', {}).get('min_block_size', 20)
+
+        # データ量チェック：クロスフィッティング実行可能性
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # データ不足時：従来の全データRidge回帰（勾配あり）
+            V_B = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
+            psi_pred = (V_B @ phi_prev.T).T
+            return psi_pred, V_B
+
+        # クロスフィッティング実行
+        try:
+            from .cross_fitting import CrossFittingManager, TwoStageCrossFitter
+
+            # クロスフィッティング管理
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+            cf_fitter = TwoStageCrossFitter(cf_manager)
+
+            # V_B推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
+            with torch.no_grad():
+                V_B_list = cf_fitter.cross_fit_stage1(
+                    phi_prev, psi_curr,
+                    stage1_estimator=lambda X, Y: self._ridge_stage1_vb(X, Y, self.lambda_B)
+                )
+
+            # **理論準拠**: out-of-fold予測計算（勾配あり）
+            psi_pred_cf = cf_fitter.compute_out_of_fold_features(phi_prev, V_B_list)
+
+            # 最終V_B：全データでの推定（勾配あり、正則化用）
+            V_B_final = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
+
+            # 情報をキャッシュ
+            if not hasattr(self, '_cross_fitting_cache'):
+                self._cross_fitting_cache = {}
+            self._cross_fitting_cache.update({
+                'V_B_list': V_B_list,
+                'cf_manager': cf_manager
+            })
+
+            return psi_pred_cf, V_B_final
+
+        except ImportError:
+            # フォールバック（勾配あり）
+            V_B = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
+            psi_pred = (V_B @ phi_prev.T).T
+            return psi_pred, V_B
+        except Exception as e:
+            print(f"V_Bクロスフィッティング失敗、従来方式を使用: {e}")
+            V_B = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
+            psi_pred = (V_B @ phi_prev.T).T
+            return psi_pred, V_B
+
     def _ridge_stage2_ub(
         self, 
         H_instrument: torch.Tensor, 
@@ -253,7 +360,110 @@ class DFObservationLayer(nn.Module):
                 u_B = HHt_inv @ Hm
         
         return u_B
-    
+
+    def _ridge_stage2_ub_with_grad(
+        self,
+        H_instrument: torch.Tensor,
+        m_target: torch.Tensor,
+        reg_lambda: float
+    ) -> torch.Tensor:
+        """
+        Stage-2 Ridge回帰（勾配計算あり）: ψ_ω更新用
+
+        u_B = (H H^T + λI)^{-1} H m
+        """
+        N, d_B = H_instrument.shape
+        N_t = m_target.size(0)
+
+        if N != N_t:
+            raise ValueError(f"特徴量とターゲットのサンプル数不一致: {N} vs {N_t}")
+
+        # グラム行列 + 正則化（勾配計算あり）
+        HHt = H_instrument.T @ H_instrument  # (d_B, d_B)
+        HHt_reg = HHt + reg_lambda * torch.eye(d_B, device=H_instrument.device, dtype=H_instrument.dtype)
+
+        # クロス項（勾配計算あり）
+        Hm = H_instrument.T @ m_target  # (d_B,)
+
+        # 逆行列計算（勾配計算あり）
+        try:
+            HHt_inv = torch.linalg.inv(HHt_reg)
+            u_B = HHt_inv @ Hm
+        except torch.linalg.LinAlgError:
+            # フォールバック：疑似逆行列
+            HHt_inv = torch.linalg.pinv(HHt_reg)
+            u_B = HHt_inv @ Hm
+
+        return u_B
+
+    def _compute_cross_fitting_prediction_ub(
+        self,
+        H_features: torch.Tensor,
+        m_target: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        **理論準拠**: u_B用クロスフィッティングでout-of-fold予測計算
+
+        Args:
+            H_features: 操作変数特徴量 (T-1, d_B)
+            m_target: 観測目標 (T-1,)
+
+        Returns:
+            tuple: (m_pred_cf, u_B_final)
+                - m_pred_cf: out-of-fold予測 (T-1,)
+                - u_B_final: 最終u_Bベクトル (d_B,)
+        """
+        T_eff = H_features.size(0)
+
+        # クロスフィッティング設定取得
+        n_blocks = getattr(self, 'cf_config', {}).get('n_blocks', 6)
+        min_block_size = getattr(self, 'cf_config', {}).get('min_block_size', 20)
+
+        # データ量チェック：クロスフィッティング実行可能性
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # データ不足時：従来の全データRidge回帰（勾配あり）
+            u_B = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
+            m_pred = (H_features * u_B).sum(dim=1)
+            return m_pred, u_B
+
+        # クロスフィッティング実行
+        try:
+            from .cross_fitting import CrossFittingManager, TwoStageCrossFitter
+
+            # クロスフィッティング管理
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+            cf_fitter = TwoStageCrossFitter(cf_manager)
+
+            # u_B推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
+            with torch.no_grad():
+                u_B_list = cf_fitter.cross_fit_stage2(
+                    H_features, m_target,
+                    stage2_estimator=lambda H, m: self._ridge_stage2_ub(H, m, self.lambda_dB)
+                )
+
+            # **理論準拠**: out-of-fold予測計算（勾配あり）
+            m_pred_cf = torch.zeros_like(m_target)
+            for k in range(cf_manager.n_blocks):
+                block_indices = cf_manager.get_block_indices(k)
+                H_block = H_features[block_indices]
+                m_pred_cf[block_indices] = (H_block * u_B_list[k]).sum(dim=1)
+
+            # 最終u_B：全データでの推定（勾配あり、正則化用）
+            u_B_final = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
+
+            return m_pred_cf, u_B_final
+
+        except ImportError:
+            # フォールバック（勾配あり）
+            u_B = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
+            m_pred = (H_features * u_B).sum(dim=1)
+            return m_pred, u_B
+        except Exception as e:
+            print(f"u_Bクロスフィッティング失敗、従来方式を使用: {e}")
+            u_B = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
+            m_pred = (H_features * u_B).sum(dim=1)
+            return m_pred, u_B
+
     def _freeze_parameters(self, module: nn.Module) -> Dict[str, torch.Tensor]:
         """パラメータを一時的に固定し、元の状態を保存"""
         original_states = {}
@@ -332,13 +542,13 @@ class DFObservationLayer(nn.Module):
                 phi_prev = phi_instrument[:-1]  # (T-1, d_A)
                 psi_curr = psi_obs[1:]          # (T-1, d_B)
                 
-                # Stage-1: V_B推定（閉形式解）
-                with torch.no_grad():
-                    V_B = self._ridge_stage1_vb(phi_prev, psi_curr, self.lambda_B)
-                
-                # 予測誤差計算
-                psi_pred = (V_B @ phi_prev.T).T  # (T-1, d_B)
-                loss_stage1 = torch.norm(psi_pred - psi_curr, p='fro') ** 2
+                # **理論準拠**: クロスフィッティングでV_B推定とout-of-fold予測
+                psi_pred, V_B = self._compute_cross_fitting_prediction_vb(phi_prev, psi_curr)
+
+                # 予測誤差（正規化済み） + V_B正則化項
+                prediction_loss = torch.norm(psi_pred - psi_curr, p='fro') ** 2 / psi_curr.numel()
+                regularization_loss = self.lambda_B * torch.norm(V_B, p='fro') ** 2
+                loss_stage1 = prediction_loss + regularization_loss
                 
                 total_loss += loss_stage1.item()
                 
@@ -432,18 +642,25 @@ class DFObservationLayer(nn.Module):
             if m_features.size(0) < T_eff + 1:
                 raise RuntimeError(f"m_features長不足: required {T_eff+1}, got {m_features.size(0)}")
             m_curr = m_features[1:T_eff+1]  # (T-1,)
-            
-            # **修正2**: 操作変数特徴量の計算（完全勾配分離）
-            with torch.no_grad():
-                # V_B、phi_prevは既にdetach済みなので安全
-                H = (V_B @ phi_prev.T).T  # (T-1, d_B)
-            
-            # u_B 推定
-            u_B = self._ridge_stage2_ub(H, m_curr, self.lambda_dB)
-            
-            # Stage-2 損失: ||m - H u_B||_2^2
-            m_pred = (H * u_B).sum(dim=1)  # (T-1,)
-            loss_stage2 = torch.norm(m_pred - m_curr, p=2) ** 2
+
+            # **修正**: Stage-2でψ_ω依存のV_B動的計算
+            # φ_θ: 固定値（キャッシュ）、ψ_ω: 現在値（勾配あり）
+            psi_obs_current = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+            psi_curr_grad = psi_obs_current[1:T_eff+1]  # (T-1, d_B) 勾配あり
+
+            # V_B動的計算（ψ_ω勾配あり）
+            V_B_current = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr_grad, self.lambda_B)
+
+            # H計算（ψ_ω勾配あり）
+            H = (V_B_current @ phi_prev.T).T  # (T-1, d_B) 勾配あり
+
+            # **理論準拠**: クロスフィッティングでu_B推定とout-of-fold予測
+            m_pred, u_B = self._compute_cross_fitting_prediction_ub(H, m_curr)
+
+            # Stage-2 損失: 予測誤差（正規化済み） + u_B正則化項
+            prediction_loss = torch.norm(m_pred - m_curr, p=2) ** 2 / m_curr.numel()
+            regularization_loss = self.lambda_dB * torch.norm(u_B, p=2) ** 2
+            loss_stage2 = prediction_loss + regularization_loss
             
             # ψ_ω 更新（φ_θ は固定済み）
             optimizer_psi.zero_grad()

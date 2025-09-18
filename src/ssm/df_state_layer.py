@@ -196,7 +196,45 @@ class DFStateLayer(nn.Module):
                 V = YtX @ XtX_inv
         
         return V
-    
+
+    def _ridge_stage1_with_grad(
+        self,
+        X_features: torch.Tensor,
+        Y_targets: torch.Tensor,
+        reg_lambda: float
+    ) -> torch.Tensor:
+        """
+        Stage-1 Ridge回帰（勾配計算あり）: φ_θ更新用
+
+        V = (Y^T X)(X^T X + λI)^{-1}
+        """
+        N, d_A = X_features.shape
+        N_t, d_A_t = Y_targets.shape
+
+        if N != N_t:
+            raise ValueError(f"特徴量とターゲットのサンプル数不一致: {N} vs {N_t}")
+
+        if d_A != d_A_t:
+            raise ValueError(f"特徴量とターゲットの次元不一致: {d_A} vs {d_A_t}")
+
+        # グラム行列 + 正則化（勾配計算あり）
+        XtX = X_features.T @ X_features  # (d_A, d_A)
+        XtX_reg = XtX + reg_lambda * torch.eye(d_A, device=X_features.device, dtype=X_features.dtype)
+
+        # クロス共分散（勾配計算あり）
+        YtX = Y_targets.T @ X_features  # (d_A, d_A)
+
+        # 逆行列計算（勾配計算あり）
+        try:
+            XtX_inv = torch.linalg.inv(XtX_reg)
+            V = YtX @ XtX_inv
+        except torch.linalg.LinAlgError:
+            # フォールバック：疑似逆行列
+            XtX_inv = torch.linalg.pinv(XtX_reg)
+            V = YtX @ XtX_inv
+
+        return V
+
     def _ridge_stage2(
         self, 
         H_features: torch.Tensor, 
@@ -306,7 +344,7 @@ class DFStateLayer(nn.Module):
             # 小データまたは簡易版：全データで推定（従来の実装）
             V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
             phi_pred = (V_A @ phi_minus.T).T
-            loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2
+            loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2 / phi_plus.numel()
             
             # **追加**: 非クロスフィッティング用キャッシュクリア
             self._stage1_cache.pop('V_A_list', None)
@@ -319,7 +357,7 @@ class DFStateLayer(nn.Module):
                 # フォールバック：全データ使用
                 V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
                 phi_pred = (V_A @ phi_minus.T).T
-                loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2
+                loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2 / phi_plus.numel()
                 
                 # **追加**: 非クロスフィッティング用キャッシュクリア
                 self._stage1_cache.pop('V_A_list', None)
@@ -351,7 +389,7 @@ class DFStateLayer(nn.Module):
                     phi_pred_k = (V_k @ phi_minus_k.T).T
                     
                     # ブロックkの損失
-                    loss_k = torch.norm(phi_pred_k - phi_plus_k, p='fro') ** 2
+                    loss_k = torch.norm(phi_pred_k - phi_plus_k, p='fro') ** 2 / phi_plus_k.numel()
                     total_loss += loss_k
                 
                 loss = total_loss / cf_manager.n_blocks
@@ -389,27 +427,27 @@ class DFStateLayer(nn.Module):
         
         total_loss = 0.0
         
-        # **修正**: 反復回数制御とretain_graph管理
+        # **理論準拠**: φ_θ反復学習（V_Aをクロスフィッティングで計算）
         for t in range(T1_iterations):
             optimizer_phi.zero_grad()
-            
-            # 特徴量計算（各反復で新しい計算グラフ）
+
+            # 特徴量計算（φ_θ更新により変化）
             phi_seq = self.phi_theta(X_states)  # (T, d_A)
-            
+
             # 過去/未来分割
             phi_minus = phi_seq[:-1]  # (T-1, d_A)
             phi_plus = phi_seq[1:]    # (T-1, d_A)
-            
-            # Stage-1: V_A推定（閉形式解）
-            with torch.no_grad():
-                V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
-            
-            # 予測誤差計算
-            phi_pred = (V_A @ phi_minus.T).T  # (T-1, d_A)
-            loss_stage1 = torch.norm(phi_pred - phi_plus, p='fro') ** 2
-            
+
+            # **理論準拠**: クロスフィッティングでV_A推定とout-of-fold予測
+            phi_pred, V_A = self._compute_cross_fitting_prediction(phi_minus, phi_plus)
+
+            # 予測誤差（正規化済み） + V_A正則化項
+            prediction_loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2 / phi_plus.numel()
+            regularization_loss = self.lambda_A * torch.norm(V_A, p='fro') ** 2
+            loss_stage1 = prediction_loss + regularization_loss
+
             total_loss += loss_stage1.item()
-            
+
             # **修正**: 計算グラフ管理
             if t < T1_iterations - 1:
                 # 最後の反復以外: retain_graph=True
@@ -417,9 +455,9 @@ class DFStateLayer(nn.Module):
             else:
                 # 最後の反復: 完全解放
                 loss_stage1.backward()
-            
+
             optimizer_phi.step()
-            
+
             # **追加**: 反復間のメモリクリア（安全性向上）
             if t < T1_iterations - 1:
                 # 中間反復では変数をデタッチ（メモリ効率向上）
@@ -430,14 +468,21 @@ class DFStateLayer(nn.Module):
             phi_seq_final = self.phi_theta(X_states)
             phi_minus_final = phi_seq_final[:-1]
             phi_plus_final = phi_seq_final[1:]
-            V_A_final = self._ridge_stage1(phi_minus_final, phi_plus_final, self.lambda_A)
-            
+            _, V_A_final = self._compute_cross_fitting_prediction(phi_minus_final, phi_plus_final)
+
             self._stage1_cache = {
                 'V_A': V_A_final.detach(),
                 'phi_minus': phi_minus_final.detach(),
                 'phi_plus': phi_plus_final.detach(),
                 'X_plus': X_states[1:].detach()
             }
+
+            # クロスフィッティング情報もキャッシュ
+            if hasattr(self, '_cross_fitting_cache'):
+                self._stage1_cache.update({
+                    'V_A_list': [V.detach() for V in self._cross_fitting_cache['V_A_list']],
+                    'cf_manager': self._cross_fitting_cache['cf_manager']
+                })
     
         return {
             'stage1_loss': total_loss / T1_iterations,
@@ -478,17 +523,17 @@ class DFStateLayer(nn.Module):
                 # U_A推定
                 U_A = self._ridge_stage2(H_cf, X_plus, self.lambda_B)
                 
-                # 損失計算（参考用）
+                # 損失計算（参考用、正規化済み）
                 X_pred = (U_A.T @ H_cf.T).T
-                loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2
+                loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.numel()
             else:
                 # 非クロスフィッティング時：直接計算
                 H_cf = (V_A @ phi_minus.T).T
                 U_A = self._ridge_stage2(H_cf, X_plus, self.lambda_B)
                 
-                # 損失計算（参考用）
+                # 損失計算（参考用、正規化済み）
                 X_pred = (U_A.T @ H_cf.T).T
-                loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2
+                loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.numel()
         
         # U_A をキャッシュ
         self._stage2_cache['U_A'] = U_A
@@ -597,6 +642,139 @@ class DFStateLayer(nn.Module):
         if verbose:
             print(f"V_A shape: {self.V_A.shape}, U_A shape: {self.U_A.shape}")
     
+    def _compute_cross_fitting_prediction(
+        self,
+        phi_minus: torch.Tensor,
+        phi_plus: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        **理論準拠**: クロスフィッティングでout-of-fold予測計算
+
+        Args:
+            phi_minus: 過去特徴量 (T-1, d_A)
+            phi_plus: 未来特徴量 (T-1, d_A)
+
+        Returns:
+            tuple: (phi_pred_cf, V_A_final)
+                - phi_pred_cf: out-of-fold予測 (T-1, d_A)
+                - V_A_final: 最終V_A行列 (d_A, d_A)
+        """
+        T_eff = phi_minus.size(0)
+
+        # クロスフィッティング設定取得
+        n_blocks = self.cf_config.get('n_blocks', 6)
+        min_block_size = self.cf_config.get('min_block_size', 20)
+
+        # データ量チェック：クロスフィッティング実行可能性
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # データ不足時：従来の全データRidge回帰（勾配あり）
+            V_A = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+            phi_pred = (V_A @ phi_minus.T).T
+            return phi_pred, V_A
+
+        # クロスフィッティング実行
+        try:
+            from .cross_fitting import CrossFittingManager, TwoStageCrossFitter
+
+            # クロスフィッティング管理
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+            cf_fitter = TwoStageCrossFitter(cf_manager)
+
+            # V_A推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
+            with torch.no_grad():
+                V_A_list = cf_fitter.cross_fit_stage1(
+                    phi_minus, phi_plus,
+                    stage1_estimator=lambda X, Y: self._ridge_stage1(X, Y, self.lambda_A)
+                )
+
+            # **理論準拠**: out-of-fold予測計算（勾配あり）
+            phi_pred_cf = cf_fitter.compute_out_of_fold_features(phi_minus, V_A_list)
+
+            # 最終V_A：全データでの推定（勾配あり、正則化用）
+            V_A_final = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+
+            # 情報をキャッシュ
+            if not hasattr(self, '_cross_fitting_cache'):
+                self._cross_fitting_cache = {}
+            self._cross_fitting_cache.update({
+                'V_A_list': V_A_list,
+                'cf_manager': cf_manager
+            })
+
+            return phi_pred_cf, V_A_final
+
+        except ImportError:
+            # フォールバック（勾配あり）
+            V_A = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+            phi_pred = (V_A @ phi_minus.T).T
+            return phi_pred, V_A
+        except Exception as e:
+            print(f"クロスフィッティング失敗、従来方式を使用: {e}")
+            V_A = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+            phi_pred = (V_A @ phi_minus.T).T
+            return phi_pred, V_A
+
+    def _compute_V_A_with_cross_fitting(
+        self,
+        phi_minus: torch.Tensor,
+        phi_plus: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        **理論準拠**: クロスフィッティングを用いたV_A計算（閉形式解）
+
+        Args:
+            phi_minus: 過去特徴量 (T-1, d_A)
+            phi_plus: 未来特徴量 (T-1, d_A)
+
+        Returns:
+            torch.Tensor: V_A行列 (d_A, d_A)
+        """
+        T_eff = phi_minus.size(0)
+
+        # クロスフィッティング設定取得
+        n_blocks = self.cf_config.get('n_blocks', 6)
+        min_block_size = self.cf_config.get('min_block_size', 20)
+
+        # データ量チェック：クロスフィッティング実行可能性
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # データ不足時：従来の全データRidge回帰
+            return self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
+
+        # クロスフィッティング実行
+        try:
+            from .cross_fitting import CrossFittingManager, TwoStageCrossFitter
+
+            # クロスフィッティング管理
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+            cf_fitter = TwoStageCrossFitter(cf_manager)
+
+            # V_A推定（クロスフィッティング）
+            V_A_list = cf_fitter.cross_fit_stage1(
+                phi_minus, phi_plus,
+                stage1_estimator=lambda X, Y: self._ridge_stage1(X, Y, self.lambda_A)
+            )
+
+            # 最終V_A：全データでの推定
+            V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
+
+            # V_Aリストをキャッシュ（Stage-2で使用）
+            if not hasattr(self, '_cross_fitting_cache'):
+                self._cross_fitting_cache = {}
+            self._cross_fitting_cache.update({
+                'V_A_list': V_A_list,
+                'cf_manager': cf_manager
+            })
+
+            return V_A
+
+        except ImportError:
+            # クロスフィッティングモジュール未使用時：従来方式
+            return self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
+        except Exception as e:
+            # エラー時：従来方式にフォールバック
+            print(f"クロスフィッティング失敗、従来方式を使用: {e}")
+            return self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
+
     def apply_transfer_operator(self, phi_prev: torch.Tensor) -> torch.Tensor:
         """
         転送作用素の適用: φ̂_{t|t-1} = V_A φ_{t-1}

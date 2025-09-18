@@ -7,3 +7,5 @@ __pycache__/
 .ipynb_checkpoints/
 _tests/
 results/
+HANDOVER_TECHNICAL_GUIDE.md
+_myzipper.py

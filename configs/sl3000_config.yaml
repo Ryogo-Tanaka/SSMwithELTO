@@ -50,8 +50,8 @@ ssm:
 
   df_state:
     feature_dim: 48     # 豊富な特徴表現
-    lambda_A: 1e-2      # 状態遷移正則化強化
-    lambda_B: 1e-2      # 入力正則化強化
+    lambda_A: 1e-3      # 状態遷移正則化強化 (1e-4 → 1e-3)
+    lambda_B: 1e-2      # 入力正則化強化 (1e-4 → 1e-2)
 
     feature_net:
       hidden_sizes: [96, 96, 64]  # 深層ネットワーク
@@ -64,8 +64,8 @@ ssm:
 
   df_observation:
     obs_feature_dim: 24   # 観測特徴次元
-    lambda_B: 1e-2        # 正則化強化
-    lambda_dB: 1e-2       # 正則化強化
+    lambda_B: 1e-3        # 正則化強化 (1e-4 → 1e-3)
+    lambda_dB: 1e-3       # 正則化強化 (1e-4 → 1e-3)
 
     obs_net:
       hidden_sizes: [48, 48, 32]  # 観測系列学習
@@ -101,7 +101,7 @@ training:
     lr_decoder: 2e-4
     lr_phi: 2e-4
     lr_psi: 2e-4
-    lambda_cca: 0.05    # CCA重み調整
+    lambda_cca: 0.001   # CCA重み調整 (0.05 → 0.001, 巨大再構成誤差対策)
     update_strategy: "all"
 
   device: "auto"

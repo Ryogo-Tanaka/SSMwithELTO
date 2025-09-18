@@ -745,20 +745,17 @@ class TwoStageTrainer:
             stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
         )
         
-        # Stage-2: U_A推定（T2回実行）
-        stage2_losses = []
-        for t in range(self.config.T2_iterations):
-            with torch.no_grad():  # **修正2: Stage-2は勾配なし**
-                stage2_metrics = self.df_state.train_stage2_closed_form()
-                stage2_losses.append(stage2_metrics['stage2_loss'])
-                
-                # ログ記録
-                self.logger.log_phase1(
-                    epoch, TrainingPhase.PHASE1_DF_A, 'stage2', t,
-                    stage2_metrics, {}
-                )
-        
-        metrics['df_a_stage2_loss'] = sum(stage2_losses) / len(stage2_losses)
+        # Stage-2: U_A推定（一度だけ実行）
+        with torch.no_grad():  # **修正2: Stage-2は勾配なし**
+            stage2_metrics = self.df_state.train_stage2_closed_form()
+
+            # ログ記録
+            self.logger.log_phase1(
+                epoch, TrainingPhase.PHASE1_DF_A, 'stage2', 0,
+                stage2_metrics, {}
+            )
+
+        metrics['df_a_stage2_loss'] = stage2_metrics['stage2_loss']
         
         # **修正2: 明示的グラフクリア**
         self._clear_computation_graph()
@@ -957,8 +954,8 @@ class TwoStageTrainer:
         # Step 6: 対応する真値取得
         Y_target = Y_train[h+1:h+1+T_pred]  # 対応する観測
         
-        # 損失計算
-        loss_rec = torch.norm(Y_hat - Y_target, p='fro') ** 2
+        # 損失計算（正規化済み）
+        loss_rec = torch.norm(Y_hat - Y_target, p='fro') ** 2 / Y_target.numel()
         
         # CCA損失（オプション）
         if self.config.lambda_cca > 0:
