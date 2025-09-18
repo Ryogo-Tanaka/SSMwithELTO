@@ -1,0 +1,199 @@
+# configs/n_link_sim_config.yaml
+# n_link_sim.npz データ用設定ファイル
+# テスト設定(test_stable_config.yaml)ベース + n-linkシミュレーション対応
+
+# =====================================
+# データ処理設定
+# =====================================
+data:
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  normalization: "standard"
+  handle_missing: "interpolate"
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+
+# =====================================
+# モデル構成 - n-linkシミュレーション想定
+# =====================================
+model:
+  encoder:
+    input_dim: 6          # n-linkの状態次元（位置・速度）想定、データ確認後調整
+    channels: 32
+    layers: 4
+    kernel_size: 3
+    activation: "GELU"
+    dropout: 0.1
+
+  decoder:
+    output_dim: 6         # エンコーダと同じ次元数
+    window: 8
+    tau: 1
+    hidden: 32
+    ma_kernel: 16
+    gru_hidden: 16
+    activation: "GELU"
+    dropout: 0.1
+
+# =====================================
+# 状態空間モデル（SSM）設定 - n-linkシミュレーション調整
+# =====================================
+ssm:
+  realization:
+    past_horizon: 12      # n-linkの動的特性を考慮してやや増加
+    jitter: 1e-6
+    cond_thresh: 1e10
+    rank: 4
+    reg_type: "sum"
+
+  df_state:
+    feature_dim: 32       # n-link系の複雑性を考慮してやや増加
+    lambda_A: 1e-3
+    lambda_B: 1e-3
+
+    feature_net:
+      hidden_sizes: [64, 64]  # n-linkの非線形性を考慮して増加
+      activation: "ReLU"
+      dropout: 0.1
+
+    cross_fitting:
+      n_blocks: 4
+      min_block_size: 15
+
+  df_observation:
+    obs_feature_dim: 16   # 観測の複雑性を考慮してやや増加
+    lambda_B: 1e-3
+    lambda_dB: 1e-3
+
+    obs_net:
+      hidden_sizes: [32, 32]  # n-linkの観測複雑性を考慮
+      activation: "ReLU"
+      dropout: 0.1
+
+    cross_fitting:
+      n_blocks: 4
+      min_block_size: 15
+
+# =====================================
+# 学習設定 - n-linkシミュレーション用
+# =====================================
+training:
+  use_kalman_filtering: true
+
+  phase1:
+    epochs: 30            # n-linkの複雑性を考慮してやや増加
+    T1_iterations: 8      # DF学習を十分に行う
+    T2_iterations: 5
+
+    df_a:
+      warmup_epochs: 5
+      lr: 3e-3            # やや慎重な学習率
+
+    df_b:
+      start_epoch: 5
+      lr: 3e-3
+
+  phase2:
+    epochs: 50            # end-to-end学習を十分に行う
+    lr_encoder: 3e-4
+    lr_decoder: 3e-4
+    lr_phi: 3e-4
+    lr_psi: 3e-4
+    lambda_cca: 0.1
+    update_strategy: "all"
+
+  device: "auto"
+  seed: 42
+  gradient_clip: 1.0
+
+  early_stopping:
+    patience: 8           # n-linkの学習に時間をかける
+    min_delta: 1e-5
+
+  checkpoint:
+    save_every: 10
+    keep_best: true
+
+# =====================================
+# Kalmanフィルタリング設定
+# =====================================
+kalman:
+  noise_estimation:
+    method: "mle"
+    obs_noise_init: 5e-2  # n-linkシミュレーションのノイズレベル想定
+    state_noise_init: 1e-2
+    min_noise: 1e-6
+    max_noise: 1e1
+
+  initialization:
+    method: "data_driven"
+    initial_cov_scale: 1.5
+
+  numerical:
+    jitter: 1e-6
+    regularization: 1e-4
+    condition_threshold: 1e10
+
+# =====================================
+# 評価設定
+# =====================================
+evaluation:
+  metrics:
+    - "mse"
+    - "mae"
+    - "rmse"
+    - "correlation"
+
+  forecasting:
+    horizon: 10           # n-linkの予測性能評価
+    n_samples: 100
+
+  visualization:
+    n_plot_samples: 200
+    plot_dimensions: 6    # 全次元プロット
+    save_plots: true      # n-linkの結果は保存
+
+# =====================================
+# 実験管理設定
+# =====================================
+experiment:
+  name: "n_link_simulation"
+  version: "v1.0"
+  description: "n-linkシミュレーションデータを用いたDFIV Kalman Filter実験"
+
+  output:
+    save_models: true
+    save_predictions: true
+    save_logs: true
+    save_plots: true      # n-linkの可視化は重要
+    compress_results: false
+
+  reproducibility:
+    set_deterministic: true
+    log_git_info: true
+    save_environment: true
+
+# =====================================
+# ロギング設定
+# =====================================
+logging:
+  level: "INFO"
+  format: "detailed"
+  save_to_file: true
+  console_output: true
+
+  progress:
+    show_progress_bar: true
+    update_frequency: 10
+
+# =====================================
+# デバッグ・テスト設定
+# =====================================
+debug:
+  test_mode: false        # 本格実験モード
+  quick_run: false
+  verbose_training: true  # n-linkの学習過程を詳細に記録
+  save_intermediate: true # 中間結果も保存
+  memory_profiling: false

@@ -312,10 +312,28 @@ class FullExperimentPipeline:
         trainer._save_inference_ready_model(str(model_path))
         print(f"💾 最終モデル保存: {model_path}")
         
-        # 実験設定保存
+        # 実験設定保存（YAML + TXT形式）
         config_path = self.output_dir / 'logs' / 'experiment_config.yaml'
         with open(config_path, 'w') as f:
             yaml.dump(self.config, f, default_flow_style=False)
+
+        # TXT形式でも設定情報を保存
+        config_txt_path = self.output_dir / 'logs' / 'experiment_config.txt'
+        with open(config_txt_path, 'w', encoding='utf-8') as f:
+            f.write("=== DFIV Kalman Filter実験設定情報 ===\n")
+            f.write(f"実験日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"出力ディレクトリ: {self.output_dir}\n\n")
+
+            # 設定内容を階層的に出力
+            def write_config_section(config_dict, prefix=""):
+                for key, value in config_dict.items():
+                    if isinstance(value, dict):
+                        f.write(f"{prefix}[{key}]\n")
+                        write_config_section(value, prefix + "  ")
+                    else:
+                        f.write(f"{prefix}{key}: {value}\n")
+
+            write_config_section(self.config)
         
         # 完全実験ログ保存
         end_time = datetime.now()

@@ -122,19 +122,66 @@ class UniversalTimeSeriesDataset(Dataset):
         try:
             if ext == ".npz":
                 data = np.load(self.data_path)
-                # 以前のチャットの仕様に従い、'Y' または 'arr_0' キーを探す
-                if 'Y' in data:
-                    raw_data = data['Y']
-                elif 'arr_0' in data:
-                    raw_data = data['arr_0']
-                elif 'X' in data:  # 既存の実装との互換性
-                    raw_data = data['X']
-                else:
+                # 柔軟なキー探索: 優先度順で適切なデータを自動選択
+                candidate_keys = ['Y', 'X', 'data', 'arr_0']
+                raw_data = None
+
+                # 優先度順でキーを探索
+                for key in candidate_keys:
+                    if key in data:
+                        candidate = data[key]
+                        # 2次元データかつ時系列として適切なサイズかチェック
+                        if candidate.ndim == 2 and candidate.shape[0] > 1:
+                            raw_data = candidate
+                            print(f"💡 npzファイルからキー '{key}' を使用: shape={candidate.shape}")
+                            break
+
+                # 優先キーがない場合、利用可能な全キーから最適なものを選択
+                if raw_data is None:
                     available_keys = list(data.keys())
-                    raise DataLoaderError(f"npzファイルに 'Y', 'arr_0', 'X' キーが見つかりません。利用可能: {available_keys}")
+                    for key in available_keys:
+                        candidate = data[key]
+                        # 2次元データで時系列として妥当なサイズ
+                        if (hasattr(candidate, 'ndim') and candidate.ndim == 2 and
+                            candidate.shape[0] > 1 and candidate.shape[1] > 0):
+                            raw_data = candidate
+                            print(f"💡 npzファイルから推定キー '{key}' を使用: shape={candidate.shape}")
+                            break
+
+                # それでも見つからない場合はエラー
+                if raw_data is None:
+                    available_info = []
+                    for key in data.keys():
+                        try:
+                            shape = data[key].shape if hasattr(data[key], 'shape') else 'scalar'
+                            dtype = data[key].dtype if hasattr(data[key], 'dtype') else type(data[key])
+                            available_info.append(f"'{key}': shape={shape}, dtype={dtype}")
+                        except:
+                            available_info.append(f"'{key}': (読み込み不可)")
+
+                    raise DataLoaderError(
+                        f"npzファイルに適切な2次元時系列データが見つかりません。\n"
+                        f"利用可能なデータ: {', '.join(available_info)}\n"
+                        f"期待される形式: (時系列長, 特徴次元) の2次元配列"
+                    )
                     
             elif ext == ".npy":
                 raw_data = np.load(self.data_path)
+
+                # npyファイルの柔軟な形状対応
+                if raw_data.ndim == 1:
+                    # 1次元の場合は単変量時系列として扱う
+                    raw_data = raw_data.reshape(-1, 1)
+                    print(f"💡 npyファイル: 1次元データを2次元に変換 shape={raw_data.shape}")
+                elif raw_data.ndim > 2:
+                    # 3次元以上の場合は最初の2次元を使用
+                    original_shape = raw_data.shape
+                    raw_data = raw_data.reshape(raw_data.shape[0], -1)
+                    print(f"💡 npyファイル: {original_shape} → {raw_data.shape} に変換")
+                elif raw_data.ndim == 2:
+                    print(f"💡 npyファイル: 2次元データを使用 shape={raw_data.shape}")
+                else:
+                    raise DataLoaderError(f"npyファイルのデータが0次元です: shape={raw_data.shape}")
                 
             elif ext == ".csv":
                 df = pd.read_csv(self.data_path, index_col=0 if 'time' in pd.read_csv(self.data_path, nrows=1).columns else None)
