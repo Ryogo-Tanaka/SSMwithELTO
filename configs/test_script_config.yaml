@@ -1,0 +1,157 @@
+# configs/test_script_config.yaml
+# スクリプトテスト用軽量設定
+
+# 実験基本設定
+experiment:
+  name: "script_test"
+  description: "スクリプト実行テスト"
+  output_dir: "results/script_test"
+  save_intermediate: true
+  create_visualizations: false  # テスト時は無効化
+
+# データ設定
+data:
+  split_ratios:
+    train: 0.6
+    val: 0.2
+    test: 0.2
+  preprocessing:
+    normalization: "standard"
+  calibration:
+    enabled: true
+    ratio: 0.25
+
+# モデル設定（軽量化）
+model:
+  encoder:
+    type: "time_invariant"
+    input_dim: 6
+    output_dim: 8
+    channels: 16          # 軽量化
+    layers: 2             # 軽量化
+    kernel_size: 3
+    activation: "GELU"
+    dropout: 0.1
+
+  decoder:
+    type: "time_invariant"
+    input_dim: 8
+    output_dim: 6
+    window: 4             # 軽量化
+    tau: 1
+    hidden: 16            # 軽量化
+    ma_kernel: 8          # 軽量化
+    gru_hidden: 8         # 軽量化
+    activation: "GELU"
+    dropout: 0.1
+
+# SSM設定（軽量化）
+ssm:
+  use_new_realization: true
+  realization:
+    encoder_output_dim: 8
+    window_length: 5      # 軽量化
+    num_components: 2
+    ridge_param: 1e-3
+    min_eigenvalue: 1e-8
+    device: "cpu"
+
+  df_state:
+    feature_dim: 8        # 軽量化
+    lambda_A: 1e-3
+    lambda_B: 1e-3
+    feature_net:
+      hidden_sizes: [16, 16]  # 軽量化
+      activation: "ReLU"
+      dropout: 0.1
+    cross_fitting:
+      n_blocks: 2
+      min_block_size: 10
+
+  df_observation:
+    obs_feature_dim: 8
+    lambda_B: 1e-3
+    lambda_dB: 1e-3
+    obs_net:
+      hidden_sizes: [12, 12]  # 軽量化
+      activation: "ReLU"
+      dropout: 0.1
+    cross_fitting:
+      n_blocks: 2
+      min_block_size: 10
+
+# 学習設定（軽量化）
+training:
+  use_kalman_filtering: true
+  calibration_ratio: 0.25     # キャリブレーション用データ比率
+  auto_inference_setup: true  # 推論環境自動セットアップ
+  phase1:
+    epochs: 1             # テスト用最小化
+    T1_iterations: 1
+    T2_iterations: 1
+    df_a:
+      warmup_epochs: 0    # テスト用最小化
+      lr: 5e-3
+    df_b:
+      start_epoch: 0
+      lr: 5e-3
+
+  phase2:
+    epochs: 1             # テスト用最小化
+    lr_encoder: 5e-4
+    lr_decoder: 5e-4
+    lr_phi: 5e-4
+    lr_psi: 5e-4
+    lambda_cca: 0.1
+    update_strategy: "all"
+
+  device: "cpu"
+  seed: 42
+  gradient_clip: 1.0
+  early_stopping:
+    patience: 2
+    min_delta: 1e-5
+  checkpoint:
+    save_every: 1
+    keep_best: true
+
+# Kalmanフィルタリング設定
+kalman_filtering:
+  enabled: true
+  noise_estimation:
+    method: "residual_based"
+    gamma_Q: 1.0e-6
+    gamma_R: 1.0e-6
+    use_calibration: true
+  initialization:
+    method: "data_driven"
+    n_init_samples: 10
+
+# 可視化・ログ設定（最小化）
+visualization:
+  enabled: false          # テスト時は無効化
+logging:
+  level: "INFO"
+  console_output: true
+  file_output: false      # テスト時は無効化
+
+# 実験再現性設定
+reproducibility:
+  random_seeds:
+    torch_seed: 42
+    numpy_seed: 42
+    python_seed: 42
+  record_environment:
+    system_info: false    # テスト時は無効化
+    library_versions: false
+    git_info: false
+  save_config: true
+  config_format: "yaml"
+
+# デバッグ設定
+debug:
+  enabled: true           # テスト時は有効化
+  quick_mode:
+    enabled: true         # テスト時は有効化
+    reduce_data: true
+    skip_visualization: true

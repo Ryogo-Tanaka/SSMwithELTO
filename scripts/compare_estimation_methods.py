@@ -202,7 +202,23 @@ class EstimationMethodComparator:
         
         try:
             # 推論環境セットアップ
-            calibration_size = min(50, test_data.size(0) // 4)
+            # past_horizonを考慮した安全なキャリブレーションサイズ計算
+            past_horizon = 10  # デフォルト値（設定から取得すべきだが一時的に固定）
+            min_required = 2 * past_horizon + 1
+            total_samples = test_data.size(0)
+
+            print(f"🔍 Stage 2 - キャリブレーション分析:")
+            print(f"   観測データ総数: {total_samples}")
+            print(f"   past_horizon: {past_horizon}")
+            print(f"   必要最小サンプル: {min_required}")
+
+            if total_samples >= min_required:
+                calibration_size = min(50, max(min_required, total_samples // 4))
+                print(f"✅ 十分なデータ: キャリブレーション{calibration_size}サンプル使用")
+            else:
+                calibration_size = total_samples
+                print(f"❌ データ不足: 全{total_samples}サンプル使用、数値不安定の可能性")
+
             calibration_data = test_data[:calibration_size]
             
             self.models['kalman'].setup_inference(

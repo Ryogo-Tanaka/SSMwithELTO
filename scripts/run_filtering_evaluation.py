@@ -47,6 +47,9 @@ sys.path.append(str(Path(__file__).parent.parent))
 from scripts.evaluate_filtering_performance import FilteringPerformanceEvaluator
 from scripts.compare_estimation_methods import EstimationMethodComparator
 
+# モード分解機能
+from src.evaluation.mode_decomposition import TrainedModelSpectrumAnalysis, SpectrumResultsSaver
+
 
 class Task4EvaluationPipeline:
     """タスク4統合評価パイプライン"""
@@ -196,13 +199,19 @@ class Task4EvaluationPipeline:
         )
         evaluation_results['method_comparison'] = comparison_results
         
-        # Stage 3: 統合分析・結果整理
+        # Stage 3: モード分解分析（新機能）
+        mode_decomp_results = self._run_mode_decomposition_analysis(
+            adjusted_config
+        )
+        evaluation_results['mode_decomposition'] = mode_decomp_results
+
+        # Stage 4: 統合分析・結果整理
         integrated_results = self._integrate_and_summarize_results(
             evaluation_results, adjusted_config
         )
         evaluation_results['integrated_analysis'] = integrated_results
-        
-        # Stage 4: 最終出力・保存
+
+        # Stage 5: 最終出力・保存
         self._save_comprehensive_results(evaluation_results, mode)
         
         # 最終サマリ出力
@@ -285,12 +294,13 @@ class Task4EvaluationPipeline:
         stage_start = datetime.now()
         
         try:
-            # フィルタリング性能評価器を作成
+            # フィルタリング性能評価器を作成（適切な設定を渡す）
             performance_evaluator = FilteringPerformanceEvaluator(
                 model_path=str(self.model_path),
                 config_path=str(self.config_path),
                 output_dir=str(self.output_dir / 'filtering_performance'),
-                device=self.device
+                device=self.device,
+                config=config  # 選択された設定を渡す
             )
             
             # 評価実行
@@ -397,18 +407,112 @@ class Task4EvaluationPipeline:
                 'error': str(e)
             })
             return {'error': str(e), 'status': 'failed'}
-    
-    def _integrate_and_summarize_results(
-        self, 
-        evaluation_results: Dict[str, Any], 
+
+    def _run_mode_decomposition_analysis(
+        self,
         config: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Stage 3: 結果統合・分析"""
-        print(f"\n📈 Stage 3: 結果統合・分析")
+        """Stage 3: モード分解分析の実行"""
+        print(f"\n📊 Stage 3: モード分解分析")
         print("-" * 50)
-        
+
         stage_start = datetime.now()
-        
+
+        try:
+            # 設定からスペクトル分析設定を取得
+            spectrum_config = config.get('evaluation', {}).get('spectrum_analysis', {})
+            if not spectrum_config.get('enabled', True):
+                print("ℹ️  モード分解分析は無効化されています")
+                return {'status': 'disabled'}
+
+            # サンプリング間隔取得
+            sampling_interval = spectrum_config.get('sampling_interval', 0.1)
+
+            print(f"📊 モデルからのスペクトル分析開始 (Δt={sampling_interval})")
+
+            # モデルスペクトル分析器作成
+            model_spectrum_analyzer = TrainedModelSpectrumAnalysis(sampling_interval)
+
+            # 保存済みモデルからスペクトル分析実行
+            spectrum_results = model_spectrum_analyzer.perform_spectrum_analysis_from_path(
+                str(self.model_path)
+            )
+
+            # 結果統計作成
+            spectrum_analysis = spectrum_results['spectrum']
+            mode_decomp_results = {
+                'V_A_shape': spectrum_results['V_A_shape'],
+                'spectral_radius': spectrum_analysis['spectral_radius'],
+                'n_stable_modes': spectrum_analysis['n_stable_modes'],
+                'n_dominant_modes': spectrum_analysis['n_dominant_modes'],
+                'dominant_indices': spectrum_analysis['dominant_indices'],
+                'stable_indices': spectrum_analysis['stable_indices'],
+                'sampling_interval': sampling_interval
+            }
+
+            # 固有値統計
+            eigenvals_continuous = spectrum_analysis['eigenvalues_continuous']
+            mode_decomp_results['eigenvalues_statistics'] = {
+                'mean_growth_rate': float(eigenvals_continuous.real.mean().item()),
+                'std_growth_rate': float(eigenvals_continuous.real.std().item()),
+                'mean_frequency_hz': float(spectrum_analysis['frequencies_hz'].mean().item()),
+                'std_frequency_hz': float(spectrum_analysis['frequencies_hz'].std().item()),
+                'max_growth_rate': float(eigenvals_continuous.real.max().item()),
+                'min_growth_rate': float(eigenvals_continuous.real.min().item())
+            }
+
+            # 詳細結果保存
+            if spectrum_config.get('save_detailed_data', True):
+                spectrum_save_path = self.output_dir / 'mode_decomposition' / 'spectrum_analysis'
+                SpectrumResultsSaver.save_results(
+                    spectrum_results,
+                    str(spectrum_save_path),
+                    save_format='both'
+                )
+                mode_decomp_results['detailed_results_saved'] = True
+                mode_decomp_results['save_path'] = str(spectrum_save_path)
+
+            stage_duration = (datetime.now() - stage_start).total_seconds()
+
+            self.experiment_log['stages'].append({
+                'stage': 3,
+                'name': 'mode_decomposition',
+                'start_time': stage_start.isoformat(),
+                'duration': stage_duration,
+                'status': 'completed'
+            })
+
+            print(f"✅ Stage 3完了 ({stage_duration:.2f}秒)")
+            print(f"  - スペクトル半径: {spectrum_analysis['spectral_radius']:.4f}")
+            print(f"  - 安定モード数: {spectrum_analysis['n_stable_modes']}")
+            print(f"  - 主要モード数: {spectrum_analysis['n_dominant_modes']}")
+
+            return mode_decomp_results
+
+        except Exception as e:
+            print(f"❌ Stage 3エラー: {e}")
+            print("❌ 詳細スタックトレース:")
+            traceback.print_exc()
+            self.experiment_log['stages'].append({
+                'stage': 3,
+                'name': 'mode_decomposition',
+                'start_time': stage_start.isoformat(),
+                'status': 'failed',
+                'error': str(e)
+            })
+            return {'error': str(e), 'status': 'failed'}
+
+    def _integrate_and_summarize_results(
+        self,
+        evaluation_results: Dict[str, Any],
+        config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Stage 4: 結果統合・分析"""
+        print(f"\n📈 Stage 4: 結果統合・分析")
+        print("-" * 50)
+
+        stage_start = datetime.now()
+
         try:
             integrated = {
                 'summary_statistics': self._compute_summary_statistics(evaluation_results),
@@ -416,22 +520,22 @@ class Task4EvaluationPipeline:
                 'performance_comparison': self._create_performance_comparison(evaluation_results),
                 'recommendations': self._generate_recommendations(evaluation_results)
             }
-            
+
             stage_duration = (datetime.now() - stage_start).total_seconds()
-            
+
             self.experiment_log['stages'].append({
-                'stage': 3,
+                'stage': 4,
                 'name': 'integration',
                 'start_time': stage_start.isoformat(),
                 'duration': stage_duration,
                 'status': 'completed'
             })
-            
-            print(f"✅ Stage 3完了 ({stage_duration:.2f}秒)")
+
+            print(f"✅ Stage 4完了 ({stage_duration:.2f}秒)")
             return integrated
-            
+
         except Exception as e:
-            print(f"❌ Stage 3エラー: {e}")
+            print(f"❌ Stage 4エラー: {e}")
             print("❌ 詳細スタックトレース:")
             traceback.print_exc()
             return {'error': str(e), 'status': 'failed'}
@@ -439,19 +543,30 @@ class Task4EvaluationPipeline:
     def _compute_summary_statistics(self, results: Dict[str, Any]) -> Dict[str, Any]:
         """サマリ統計の計算"""
         summary = {}
-        
+
         # フィルタリング性能統計
         if 'filtering_performance' in results:
             filtering = results['filtering_performance']
             if 'summary_metrics' in filtering:
                 summary['filtering'] = filtering['summary_metrics']
-        
+
         # 手法比較統計
         if 'method_comparison' in results:
             comparison = results['method_comparison']
             if 'summary' in comparison:
                 summary['comparison'] = comparison['summary']
-        
+
+        # モード分解統計
+        if 'mode_decomposition' in results:
+            mode_decomp = results['mode_decomposition']
+            if 'status' not in mode_decomp or mode_decomp['status'] != 'failed':
+                summary['mode_decomposition'] = {
+                    'spectral_radius': mode_decomp.get('spectral_radius'),
+                    'n_stable_modes': mode_decomp.get('n_stable_modes'),
+                    'n_dominant_modes': mode_decomp.get('n_dominant_modes'),
+                    'eigenvalues_statistics': mode_decomp.get('eigenvalues_statistics', {})
+                }
+
         return summary
     
     def _extract_key_findings(self, results: Dict[str, Any]) -> List[str]:
@@ -489,7 +604,22 @@ class Task4EvaluationPipeline:
                         if 'improvement' in result and 'kalman_vs_deterministic' in result['improvement']:
                             improvement = result['improvement']['kalman_vs_deterministic']
                             findings.append(f"Kalman {metric.upper()}改善率: {improvement:+.2f}%")
-        
+
+        # モード分解から
+        if 'mode_decomposition' in results:
+            mode_decomp = results['mode_decomposition']
+            if 'status' not in mode_decomp or mode_decomp['status'] != 'failed':
+                if 'spectral_radius' in mode_decomp:
+                    findings.append(f"システムスペクトル半径: {mode_decomp['spectral_radius']:.4f}")
+                if 'n_stable_modes' in mode_decomp:
+                    findings.append(f"安定モード数: {mode_decomp['n_stable_modes']}")
+                if 'eigenvalues_statistics' in mode_decomp:
+                    stats = mode_decomp['eigenvalues_statistics']
+                    if 'mean_growth_rate' in stats:
+                        growth_rate = stats['mean_growth_rate']
+                        stability = "安定" if growth_rate < 0 else "不安定"
+                        findings.append(f"平均成長率: {growth_rate:.4f} ({stability})")
+
         return findings
     
     def _create_performance_comparison(self, results: Dict[str, Any]) -> Dict[str, Any]:

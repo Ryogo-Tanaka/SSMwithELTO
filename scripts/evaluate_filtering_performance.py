@@ -39,7 +39,8 @@ class FilteringPerformanceEvaluator:
         model_path: str,
         config_path: str,
         output_dir: str,
-        device: str = 'auto'
+        device: str = 'auto',
+        config: dict = None
     ):
         self.model_path = Path(model_path)
         self.config_path = Path(config_path)
@@ -54,10 +55,22 @@ class FilteringPerformanceEvaluator:
             
         print(f"🖥️  使用デバイス: {self.device}")
         
+        # 設定読み込み
+        if config is not None:
+            # 外部から設定が渡された場合（推奨）
+            self.config = config
+            print(f"📝 外部設定を使用")
+        else:
+            # ファイルから読み込み（フォールバック） - 明確な選択基準なし
+            raise ValueError(
+                "設定が指定されていません。run_filtering_evaluation.pyから適切な設定を渡してください。"
+                "複数ドキュメントYAMLファイルからの自動選択は未実装です。"
+            )
+
         # 分析器の初期化
         self.filtering_analyzer = FilteringAnalyzer(str(self.output_dir), self.device)
         self.uncertainty_evaluator = UncertaintyEvaluator(str(self.output_dir))
-        
+
         # モデル読み込み
         self.inference_model = None
         self._load_inference_model()
@@ -209,7 +222,31 @@ class FilteringPerformanceEvaluator:
         try:
             # キャリブレーションデータの準備（観測の一部を使用）
             observations = evaluation_data['observations']
-            calibration_size = min(50, observations.size(0) // 4)  # 25%または最大50サンプル
+
+            # past_horizonを考慮した最小キャリブレーションサイズを計算
+            past_horizon = self.config.get('ssm', {}).get('realization', {}).get('past_horizon', 10)
+            min_required = 2 * past_horizon + 1  # realization.filterに必要な最小サンプル数
+
+            # 利用可能なデータに基づいてキャリブレーションサイズを決定
+            total_samples = observations.size(0)
+
+            # DEBUG: テストデータ不足の詳細ログ
+            print(f"🔍 DEBUG - データサイズ分析:")
+            print(f"   観測データ総数: {total_samples}")
+            print(f"   past_horizon: {past_horizon}")
+            print(f"   必要最小サンプル: {min_required} (2*{past_horizon}+1)")
+            print(f"   データ分割: {total_samples} // 4 = {total_samples // 4}")
+
+            if total_samples >= min_required:
+                calibration_size = min(50, max(min_required, total_samples // 4))
+                print(f"✅ 十分なデータ: キャリブレーション{calibration_size}サンプル使用")
+            else:
+                # データが不足している場合は全データを使用し、past_horizonを調整
+                calibration_size = total_samples
+                print(f"❌ 【根本原因】テストデータ不足: {total_samples}サンプル < 必要{min_required}")
+                print(f"   → より大きなテストデータセット(推奨: >50サンプル)が必要")
+                print(f"   → 一時対処: past_horizon={past_horizon}を調整することを推奨")
+
             calibration_data = observations[:calibration_size]
             
             # 推論セットアップ

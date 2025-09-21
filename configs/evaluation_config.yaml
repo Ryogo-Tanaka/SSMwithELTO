@@ -7,6 +7,9 @@ evaluation:
   output_base_dir: "results/task4_evaluation"
   save_detailed_results: true
   create_visualizations: true
+
+  # 新しい確率実現クラス使用設定
+  use_new_realization: true        # 新しい確率実現クラス使用
   
   # 評価対象データ設定
   data:
@@ -42,6 +45,20 @@ evaluation:
     likelihood:
       - "log_likelihood"   # 対数尤度
       - "perplexity"      # パープレキシティ
+
+    # スペクトル分析指標（モード分解）
+    spectrum_analysis:
+      enabled: true
+      sampling_interval: 0.1           # サンプリング間隔 Δt
+      dominant_threshold: 0.1          # 主要モード閾値
+      compare_with_truth: true         # 真値との比較（利用可能時）
+      save_detailed_data: true         # 詳細データ保存
+
+    # 多変量特徴量対応設定
+    multivariate_metrics:
+      evaluate_per_dimension: true     # 次元別評価有効化
+      feature_correlation_analysis: true # 特徴量相関分析
+      cross_dimensional_metrics: true  # 次元間指標計算
       
   # 比較実験設定
   comparison:
@@ -102,6 +119,8 @@ visualization:
     - "calibration_curve"           # キャリブレーション曲線
     - "coverage_rates"              # カバレッジ率
     - "method_comparison"           # 手法比較
+    - "mode_decomposition_spectrum" # モード分解スペクトル
+    - "eigenvalue_distribution"     # 固有値分布
     
   # 図のサイズ設定
   figure_size:

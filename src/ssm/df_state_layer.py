@@ -65,10 +65,14 @@ class StateFeatureNet(nn.Module):
         """
         Args:
             x: 状態 (batch_size, r) または (r,)
-            
+
         Returns:
             torch.Tensor: 特徴 (batch_size, d_A) または (d_A,)
         """
+        # GPUデバイス整合性を確保
+        if hasattr(self.net, 'to'):
+            self.net = self.net.to(x.device)
+
         if x.dim() == 1:
             x = x.unsqueeze(0)
             return self.net(x).squeeze(0)
@@ -794,6 +798,9 @@ class DFStateLayer(nn.Module):
         else:
             V_A = self.V_A
         
+        # GPUデバイス整合性を確保
+        V_A = V_A.to(phi_prev.device)
+
         if phi_prev.dim() == 1:
             return V_A @ phi_prev
         else:
@@ -843,7 +850,8 @@ class DFStateLayer(nn.Module):
         # 転送作用素適用
         phi_pred = self.apply_transfer_operator(phi_prev)
         
-        # 状態空間に戻す
+        # 状態空間に戻す（GPUデバイス整合性を確保）
+        U_A = U_A.to(phi_pred.device)
         if phi_pred.dim() == 1:
             return U_A.T @ phi_pred
         else:

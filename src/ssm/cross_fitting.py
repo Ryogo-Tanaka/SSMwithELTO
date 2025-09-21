@@ -230,6 +230,52 @@ class TwoStageCrossFitter:
             
         return stage2_estimator(H_cf, Y_target, **estimator_kwargs)
 
+    def cross_fit_stage2_matrix(
+        self,
+        H_cf: torch.Tensor,
+        M_target: torch.Tensor,
+        stage2_estimator: Callable,
+        detach_features: bool = True,
+        **estimator_kwargs
+    ) -> List[torch.Tensor]:
+        """
+        Stage-2推定（多変量読み出し行列）
+
+        各ブロックに対してout-of-fold推定を行い、U_Bリストを返す。
+
+        Args:
+            H_cf: Out-of-fold 特徴量 (T, d_B)
+            M_target: 多変量ターゲット (T, m)
+            stage2_estimator: Stage-2推定関数
+                signature: U_B = estimator(H, M, **kwargs) -> (d_B, m)
+            detach_features: 勾配を切断するかどうか
+            **estimator_kwargs: estimatorの追加引数
+
+        Returns:
+            List[torch.Tensor]: 各ブロック用のU_Bリスト [(d_B, m), ...]
+        """
+        if H_cf.size(0) != M_target.size(0):
+            raise ValueError(f"Feature-target size mismatch: H_cf={H_cf.size(0)}, M={M_target.size(0)}")
+
+        U_B_list = []
+
+        for k in range(self.cf_manager.n_blocks):
+            # out-of-fold インデックス
+            oof_indices = self.cf_manager.get_out_of_fold_indices(k)
+
+            # out-of-fold データで推定
+            H_oof = H_cf[oof_indices]  # (|I_{-k}|, d_B)
+            M_oof = M_target[oof_indices]  # (|I_{-k}|, m)
+
+            if detach_features:
+                H_oof = H_oof.detach()
+
+            # U_B推定
+            U_B_k = stage2_estimator(H_oof, M_oof, **estimator_kwargs)
+            U_B_list.append(U_B_k)
+
+        return U_B_list
+
 
 class CrossFittingError(Exception):
     """クロスフィッティング処理中のエラー"""

@@ -9,3 +9,5 @@ _tests/
 results/
 HANDOVER_TECHNICAL_GUIDE.md
 _myzipper.py
+test_*.py
+test_*.json

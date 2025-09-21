@@ -4,10 +4,10 @@ Algorithm 1: Operator-based Kalman filtering with Galerkin-projected conditional
 
 資料Section 2.7.2の完全実装。学習済み転送作用素VA, VBを用いた逐次状態推定。
 
-Input: 
-- 学習済み演算子: VA ∈ R^(dA×dA), VB ∈ R^(dB×dA), uB ∈ R^dB, UA^T ∈ R^(r×dA)
-- ノイズ共分散: Q ∈ R^(dA×dA), R ∈ R≥0
-- エンコーダ: uη : R^n→R
+Input:
+- 学習済み演算子: VA ∈ R^(dA×dA), VB ∈ R^(dB×dA), UB ∈ R^(dB×m), UA^T ∈ R^(r×dA)
+- ノイズ共分散: Q ∈ R^(dA×dA), R ∈ R^(m×m)
+- エンコーダ: uη : R^n→R^m
 - 初期値: (µ0, Σ0)
 
 Output:
@@ -35,7 +35,7 @@ class OperatorBasedKalmanFilter:
         V_A: torch.Tensor,           # 状態転送作用素 (dA, dA)
         V_B: torch.Tensor,           # 観測転送作用素 (dB, dA)
         U_A: torch.Tensor,           # 状態読み出し行列 (dA, r)
-        u_B: torch.Tensor,           # 観測読み出しベクトル (dB,)
+        U_B: torch.Tensor,           # 観測読み出し行列 (dB, m)
         Q: torch.Tensor,             # 状態ノイズ共分散 (dA, dA)
         R: Union[torch.Tensor, float], # 観測ノイズ分散（スカラーまたは行列）
         encoder: nn.Module,          # エンコーダネットワーク（frozen）
@@ -49,7 +49,7 @@ class OperatorBasedKalmanFilter:
             V_A: 学習済み状態転送作用素 (dA, dA)
             V_B: 学習済み観測転送作用素 (dB, dA)  
             U_A: 学習済み状態読み出し行列 (dA, r)
-            u_B: 学習済み観測読み出しベクトル (dB,)
+            U_B: 学習済み観測読み出し行列 (dB, m)
             Q: 状態ノイズ共分散 (dA, dA)
             R: 観測ノイズ分散（スカラーまたは行列）
             encoder: エンコーダネットワーク（frozen）
@@ -61,7 +61,7 @@ class OperatorBasedKalmanFilter:
         self.V_A = V_A.to(self.device)
         self.V_B = V_B.to(self.device)
         self.U_A = U_A.to(self.device)
-        self.u_B = u_B.to(self.device)
+        self.U_B = U_B.to(self.device)
         
         # ノイズ共分散
         self.Q = Q.to(self.device)
@@ -158,35 +158,42 @@ class OperatorBasedKalmanFilter:
 
     def _approximate_feature_mapping(self, m_series: torch.Tensor) -> torch.Tensor:
         """
-        スカラー特徴量からdA次元特徴への近似写像
-        
+        多変量特徴量からdA次元特徴への近似写像
+
         注意: この関数は簡易版。実際の実装では学習済みDF-A/DF-Bの
         特徴写像 φ_θ を使用する必要がある。
-        
+
         Args:
-            m_series: スカラー特徴系列 (T,)
-            
+            m_series: 多変量特徴系列 (T, m) または (T,) for backward compatibility
+
         Returns:
             torch.Tensor: 近似特徴 (T, dA)
         """
         T = m_series.size(0)
-        
+
+        # 多変量対応: 入力が(T,)の場合は(T,1)に変換
+        if m_series.dim() == 1:
+            m_series = m_series.unsqueeze(1)  # (T, 1)
+
+        m = m_series.size(1)  # 特徴量次元
+
         # 簡易的な特徴拡張（実際はφ_θを使用）
         # 例: 遅延埋め込み + ランダムフーリエ特徴
         features = []
-        
-        # 遅延埋め込み
+
+        # 遅延埋め込み（多変量対応）
         max_delay = min(5, T)
         for t in range(T):
             delayed = []
             for d in range(max_delay):
                 if t - d >= 0:
-                    delayed.append(m_series[t - d])
+                    delayed.append(m_series[t - d])  # (m,)
                 else:
-                    delayed.append(torch.zeros_like(m_series[0]))
-            features.append(torch.stack(delayed))
-            
-        feature_matrix = torch.stack(features)  # (T, max_delay)
+                    delayed.append(torch.zeros_like(m_series[0]))  # (m,)
+            delayed_features = torch.cat(delayed, dim=0)  # (max_delay * m,)
+            features.append(delayed_features)
+
+        feature_matrix = torch.stack(features)  # (T, max_delay * m)
         
         # 線形変換でdA次元に拡張
         if feature_matrix.size(1) < self.dA:
@@ -248,20 +255,20 @@ class OperatorBasedKalmanFilter:
         Returns:
             mu_plus: 更新状態平均 µ⁺ₜ (dA,)
             Sigma_plus: 更新状態共分散 Σ⁺ₜ (dA, dA)
-            likelihood: 観測尤度
+            likelihood: ダミー値（正規分布非仮定のため廃止）
         """
-        # 1. 現在観測のエンコード: m_t ← u_η(y_t) ∈ R
+        # 1. 現在観測のエンコード: m_t ← u_η(y_t) ∈ R^m
         with torch.no_grad():
             # TCNエンコーダ用の形状調整: [d] → [1, 1, d]
             if observation.dim() == 1:
                 observation = observation.unsqueeze(0).unsqueeze(0)  # (1, 1, d)
             elif observation.dim() == 2:
                 observation = observation.unsqueeze(1)  # (B, 1, d)
-            m_t = self.encoder(observation).squeeze()  # scalar
+            m_t = self.encoder(observation).squeeze()  # (m,) multivariate features
 
             # 1.5. 観測特徴の生成: ψ_ω(m_t) ∈ ℝ^{d_B} (式54で使用)
-            # 簡易実装: 学習済み観測特徴マッピングを近似
-            psi_omega_m_t = self._generate_obs_features_from_scalar(m_t)  # (dB,)
+            # 多変量特徴量から観測特徴量への変換
+            psi_omega_m_t = self._generate_obs_features_from_multivariate(m_t)  # (dB,)
 
         # 2. 観測予測 (Observation prediction): 式51
         # ハット{ψ}^{-}_{t} = V_B μ^-_{t} ∈ ℝ^{d_B}
@@ -269,7 +276,18 @@ class OperatorBasedKalmanFilter:
 
         # 3. イノベーション共分散 (Innovation covariance): 式52
         # S_t = V_B Σ^-_t V_B^T + R ∈ ℝ^{d_B × d_B}
-        S = self.V_B @ Sigma_minus @ self.V_B.T + self.R  # (dB, dB)
+        S = self.V_B @ Sigma_minus @ self.V_B.T  # (dB, dB)
+
+        # 観測ノイズ共分散の追加（多変量対応）
+        if isinstance(self.R, torch.Tensor) and self.R.dim() == 2:
+            # 行列 R ∈ R^{d_B × d_B}
+            S = S + self.R
+        elif isinstance(self.R, (int, float)) or (isinstance(self.R, torch.Tensor) and self.R.dim() == 0):
+            # スカラー R → 対角行列 R * I_{d_B}
+            R_scalar = float(self.R) if isinstance(self.R, torch.Tensor) else self.R
+            S = S + R_scalar * torch.eye(self.dB, device=S.device, dtype=S.dtype)
+        else:
+            raise ValueError(f"Unsupported observation noise covariance type: {type(self.R)}, shape: {self.R.shape if hasattr(self.R, 'shape') else 'N/A'}")
 
         # 数値安定性チェック (Check positive definiteness)
         try:
@@ -304,10 +322,11 @@ class OperatorBasedKalmanFilter:
         
         # 正定値性確保
         Sigma_plus = self._regularize_covariance(Sigma_plus)
-        
-        # 6. 観測尤度計算
-        likelihood = self._compute_likelihood(innovation, S)
-        
+
+        # 6. 観測尤度計算（廃止: 正規分布非仮定のため）
+        # likelihood = self._compute_likelihood(innovation, S)
+        likelihood = 0.0  # ダミー値
+
         return mu_plus, Sigma_plus, likelihood
 
     def filter_step(
@@ -327,7 +346,7 @@ class OperatorBasedKalmanFilter:
         Returns:
             x_hat_t: 推定状態 x̂_t (r,)
             Sigma_x_t: 状態共分散 Σ_t^(x) (r, r)
-            likelihood: 観測尤度
+            likelihood: ダミー値（正規分布非仮定のため廃止）
         """
         if state is not None:
             mu_prev, Sigma_prev = state
@@ -374,7 +393,7 @@ class OperatorBasedKalmanFilter:
         Returns:
             X_means: 状態平均系列 (T, r)
             X_covariances: 状態共分散系列 (T, r, r)
-            likelihoods: 観測尤度系列 (T,) [optional]
+            likelihoods: ダミー値系列 (T,) [正規分布非仮定のため廃止]
         """
         T = observations.size(0)
         
@@ -469,22 +488,31 @@ class OperatorBasedKalmanFilter:
 
     def _compute_likelihood(self, innovation: torch.Tensor, S: torch.Tensor) -> float:
         """
-        観測尤度計算
-        
+        観測尤度計算（廃止）
+
+        注意: 定式化では正規分布を仮定していないため、尤度計算は理論的に不適切。
+        平均と共分散のみを特徴空間から元の状態空間へ射影することで復元する。
+
         Args:
-            innovation: イノベーション (scalar)
-            S: イノベーション共分散 (scalar)
-            
+            innovation: イノベーション (多変量) - 使用されない
+            S: イノベーション共分散 (行列) - 使用されない
+
         Returns:
-            float: 対数尤度
+            float: ダミー値（0.0を返す）
         """
-        # 正規分布の対数確率密度
-        log_likelihood = -0.5 * (
-            torch.log(2 * torch.pi * S) + 
-            (innovation ** 2) / S
-        )
-        
-        return log_likelihood.item()
+        # 引数は後方互換性のためのみ保持
+        _ = innovation  # 未使用警告回避
+        _ = S          # 未使用警告回避
+
+        # TODO: 正規分布仮定なしの定式化のため、尤度計算を削除
+        # 元の実装（正規分布仮定）:
+        # log_likelihood = -0.5 * (
+        #     torch.log(2 * torch.pi * S) +
+        #     (innovation ** 2) / S
+        # )
+
+        # 正規分布を仮定しない定式化では尤度計算は行わない
+        return 0.0  # ダミー値
 
     def get_current_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -546,15 +574,15 @@ class OperatorBasedKalmanFilter:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def _generate_obs_features_from_scalar(self, m_t: torch.Tensor) -> torch.Tensor:
+    def _generate_obs_features_from_multivariate(self, m_t: torch.Tensor) -> torch.Tensor:
         """
-        スカラー特徴から観測特徴を生成: ψ_ω(m_t) ∈ ℝ^{d_B}
+        多変量特徴から観測特徴を生成: ψ_ω(m_t) ∈ ℝ^{d_B}
 
         定式化の式54で必要な観測特徴ベクトルを生成。
         学習済みDF-B層のψ_ωネットワークが必須。
 
         Args:
-            m_t: スカラー特徴 (エンコーダ出力) - 0次元または1要素の1次元テンソル
+            m_t: 多変量特徴 (エンコーダ出力) ∈ R^m - (m,) または (1, m)
 
         Returns:
             psi_omega_m_t: 観測特徴ベクトル (dB,)
@@ -571,13 +599,15 @@ class OperatorBasedKalmanFilter:
                 )
 
             # m_t の形状を ψ_ω の入力形式に調整
-            # スカラー(0次元) → (1,), 1要素1次元はそのまま
-            if m_t.dim() == 0:
-                m_t_input = m_t.unsqueeze(0)  # (1,)
-            elif m_t.numel() == 1:
-                m_t_input = m_t.flatten()  # 確実に(1,)形状
+            # 多変量特徴: (m,) または (1, m) → (m,) for single sample
+            if m_t.dim() == 1:
+                # (m,) - 単一サンプル
+                m_t_input = m_t  # そのまま
+            elif m_t.dim() == 2 and m_t.size(0) == 1:
+                # (1, m) - バッチサイズ1
+                m_t_input = m_t.squeeze(0)  # (m,)
             else:
-                raise ValueError(f"m_t must be scalar-like tensor, got shape: {m_t.shape}")
+                raise ValueError(f"m_t must be multivariate feature tensor with shape (m,) or (1, m), got shape: {m_t.shape}")
 
             # 学習済みψ_ωネットワークで観測特徴生成
             psi_omega_m_t = self.df_obs_layer.psi_omega(m_t_input)  # (dB,) or (1, dB)

@@ -10,14 +10,14 @@ from .cross_fitting import CrossFittingManager, TwoStageCrossFitter, CrossFittin
 
 class ObservationFeatureNet(nn.Module):
     """
-    観測特徴写像 ψ_ω: R → R^{d_B}
-    
-    スカラー特徴量（エンコーダ出力）を高次元特徴空間に写像する。
+    観測特徴写像 ψ_ω: R^m → R^{d_B}
+
+    多変量特徴量（エンコーダ出力）を高次元特徴空間に写像する。
     """
     
     def __init__(
-        self, 
-        input_dim: int = 1,  # スカラー特徴量
+        self,
+        input_dim: int = 8,  # 多変量特徴量次元 m
         output_dim: int = 16,
         hidden_sizes: list[int] = [32, 32],
         activation: str = "ReLU",
@@ -25,7 +25,7 @@ class ObservationFeatureNet(nn.Module):
     ):
         """
         Args:
-            input_dim: 入力次元（通常1）
+            input_dim: 入力次元 m（多変量特徴量）
             output_dim: 出力特徴次元 d_B
             hidden_sizes: 中間層のユニット数リスト
             activation: 活性化関数名
@@ -63,24 +63,19 @@ class ObservationFeatureNet(nn.Module):
     def forward(self, m: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            m: スカラー特徴量 (batch_size, 1) または (1,) または scalar
-            
+            m: 多変量特徴量 (batch_size, m) または (m,)
+
         Returns:
             torch.Tensor: 観測特徴量 (batch_size, d_B) または (d_B,)
         """
-        # スカラー入力を(1,)形状に正規化
-        if m.dim() == 0:  # scalar
-            m = m.unsqueeze(0).unsqueeze(0)  # (1, 1)
+        # 多変量特徴量の形状チェック
+        if m.dim() == 1:  # (m,)
+            m = m.unsqueeze(0)  # (1, m)
             return self.net(m).squeeze(0)  # (d_B,)
-        elif m.dim() == 1:
-            if m.size(0) == 1:  # (1,)
-                m = m.unsqueeze(0)  # (1, 1)
-                return self.net(m).squeeze(0)  # (d_B,)
-            else:  # (batch_size,)
-                m = m.unsqueeze(1)  # (batch_size, 1)
-                return self.net(m)  # (batch_size, d_B)
-        else:  # (batch_size, 1)
-            return self.net(m)
+        elif m.dim() == 2:  # (batch_size, m)
+            return self.net(m)  # (batch_size, d_B)
+        else:
+            raise ValueError(f"Unsupported input shape: {m.shape}. Expected (m,) or (batch_size, m)")
 
 
 class DFObservationLayer(nn.Module):
@@ -105,6 +100,7 @@ class DFObservationLayer(nn.Module):
         self,
         df_state_layer,  # DFStateLayerインスタンス（必須）
         obs_feature_dim: int = 16,
+        multivariate_feature_dim: int = 8,  # 多変量特徴量次元 m
         lambda_B: float = 1e-3,
         lambda_dB: float = 1e-3,
         obs_net_config: Optional[Dict[str, Any]] = None,
@@ -114,6 +110,7 @@ class DFObservationLayer(nn.Module):
         Args:
             df_state_layer: **必須** 学習済みDFStateLayerインスタンス
             obs_feature_dim: 観測特徴次元 d_B
+            multivariate_feature_dim: 多変量特徴量次元 m
             lambda_B: Stage-1正則化パラメータ λ_B
             lambda_dB: Stage-2正則化パラメータ λ_{dB}
             obs_net_config: ObservationFeatureNetの設定
@@ -125,6 +122,7 @@ class DFObservationLayer(nn.Module):
         super().__init__()
         self.df_state = df_state_layer
         self.obs_feature_dim = obs_feature_dim
+        self.multivariate_feature_dim = multivariate_feature_dim
         self.lambda_B = float(lambda_B)  # 文字列対応
         self.lambda_dB = float(lambda_dB)  # 文字列対応
         
@@ -134,7 +132,7 @@ class DFObservationLayer(nn.Module):
         # 観測特徴ネットワーク ψ_ω
         obs_config = obs_net_config or {}
         self.psi_omega = ObservationFeatureNet(
-            input_dim=1,
+            input_dim=multivariate_feature_dim,
             output_dim=obs_feature_dim,
             **obs_config
         )
@@ -144,12 +142,12 @@ class DFObservationLayer(nn.Module):
         
         # 学習済みパラメータ
         self.V_B: Optional[torch.Tensor] = None  # 観測転送作用素 (d_B, d_A)
-        self.u_B: Optional[torch.Tensor] = None  # 観測読み出しベクトル (d_B,)
+        self.U_B: Optional[torch.Tensor] = None  # 観測読み出し行列 (d_B, m)
         self._is_fitted = False
         
         # **新機能**: Phase-1学習用の内部状態管理
         self._stage1_cache = {}  # V_B計算結果をキャッシュ
-        self._stage2_cache = {}  # u_B計算結果をキャッシュ
+        self._stage2_cache = {}  # U_B計算結果をキャッシュ
     
     def _ridge_stage1_vb(
         self, 
@@ -183,7 +181,8 @@ class DFObservationLayer(nn.Module):
         PhiTPhi = Phi_instrument.T @ Phi_instrument  # (d_A, d_A)
         PhiTPhi_reg = PhiTPhi + reg_lambda * torch.eye(d_A, device=Phi_instrument.device, dtype=Phi_instrument.dtype)
         
-        # クロス共分散
+        # クロス共分散（デバイス整合性を確保）
+        Psi_treatment = Psi_treatment.to(Phi_instrument.device)
         PsiTPhi = Psi_treatment.T @ Phi_instrument  # (d_B, d_A)
         
         # 逆行列計算（数値安定化）
@@ -226,7 +225,8 @@ class DFObservationLayer(nn.Module):
         PhiPhi = Phi_instrument.T @ Phi_instrument  # (d_A, d_A)
         PhiPhi_reg = PhiPhi + reg_lambda * torch.eye(d_A, device=Phi_instrument.device, dtype=Phi_instrument.dtype)
 
-        # クロス共分散（勾配計算あり）
+        # クロス共分散（勾配計算あり・デバイス整合性を確保）
+        Psi_treatment = Psi_treatment.to(Phi_instrument.device)
         PsiPhi = Psi_treatment.T @ Phi_instrument  # (d_B, d_A)
 
         # 逆行列計算（勾配計算あり）
@@ -312,68 +312,71 @@ class DFObservationLayer(nn.Module):
             psi_pred = (V_B @ phi_prev.T).T
             return psi_pred, V_B
 
-    def _ridge_stage2_ub(
-        self, 
-        H_instrument: torch.Tensor, 
-        m_target: torch.Tensor, 
+    def _ridge_stage2_ub_matrix(
+        self,
+        H_instrument: torch.Tensor,
+        M_target: torch.Tensor,
         reg_lambda: float
     ) -> torch.Tensor:
         """
-        Stage-2 Ridge回帰: 観測読み出しベクトル推定
-        
-        u_B = (H H^T + λI)^{-1} H m
-        
+        Stage-2 Ridge回帰: 観測読み出し行列推定（多変量版）
+
+        U_B = (H H^T + λI)^{-1} H M^T
+
         Args:
             H_instrument: クロスフィット操作変数特徴量 (N, d_B)
-            m_target: 目標スカラー特徴量 (N,)
+            M_target: 目標多変量特徴量 (N, m)
             reg_lambda: 正則化パラメータ λ_{dB}
-            
+
         Returns:
-            torch.Tensor: 観測読み出しベクトル u_B (d_B,)
+            torch.Tensor: 観測読み出し行列 U_B (d_B, m)
         """
         N, d_B = H_instrument.shape
-        if m_target.size(0) != N:
-            raise ValueError(f"操作変数とターゲットのサンプル数不一致: {N} vs {m_target.size(0)}")
-        
+        N_t, m = M_target.shape
+
+        if N != N_t:
+            raise ValueError(f"操作変数とターゲットのサンプル数不一致: {N} vs {N_t}")
+
         # グラム行列 + 正則化
         HHt = H_instrument.T @ H_instrument  # (d_B, d_B)
         HHt_reg = HHt + reg_lambda * torch.eye(d_B, device=H_instrument.device, dtype=H_instrument.dtype)
-        
-        # クロス項
-        Hm = H_instrument.T @ m_target  # (d_B,)
-        
+
+        # クロス項（デバイス整合性を確保）
+        M_target = M_target.to(H_instrument.device)
+        HM = H_instrument.T @ M_target  # (d_B, m)
+
         # 逆行列計算（数値安定化）
         try:
             HHt_inv = torch.linalg.inv(HHt_reg)
-            u_B = HHt_inv @ Hm
+            U_B = HHt_inv @ HM
         except torch.linalg.LinAlgError:
             # Cholesky分解 fallback
             try:
                 L = torch.linalg.cholesky(HHt_reg)
                 HHt_inv = torch.cholesky_inverse(L)
-                u_B = HHt_inv @ Hm
+                U_B = HHt_inv @ HM
             except torch.linalg.LinAlgError:
                 # SVD fallback
                 U, S, Vh = torch.linalg.svd(HHt_reg)
                 S_inv = torch.where(S > 1e-10, 1.0 / S, 0.0)
                 HHt_inv = (Vh.T * S_inv) @ Vh
-                u_B = HHt_inv @ Hm
-        
-        return u_B
+                U_B = HHt_inv @ HM
 
-    def _ridge_stage2_ub_with_grad(
+        return U_B
+
+    def _ridge_stage2_ub_matrix_with_grad(
         self,
         H_instrument: torch.Tensor,
-        m_target: torch.Tensor,
+        M_target: torch.Tensor,
         reg_lambda: float
     ) -> torch.Tensor:
         """
-        Stage-2 Ridge回帰（勾配計算あり）: ψ_ω更新用
+        Stage-2 Ridge回帰（勾配計算あり）: ψ_ω更新用（多変量版）
 
-        u_B = (H H^T + λI)^{-1} H m
+        U_B = (H H^T + λI)^{-1} H M^T
         """
         N, d_B = H_instrument.shape
-        N_t = m_target.size(0)
+        N_t, m = M_target.shape
 
         if N != N_t:
             raise ValueError(f"特徴量とターゲットのサンプル数不一致: {N} vs {N_t}")
@@ -382,36 +385,37 @@ class DFObservationLayer(nn.Module):
         HHt = H_instrument.T @ H_instrument  # (d_B, d_B)
         HHt_reg = HHt + reg_lambda * torch.eye(d_B, device=H_instrument.device, dtype=H_instrument.dtype)
 
-        # クロス項（勾配計算あり）
-        Hm = H_instrument.T @ m_target  # (d_B,)
+        # クロス項（勾配計算あり・デバイス整合性を確保）
+        M_target = M_target.to(H_instrument.device)
+        HM = H_instrument.T @ M_target  # (d_B, m)
 
         # 逆行列計算（勾配計算あり）
         try:
             HHt_inv = torch.linalg.inv(HHt_reg)
-            u_B = HHt_inv @ Hm
+            U_B = HHt_inv @ HM
         except torch.linalg.LinAlgError:
             # フォールバック：疑似逆行列
             HHt_inv = torch.linalg.pinv(HHt_reg)
-            u_B = HHt_inv @ Hm
+            U_B = HHt_inv @ HM
 
-        return u_B
+        return U_B
 
-    def _compute_cross_fitting_prediction_ub(
+    def _compute_cross_fitting_prediction_ub_matrix(
         self,
         H_features: torch.Tensor,
-        m_target: torch.Tensor
+        M_target: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        **理論準拠**: u_B用クロスフィッティングでout-of-fold予測計算
+        **理論準拠**: U_B用クロスフィッティングでout-of-fold予測計算（多変量版）
 
         Args:
             H_features: 操作変数特徴量 (T-1, d_B)
-            m_target: 観測目標 (T-1,)
+            M_target: 観測目標 (T-1, m)
 
         Returns:
-            tuple: (m_pred_cf, u_B_final)
-                - m_pred_cf: out-of-fold予測 (T-1,)
-                - u_B_final: 最終u_Bベクトル (d_B,)
+            tuple: (M_pred_cf, U_B_final)
+                - M_pred_cf: out-of-fold予測 (T-1, m)
+                - U_B_final: 最終U_B行列 (d_B, m)
         """
         T_eff = H_features.size(0)
 
@@ -422,9 +426,9 @@ class DFObservationLayer(nn.Module):
         # データ量チェック：クロスフィッティング実行可能性
         if T_eff < max(n_blocks * min_block_size, 100):
             # データ不足時：従来の全データRidge回帰（勾配あり）
-            u_B = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
-            m_pred = (H_features * u_B).sum(dim=1)
-            return m_pred, u_B
+            U_B = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
+            M_pred = (H_features @ U_B)  # TODO: 多変量対応修正 - U_B.T -> U_B (T-1, d_B) @ (d_B, m) = (T-1, m)
+            return M_pred, U_B
 
         # クロスフィッティング実行
         try:
@@ -434,35 +438,35 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # u_B推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
+            # U_B推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
             with torch.no_grad():
-                u_B_list = cf_fitter.cross_fit_stage2(
-                    H_features, m_target,
-                    stage2_estimator=lambda H, m: self._ridge_stage2_ub(H, m, self.lambda_dB)
+                U_B_list = cf_fitter.cross_fit_stage2_matrix(
+                    H_features, M_target,
+                    stage2_estimator=lambda H, M: self._ridge_stage2_ub_matrix(H, M, self.lambda_dB)
                 )
 
             # **理論準拠**: out-of-fold予測計算（勾配あり）
-            m_pred_cf = torch.zeros_like(m_target)
+            M_pred_cf = torch.zeros_like(M_target)
             for k in range(cf_manager.n_blocks):
                 block_indices = cf_manager.get_block_indices(k)
                 H_block = H_features[block_indices]
-                m_pred_cf[block_indices] = (H_block * u_B_list[k]).sum(dim=1)
+                M_pred_cf[block_indices] = H_block @ U_B_list[k]  # TODO: 多変量対応修正 - U_B_list[k].T -> U_B_list[k]
 
-            # 最終u_B：全データでの推定（勾配あり、正則化用）
-            u_B_final = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
+            # 最終U_B：全データでの推定（勾配あり、正則化用）
+            U_B_final = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
 
-            return m_pred_cf, u_B_final
+            return M_pred_cf, U_B_final
 
         except ImportError:
             # フォールバック（勾配あり）
-            u_B = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
-            m_pred = (H_features * u_B).sum(dim=1)
-            return m_pred, u_B
+            U_B = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
+            M_pred = H_features @ U_B  # (T-1, d_B) @ (d_B, m) = (T-1, m)
+            return M_pred, U_B
         except Exception as e:
-            print(f"u_Bクロスフィッティング失敗、従来方式を使用: {e}")
-            u_B = self._ridge_stage2_ub_with_grad(H_features, m_target, self.lambda_dB)
-            m_pred = (H_features * u_B).sum(dim=1)
-            return m_pred, u_B
+            print(f"U_Bクロスフィッティング失敗、従来方式を使用: {e}")
+            U_B = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
+            M_pred = H_features @ U_B  # (T-1, d_B) @ (d_B, m) = (T-1, m)
+            return M_pred, U_B
 
     def _freeze_parameters(self, module: nn.Module) -> Dict[str, torch.Tensor]:
         """パラメータを一時的に固定し、元の状態を保存"""
@@ -491,12 +495,13 @@ class DFObservationLayer(nn.Module):
         """
         T_x = X_hat_states.size(0)
         
-        # スカラー特徴量の次元調整
-        if m_features.dim() == 2 and m_features.size(1) == 1:
-            m_features = m_features.squeeze(1)
-        elif m_features.dim() != 1:
-            raise ValueError(f"スカラー特徴量は1次元: got {m_features.shape}")
-        
+        # 多変量特徴量の次元チェック
+        if m_features.dim() != 2:
+            raise ValueError(f"多変量特徴量は2次元 (T, m): got {m_features.shape}")
+
+        if m_features.size(1) != self.multivariate_feature_dim:
+            raise ValueError(f"特徴量次元不一致: expected {self.multivariate_feature_dim}, got {m_features.size(1)}")
+
         # **修正: より詳細な時間検証**
         if T_x != m_features.size(0):
             # デバッグ情報付きエラー
@@ -529,14 +534,14 @@ class DFObservationLayer(nn.Module):
                 # 操作変数特徴量（各反復で新しい計算グラフ）
                 phi_instrument = self.phi_theta(X_hat_states)  # (T, d_A)
                 
-                # 観測特徴量
+                # 観測特徴量（多変量対応）
                 if fix_psi_omega:
                     # ψ_ω固定: 勾配計算なし
                     with torch.no_grad():
-                        psi_obs = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+                        psi_obs = self.psi_omega(m_features)  # m_features: (T, m)
                 else:
                     # ψ_ω更新: 勾配計算あり
-                    psi_obs = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+                    psi_obs = self.psi_omega(m_features)  # m_features: (T, m)
                 
                 # 時間合わせ
                 phi_prev = phi_instrument[:-1]  # (T-1, d_A)
@@ -577,7 +582,7 @@ class DFObservationLayer(nn.Module):
             # Stage-1結果をキャッシュ（Stage-2用）
             with torch.no_grad():
                 phi_final = self.phi_theta(X_hat_states)
-                psi_final = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+                psi_final = self.psi_omega(m_features)  # m_features: (T, m)
                 
                 phi_prev_final = phi_final[:-1]
                 psi_curr_final = psi_final[1:]
@@ -605,22 +610,22 @@ class DFObservationLayer(nn.Module):
     
     def train_stage2_with_gradients(
             self,
-            m_features: torch.Tensor,
+            M_features: torch.Tensor,
             optimizer_psi: torch.optim.Optimizer,
             fix_phi_theta: bool = True
         ) -> Dict[str, float]:
         """
-        **修正版**: Stage-2学習 + ψ_ω勾配更新（φ_θ完全固定）
-        
+        **修正版**: Stage-2学習 + ψ_ω勾配更新（多変量特徴量対応）
+
         資料の学習戦略に対応:
-        u_B = 閉形式解(H^{(cf)}_B, m)        # u_B計算（φ_θ固定）
-        ψ_ω ← ψ_ω - α∇L2(u_B, ψ_ω)         # ψ_ω更新（φ_θ固定）
-        
+        U_B = 閉形式解(H^{(cf)}_B, M)        # U_B計算（φ_θ固定）
+        ψ_ω ← ψ_ω - α∇L2(U_B, ψ_ω)         # ψ_ω更新（φ_θ固定）
+
         Args:
-            m_features: スカラー特徴量 (T,)
+            M_features: 多変量特徴量 (T, m)
             optimizer_psi: ψ_ω用オプティマイザ
             fix_phi_theta: φ_θ を完全固定するか
-            
+
         Returns:
             Dict[str, float]: 損失メトリクス
         """
@@ -639,13 +644,13 @@ class DFObservationLayer(nn.Module):
             T_eff = phi_prev.size(0)
             
             # **修正3**: 境界チェック追加
-            if m_features.size(0) < T_eff + 1:
-                raise RuntimeError(f"m_features長不足: required {T_eff+1}, got {m_features.size(0)}")
-            m_curr = m_features[1:T_eff+1]  # (T-1,)
+            if M_features.size(0) < T_eff + 1:
+                raise RuntimeError(f"M_features長不足: required {T_eff+1}, got {M_features.size(0)}")
+            M_curr = M_features[1:T_eff+1]  # (T-1, m)
 
             # **修正**: Stage-2でψ_ω依存のV_B動的計算
             # φ_θ: 固定値（キャッシュ）、ψ_ω: 現在値（勾配あり）
-            psi_obs_current = self.psi_omega(m_features.unsqueeze(1) if m_features.dim() == 1 else m_features)
+            psi_obs_current = self.psi_omega(M_features)
             psi_curr_grad = psi_obs_current[1:T_eff+1]  # (T-1, d_B) 勾配あり
 
             # V_B動的計算（ψ_ω勾配あり）
@@ -654,12 +659,12 @@ class DFObservationLayer(nn.Module):
             # H計算（ψ_ω勾配あり）
             H = (V_B_current @ phi_prev.T).T  # (T-1, d_B) 勾配あり
 
-            # **理論準拠**: クロスフィッティングでu_B推定とout-of-fold予測
-            m_pred, u_B = self._compute_cross_fitting_prediction_ub(H, m_curr)
+            # **理論準拠**: クロスフィッティングでU_B推定とout-of-fold予測
+            M_pred, U_B = self._compute_cross_fitting_prediction_ub_matrix(H, M_curr)
 
-            # Stage-2 損失: 予測誤差（正規化済み） + u_B正則化項
-            prediction_loss = torch.norm(m_pred - m_curr, p=2) ** 2 / m_curr.numel()
-            regularization_loss = self.lambda_dB * torch.norm(u_B, p=2) ** 2
+            # Stage-2 損失: 予測誤差（正規化済み） + U_B正則化項
+            prediction_loss = torch.norm(M_pred - M_curr, p='fro') ** 2 / M_curr.numel()
+            regularization_loss = self.lambda_dB * torch.norm(U_B, p='fro') ** 2
             loss_stage2 = prediction_loss + regularization_loss
             
             # ψ_ω 更新（φ_θ は固定済み）
@@ -674,8 +679,8 @@ class DFObservationLayer(nn.Module):
             
             optimizer_psi.step()
             
-            # u_B をキャッシュ
-            self._stage2_cache['u_B'] = u_B.detach()
+            # U_B をキャッシュ
+            self._stage2_cache['U_B'] = U_B.detach()
             
             return {'stage2_loss': loss_stage2.item()}
             
@@ -685,28 +690,29 @@ class DFObservationLayer(nn.Module):
                 self._restore_parameters(self.phi_theta, phi_original_states)
     
     def fit_two_stage(
-        self, 
+        self,
         X_hat_states: torch.Tensor,  # DF-Aからの状態予測
-        m_features: torch.Tensor,    # エンコーダからのスカラー特徴量
+        M_features: torch.Tensor,    # エンコーダからの多変量特徴量
         use_cross_fitting: bool = True,
         verbose: bool = False
     ) -> 'DFObservationLayer':
         """
-        従来の2段階クロスフィッティング学習（変更なし）
-        
+        従来の2段階クロスフィッティング学習（多変量対応）
+
         **注意**: これは既存の学習メソッドです。
-        新しいPhase-1学習では train_stage1_with_gradients と 
+        新しいPhase-1学習では train_stage1_with_gradients と
         train_stage2_with_gradients を使用してください。
         """
         T_x, r = X_hat_states.shape
-        
-        # スカラー特徴量の次元調整
-        if m_features.dim() == 2 and m_features.size(1) == 1:
-            m_features = m_features.squeeze(1)  # (T, 1) → (T,)
-        elif m_features.dim() != 1:
-            raise ValueError(f"スカラー特徴量は1次元であるべき: got shape {m_features.shape}")
-        
-        T_m = m_features.size(0)
+
+        # 多変量特徴量の次元チェック
+        if M_features.dim() != 2:
+            raise ValueError(f"多変量特徴量は2次元であるべき: got shape {M_features.shape}")
+
+        if M_features.size(1) != self.multivariate_feature_dim:
+            raise ValueError(f"特徴量次元不一致: expected {self.multivariate_feature_dim}, got {M_features.size(1)}")
+
+        T_m = M_features.size(0)
         
         if T_x != T_m:
             raise ValueError(f"状態予測と特徴量の時系列長不一致: {T_x} vs {T_m}")
@@ -720,31 +726,31 @@ class DFObservationLayer(nn.Module):
         
         # 観測特徴量
         with torch.no_grad():
-            Psi_obs = self.psi_omega(m_features)  # (T, d_B)
+            Psi_obs = self.psi_omega(M_features)  # (T, d_B)
         
         # 時間合わせ: 現時刻の観測を次時刻で予測
         # 操作変数: t-1 時刻の状態予測特徴量
         # 目標: t 時刻の観測特徴量
         Phi_prev = Phi_instrument[:-1]  # (T-1, d_A)
         Psi_curr = Psi_obs[1:]          # (T-1, d_B)
-        m_curr = m_features[1:]         # (T-1,)
+        M_curr = M_features[1:]         # (T-1, m)
         
         if use_cross_fitting and T_x >= 20:
-            self._fit_with_cross_fitting(Phi_prev, Psi_curr, m_curr, verbose)
+            self._fit_with_cross_fitting(Phi_prev, Psi_curr, M_curr, verbose)
         else:
-            self._fit_without_cross_fitting(Phi_prev, Psi_curr, m_curr, verbose)
+            self._fit_without_cross_fitting(Phi_prev, Psi_curr, M_curr, verbose)
         
         self._is_fitted = True
         return self
     
     def _fit_with_cross_fitting(
-        self, 
-        Phi_prev: torch.Tensor, 
-        Psi_curr: torch.Tensor, 
-        m_curr: torch.Tensor,
+        self,
+        Phi_prev: torch.Tensor,
+        Psi_curr: torch.Tensor,
+        M_curr: torch.Tensor,
         verbose: bool
     ):
-        """クロスフィッティング付き学習"""
+        """クロスフィッティング付き学習（多変量対応）"""
         T_eff = Phi_prev.size(0)  # T-1
         
         # クロスフィッティング管理
@@ -767,95 +773,115 @@ class DFObservationLayer(nn.Module):
         # Out-of-fold操作変数特徴量計算
         H_cf = cf_fitter.compute_out_of_fold_features(Phi_prev, VB_list)
         
-        # Stage-2: 観測読み出しベクトル推定
-        self.u_B = cf_fitter.cross_fit_stage2(
-            H_cf, m_curr,
-            self._ridge_stage2_ub,
+        # Stage-2: 観測読み出し行列推定（多変量版）
+        U_B_list = cf_fitter.cross_fit_stage2_matrix(
+            H_cf, M_curr,
+            self._ridge_stage2_ub_matrix,
             detach_features=True,
             reg_lambda=self.lambda_dB
         )
-        
+
+        # 平均U_B行列（最終的な U_B）
+        self.U_B = torch.stack(U_B_list).mean(dim=0)
+
         if verbose:
-            print(f"V_B shape: {self.V_B.shape}, u_B shape: {self.u_B.shape}")
+            print(f"V_B shape: {self.V_B.shape}, U_B shape: {self.U_B.shape}")
     
     def _fit_without_cross_fitting(
-        self, 
-        Phi_prev: torch.Tensor, 
-        Psi_curr: torch.Tensor, 
-        m_curr: torch.Tensor,
+        self,
+        Phi_prev: torch.Tensor,
+        Psi_curr: torch.Tensor,
+        M_curr: torch.Tensor,
         verbose: bool
     ):
-        """クロスフィッティングなし学習（小データ用）"""
+        """クロスフィッティングなし学習（小データ用、多変量対応）"""
         if verbose:
-            print("DF-B クロスフィッティングなしで学習")
-        
+            print("DF-B クロスフィッティングなしで学習（多変量版）")
+
         # Stage-1: 直接推定
         self.V_B = self._ridge_stage1_vb(Phi_prev, Psi_curr, self.lambda_B)
-        
+
         # 中間特徴量
         H = (self.V_B @ Phi_prev.T).T  # (T-1, d_B)
-        
-        # Stage-2: 読み出し推定
-        self.u_B = self._ridge_stage2_ub(H, m_curr, self.lambda_dB)
-        
+
+        # Stage-2: 読み出し行列推定（多変量版）
+        self.U_B = self._ridge_stage2_ub_matrix(H, M_curr, self.lambda_dB)
+
         if verbose:
-            print(f"V_B shape: {self.V_B.shape}, u_B shape: {self.u_B.shape}")
+            print(f"V_B shape: {self.V_B.shape}, U_B shape: {self.U_B.shape}")
     
     def predict_one_step(self, x_hat_prev: torch.Tensor) -> torch.Tensor:
         """
-        1ステップ特徴量予測: m̂_{t|t-1} = u_B^T V_B φ_θ(x̂_{t|t-1})
-        
+        1ステップ特徴量予測: M̂_{t|t-1} = U_B^T V_B φ_θ(x̂_{t|t-1})
+
         Args:
             x_hat_prev: 前時刻の状態予測 (r,) または (batch, r)
-            
+
         Returns:
-            torch.Tensor: 予測スカラー特徴量 () または (batch,)
+            torch.Tensor: 予測多変量特徴量 (m,) または (batch, m)
         """
+        # 次元チェックを追加
+        expected_state_dim = self.df_state.phi_theta.net[0].in_features
+        if x_hat_prev.dim() == 1:
+            actual_dim = x_hat_prev.shape[0]
+        else:
+            actual_dim = x_hat_prev.shape[-1]
+
+        if actual_dim != expected_state_dim:
+            raise ValueError(
+                f"predict_one_step expects state input with dimension {expected_state_dim}, "
+                f"but got {actual_dim}. "
+                f"Input shape: {x_hat_prev.shape}. "
+                f"Note: This method expects x_hat_prev (state), not M_features (multivariate features)."
+            )
+
         if not self._is_fitted:
             # **修正**: キャッシュされた結果も使用可能に
-            if 'V_B' in self._stage1_cache and 'u_B' in self._stage2_cache:
+            if 'V_B' in self._stage1_cache and 'U_B' in self._stage2_cache:
                 V_B = self._stage1_cache['V_B']
-                u_B = self._stage2_cache['u_B']
+                U_B = self._stage2_cache['U_B']
             else:
                 raise RuntimeError("fit_two_stage() または train_stage1/2_with_gradients() を先に実行してください")
         else:
             V_B = self.V_B
-            u_B = self.u_B
+            U_B = self.U_B
         
         # 状態特徴写像（共有φ_θ）
         phi_prev = self.phi_theta(x_hat_prev)
-        
-        # 観測転送作用素適用 + 読み出し
+
+        # 観測転送作用素適用 + 読み出し（GPUデバイス整合性を確保）
+        V_B = V_B.to(phi_prev.device)
+        U_B = U_B.to(phi_prev.device)
         if phi_prev.dim() == 1:
             h_pred = V_B @ phi_prev  # (d_B,)
-            return u_B @ h_pred      # scalar
+            return U_B.T @ h_pred    # (m,) - スカラー入力: U_B^T @ h
         else:
             h_pred = (V_B @ phi_prev.T).T  # (batch, d_B)
-            return (h_pred * u_B).sum(dim=1)  # (batch,)
+            return h_pred @ U_B    # TODO: 多変量対応修正 - U_B.T -> U_B for batch input
     
     def predict_sequence(
-        self, 
+        self,
         X_hat_states: torch.Tensor
     ) -> torch.Tensor:
         """
         系列予測: 各時刻でのone-step-ahead特徴量予測
-        
+
         Args:
             X_hat_states: 状態予測系列 (T, r)
-            
+
         Returns:
-            torch.Tensor: 予測特徴量系列 (T-1,)
+            torch.Tensor: 予測特徴量系列 (T-1, m)
         """
         if not self._is_fitted and 'V_B' not in self._stage1_cache:
             raise RuntimeError("学習が完了していません")
-        
+
         T = X_hat_states.size(0)
         predictions = []
-        
+
         for t in range(T - 1):
-            m_pred = self.predict_one_step(X_hat_states[t])
-            predictions.append(m_pred)
-        
+            M_pred = self.predict_one_step(X_hat_states[t])
+            predictions.append(M_pred)
+
         return torch.stack(predictions)
     
     def get_observation_operator(self) -> torch.Tensor:
@@ -867,12 +893,12 @@ class DFObservationLayer(nn.Module):
         else:
             raise RuntimeError("学習が完了していません")
     
-    def get_readout_vector(self) -> torch.Tensor:
-        """観測読み出しベクトル u_B を取得"""
+    def get_readout_matrix(self) -> torch.Tensor:
+        """観測読み出し行列 U_B を取得"""
         if self._is_fitted:
-            return self.u_B.clone()
-        elif 'u_B' in self._stage2_cache:
-            return self._stage2_cache['u_B'].clone()
+            return self.U_B.clone()
+        elif 'U_B' in self._stage2_cache:
+            return self._stage2_cache['U_B'].clone()
         else:
             raise RuntimeError("学習が完了していません")
     
@@ -890,7 +916,7 @@ class DFObservationLayer(nn.Module):
         if self._is_fitted:
             state_dict.update({
                 'V_B': self.V_B,
-                'u_B': self.u_B,
+                'U_B': self.U_B,
             })
         
         if self._stage1_cache:
@@ -906,11 +932,11 @@ class DFObservationLayer(nn.Module):
             'psi_omega': self.psi_omega.state_dict(),
         }
 
-        # filtering評価では学習済みV_B, u_Bが必要なので含める
+        # filtering評価では学習済みV_B, U_Bが必要なので含める
         if hasattr(self, 'V_B') and self.V_B is not None:
             state_dict['V_B'] = self.V_B
-        if hasattr(self, 'u_B') and self.u_B is not None:
-            state_dict['u_B'] = self.u_B
+        if hasattr(self, 'U_B') and self.U_B is not None:
+            state_dict['U_B'] = self.U_B
 
         # phi_theta は推論時にdf_state_layerから共有参照されるため保存不要
         # configは除外（推論時には設定ファイルから読み込むため不要）
@@ -919,16 +945,16 @@ class DFObservationLayer(nn.Module):
         return state_dict
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
-        """カスタムload_state_dict: V_B/u_Bも適切に設定"""
-        # V_B, u_Bを別途処理
+        """カスタムload_state_dict: V_B/U_Bも適切に設定"""
+        # V_B, U_Bを別途処理
         v_b = state_dict.pop('V_B', None)
-        u_b = state_dict.pop('u_B', None)
+        u_b = state_dict.pop('U_B', None)
 
         # 通常のパラメータを読み込み
         super().load_state_dict(state_dict, strict=strict)
 
-        # V_B, u_Bを設定
+        # V_B, U_Bを設定
         if v_b is not None:
             self.V_B = v_b.to(self.device) if hasattr(self, 'device') else v_b
         if u_b is not None:
-            self.u_B = u_b.to(self.device) if hasattr(self, 'device') else u_b
+            self.U_B = u_b.to(self.device) if hasattr(self, 'device') else u_b

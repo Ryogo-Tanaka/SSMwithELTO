@@ -1,7 +1,9 @@
 import torch
+import torch.nn as nn
 from torch.linalg import cholesky, solve_triangular, eigvalsh, svd
 import warnings
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Union
+import math
 
 class RealizationError(Exception):
     """
@@ -9,6 +11,567 @@ class RealizationError(Exception):
     fails due to numerical issues (ill-conditioning, non-positive-definite, etc.).
     """
     pass
+
+
+class StochasticRealizationWithEncoder(nn.Module):
+    """
+    定式化準拠: Hilbert空間での関数的CCAに基づく確率的実現
+
+    定式化対応:
+    - Hilbert空間特徴量プロセス: u_t = u_η(y_t) ∈ R^m (Section 3.1)
+    - 過去・未来部分空間: H^- := span{u_{t-1}, u_{t-2}, ...}, H^+ := span{u_t, u_{t+1}, ...}
+    - 関数的CCA制約最適化: max Cov(v^-, v^+) / (√Var(v^-) √Var(v^+))
+    - Galerkin投影による有限次元近似: ℓ長ウィンドウでの実装
+
+    実装特徴:
+    1. 時不変エンコーダー u_η との完全統合
+    2. 弱定常性に基づく共分散演算子の正確な計算
+    3. Ridge正則化とSVDによる数値安定化
+    4. 正準方向から状態変数への理論準拠変換
+
+    ==== 設定ファイル対応: 必要なパラメータ設定 ====
+    # configs/realization.yaml 例:
+    # ssm:
+    #   realization:
+    #     # 基本パラメータ
+    #     encoder_output_dim: 16          # エンコーダー出力次元 m
+    #     window_length: 10               # Galerkin近似ウィンドウ長 ℓ
+    #     num_components: 8               # 状態次元 r (上位正準方向数)
+    #     ridge_param: 1e-3               # Ridge正則化パラメータ λ
+    #
+    #     # 数値安定化設定
+    #     min_eigenvalue: 1e-8            # 最小固有値クリッピング
+    #     condition_threshold: 1e12       # 条件数閾値
+    #
+    #     # 特徴量マッピング設定
+    #     feature_mapping:
+    #       method: "component_averaging"  # "component_averaging" | "component_mlp"
+    #       mlp_hidden_dims: [32, 16]     # MLP使用時の隠れ層次元
+    #
+    #     # 状態変数計算設定
+    #     state_computation:
+    #       use_past_block: true          # 過去ブロック使用 (既存実装準拠)
+    #       apply_sqrt_weights: true      # Λ^{1/2} 重み付け適用
+    #       correlation_threshold: 0.1    # 正準相関選択閾値
+    #
+    #     # デバイス設定
+    #     device: "cpu"                   # "cpu" | "cuda"
+    ===================================================
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        encoder_output_dim: int,  # 設定ファイルから明示指定
+        window_length: int = 10,
+        num_components: int = 8,
+        ridge_param: float = 1e-3,
+        min_eigenvalue: float = 1e-8,
+        device: str = 'cpu'
+    ):
+        """
+        Args:
+            encoder: 時不変エンコーダー u_η: R^n → R^m
+            window_length: Galerkin近似のウィンドウ長 ℓ
+            num_components: 状態次元 r（上位正準方向数）
+            ridge_param: Ridge正則化パラメータ λ
+            device: 計算デバイス
+        """
+        super().__init__()
+
+        self.encoder = encoder
+        self.window_length = int(window_length)  # ℓ
+        self.num_components = int(num_components)  # r
+        self.ridge_param = float(ridge_param)  # λ
+        self.device = device
+
+        # 定式化対応: エンコーダー出力次元 m の取得
+        # encoder_output_dimを優先し、フォールバックで自動検出
+        if encoder_output_dim is not None:
+            self.feature_dim = encoder_output_dim
+        else:
+            self.feature_dim = self._get_encoder_output_dim()
+
+        # 学習済みパラメータ（fit後に設定）
+        self.canonical_directions_past: Optional[torch.Tensor] = None  # a_i ∈ R^m
+        self.canonical_directions_future: Optional[torch.Tensor] = None  # b_i ∈ R^m
+        self.canonical_correlations: Optional[torch.Tensor] = None  # ρ_i
+        self.is_fitted = False
+
+        # 互換性のため: 古いRealizationクラスとの互換性
+        self.h = self.window_length  # past_horizon相当
+        self.rank = self.num_components  # rank相当（低ランク近似の次数）
+
+        # 計算フロー最適化: 中間結果のキャッシュ
+        self._cached_feature_matrices: Optional[Dict[str, torch.Tensor]] = None  # Φ_X, Φ_Y
+        self._cached_covariance_blocks: Optional[Dict[str, torch.Tensor]] = None  # G, H, A
+        self._cached_whitening_matrices: Optional[Dict[str, torch.Tensor]] = None  # G_inv_sqrt, H_inv_sqrt
+        self._last_input_shape: Optional[Tuple[int, int]] = None  # (T, n) for cache validation
+
+        # デバッグ・統計用
+        self._feature_statistics: Optional[Dict[str, torch.Tensor]] = None
+
+    def _get_encoder_output_dim(self) -> int:
+        """
+        定式化対応: エンコーダー出力次元 m の取得（設定ファイル対応）
+
+        実環境対応: ダミー入力を避け、設定パラメータで明示指定
+        """
+        # エンコーダーの属性から直接取得を試行
+        if hasattr(self.encoder, 'output_dim'):
+            return self.encoder.output_dim
+
+        # 実環境では設定ファイルで明示指定することを推奨
+        raise ValueError(
+            "Cannot determine encoder output dimension. "
+            "Please specify 'encoder_output_dim' in config or "
+            "ensure encoder has 'output_dim' attribute. "
+            "Example config: ssm.realization.encoder_output_dim: 16"
+        )
+
+    def _build_feature_matrices(
+        self,
+        Y: torch.Tensor,
+        use_cache: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        定式化対応: 時不変エンコーダーを用いた特徴量行列構築（キャッシュ対応）
+
+        計算フロー最適化: 同一データに対する再計算を避ける
+
+        定式化 Section 3.2-3.3:
+        1. エンコーダー適用: Y → M = [u_η(y_1), ..., u_η(y_T)]
+        2. 過去・未来ブロック定義（修正版）:
+           p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-ℓ)^T)^T ∈ R^{d·ℓ}
+           f(t) = (y(t)^T, y(t+1)^T, ..., y(t+ℓ-1)^T)^T ∈ R^{d·ℓ}
+        3. 特徴量マッピング φ_m 構築:
+           過去特徴量: Φ_X[i] = φ_m(p(t))
+           未来特徴量: Φ_Y[i] = φ_m(f(t))
+
+        Args:
+            Y: 観測時系列 (T, n)
+            use_cache: キャッシュを使用するか
+
+        Returns:
+            Φ_X: 過去特徴量行列 (m, N)
+            Φ_Y: 未来特徴量行列 (m, N)
+        """
+        T, n = Y.shape
+        current_shape = (T, n)
+
+        # キャッシュチェック: 同一データに対する再計算を避ける
+        if (use_cache and
+            self._cached_feature_matrices is not None and
+            self._last_input_shape == current_shape):
+            return self._cached_feature_matrices['Φ_X'], self._cached_feature_matrices['Φ_Y']
+
+        ℓ = self.window_length
+        N = T - 2 * ℓ + 1  # 有効サンプル数
+
+        if N <= 0:
+            raise ValueError(f"Time series too short for window length {ℓ}")
+
+        # Step 1: 全時点でエンコーダー適用（バッチ処理対応）
+        # u_η(y_t) → m_t ∈ R^m (定式化 Section 3.1)
+
+        # バッチ処理でエンコーダーを呼び出し（BatchNorm対応）
+        self.encoder.eval()  # 推論モードに設定してBatchNormを無効化
+        with torch.no_grad():
+            # Y全体をバッチとして処理: (T, n) → (T, m)
+            M = self.encoder(Y)  # バッチ処理でエンコーダー適用
+
+            # 次元確認と調整
+            if M.dim() == 1:  # (m,) の場合
+                M = M.unsqueeze(0)  # (1, m)
+            elif M.dim() == 3:  # (T, 1, m) の場合
+                M = M.squeeze(1)  # (T, m)
+
+        # Step 2: 特徴量マッピング φ_m の構築
+        # 定式化 Section 3.3: 同一成分のグループ化 → MLP変換
+        Φ_X_list = []
+        Φ_Y_list = []
+
+        for i in range(N):
+            t = i + ℓ  # 実際の時点（ℓから開始）
+
+            # 過去ブロック: p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-ℓ)^T)^T
+            # 時点t-1からt-ℓまで逆順で取得
+            past_indices = list(range(t-1, t-ℓ-1, -1))  # [t-1, t-2, ..., t-ℓ]
+            past_features = M[past_indices]  # (ℓ, m)
+
+            # 未来ブロック: f(t) = (y(t)^T, y(t+1)^T, ..., y(t+ℓ-1)^T)^T
+            future_features = M[t:t+ℓ]  # (ℓ, m)
+
+            # φ_m 変換: 成分別グループ化 → スカラー出力
+            φ_past = self._apply_feature_mapping(past_features)  # (m,)
+            φ_future = self._apply_feature_mapping(future_features)  # (m,)
+
+            Φ_X_list.append(φ_past)
+            Φ_Y_list.append(φ_future)
+
+        Φ_X = torch.stack(Φ_X_list, dim=1)  # (m, N)
+        Φ_Y = torch.stack(Φ_Y_list, dim=1)  # (m, N)
+
+        # キャッシュ保存
+        if use_cache:
+            self._cached_feature_matrices = {'Φ_X': Φ_X.clone(), 'Φ_Y': Φ_Y.clone()}
+            self._last_input_shape = current_shape
+
+        return Φ_X, Φ_Y
+
+    def _apply_feature_mapping(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        定式化対応: 特徴量マッピング φ_m の実装
+
+        定式化 Section 3.3:
+        1. 同一成分のグループ化: φ_u^{(i)}(p(t)) := (φ_u^{(i)}(y(t-1)), ..., φ_u^{(i)}(y(t-ℓ)))^T
+        2. スカラー出力変換: φ̃_m^{(i)}(p(t)) := MLP(φ_u^{(i)}(p(t)))
+        3. 最終出力: φ_m(p(t)) = (φ̃_m^{(1)}(p(t)), ..., φ̃_m^{(m)}(p(t)))^T
+
+        簡易実装: 各成分の平均値を使用（理論的にはMLPが必要）
+
+        Args:
+            features: (ℓ, m) 特徴量ブロック
+
+        Returns:
+            φ_output: (m,) マッピング結果
+        """
+        # 簡易実装: 各成分の時間平均（理論的にはMLPを使用すべき）
+        # TODO: 本格実装では成分別MLPを使用
+        φ_output = torch.mean(features, dim=0)  # (m,)
+        return φ_output
+
+    def _compute_covariance_blocks(
+        self,
+        Φ_X: torch.Tensor,
+        Φ_Y: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        定式化対応: サンプル共分散ブロック計算
+
+        定式化 Section 3.4:
+        - 中心化特徴量行列（サンプル平均減算）
+        - サンプル共分散ブロック:
+          G = (1/N) Φ_X Φ_X^T ∈ R^{m×m} (過去の分散)
+          H = (1/N) Φ_Y Φ_Y^T ∈ R^{m×m} (未来の分散)
+          A = (1/N) Φ_Y Φ_X^T ∈ R^{m×m} (過去-未来の共分散)
+
+        Args:
+            Φ_X: 過去特徴量行列 (m, N)
+            Φ_Y: 未来特徴量行列 (m, N)
+
+        Returns:
+            G: 過去分散行列 (m, m)
+            H: 未来分散行列 (m, m)
+            A: 交差共分散行列 (m, m)
+        """
+        m, N = Φ_X.shape
+
+        # 中心化（サンプル平均減算）
+        Φ_X_mean = torch.mean(Φ_X, dim=1, keepdim=True)  # (m, 1)
+        Φ_Y_mean = torch.mean(Φ_Y, dim=1, keepdim=True)  # (m, 1)
+
+        Φ_X_centered = Φ_X - Φ_X_mean  # (m, N)
+        Φ_Y_centered = Φ_Y - Φ_Y_mean  # (m, N)
+
+        # サンプル共分散ブロック
+        G = (Φ_X_centered @ Φ_X_centered.T) / N  # (m, m)
+        H = (Φ_Y_centered @ Φ_Y_centered.T) / N  # (m, m)
+        A = (Φ_Y_centered @ Φ_X_centered.T) / N  # (m, m)
+
+        # 統計情報保存（デバッグ用）
+        self._feature_statistics = {
+            'past_mean': Φ_X_mean.squeeze(),
+            'future_mean': Φ_Y_mean.squeeze(),
+            'num_samples': N
+        }
+
+        return G, H, A
+
+    def _apply_ridge_regularization(
+        self,
+        G: torch.Tensor,
+        H: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        定式化対応: Ridge正則化による数値安定化
+
+        定式化 Section 3.4:
+        Ridge正則化: G_λ = G + λI_m, H_λ = H + λI_m, λ > 0
+
+        Args:
+            G: 過去分散行列 (m, m)
+            H: 未来分散行列 (m, m)
+
+        Returns:
+            G_λ: 正則化過去分散行列 (m, m)
+            H_λ: 正則化未来分散行列 (m, m)
+        """
+        m = G.size(0)
+        I_m = torch.eye(m, device=G.device, dtype=G.dtype)
+
+        G_λ = G + self.ridge_param * I_m
+        H_λ = H + self.ridge_param * I_m
+
+        return G_λ, H_λ
+
+    def _compute_whitening_matrices(
+        self,
+        G_λ: torch.Tensor,
+        H_λ: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        定式化対応: 白色化行列の安定計算
+
+        定式化 Section 3.4:
+        白色化行列計算: G_λ^{-1/2}, H_λ^{-1/2} の安定的計算（固有値分解使用）
+
+        数値安定化:
+        - 最小固有値クリッピング
+        - 条件数管理
+
+        Args:
+            G_λ: 正則化過去分散行列 (m, m)
+            H_λ: 正則化未来分散行列 (m, m)
+
+        Returns:
+            G_inv_sqrt: G_λ^{-1/2} (m, m)
+            H_inv_sqrt: H_λ^{-1/2} (m, m)
+        """
+        def stable_matrix_inv_sqrt(A: torch.Tensor, min_eigval: float = 1e-8) -> torch.Tensor:
+            """数値安定的な A^{-1/2} 計算"""
+            # 対称化
+            A_sym = 0.5 * (A + A.T)
+
+            # 固有値分解
+            eigvals, eigvecs = torch.linalg.eigh(A_sym)
+
+            # 最小固有値クリッピング（数値安定化）
+            eigvals_clipped = torch.clamp(eigvals, min=min_eigval)
+
+            # A^{-1/2} = V diag(λ^{-1/2}) V^T
+            inv_sqrt_eigvals = eigvals_clipped.rsqrt()
+            A_inv_sqrt = eigvecs @ torch.diag(inv_sqrt_eigvals) @ eigvecs.T
+
+            return A_inv_sqrt
+
+        G_inv_sqrt = stable_matrix_inv_sqrt(G_λ)
+        H_inv_sqrt = stable_matrix_inv_sqrt(H_λ)
+
+        # 白色化行列保存（デバッグ用）
+        self._whitening_matrices = {
+            'G_inv_sqrt': G_inv_sqrt,
+            'H_inv_sqrt': H_inv_sqrt
+        }
+
+        return G_inv_sqrt, H_inv_sqrt
+
+    def _solve_canonical_correlation(
+        self,
+        A: torch.Tensor,
+        G_inv_sqrt: torch.Tensor,
+        H_inv_sqrt: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        定式化対応: SVDによる正準相関分析
+
+        定式化 Section 3.5:
+        1. 白色化された交差ブロック: Ã := H_λ^{-1/2} A G_λ^{-1/2}
+        2. SVD分解: Ã = U Σ V^T
+        3. 正準方向の逆変換:
+           a_i = G_λ^{-1/2} v_i ∈ R^m
+           b_i = H_λ^{-1/2} u_i ∈ R^m
+
+        Args:
+            A: 交差共分散行列 (m, m)
+            G_inv_sqrt: G_λ^{-1/2} (m, m)
+            H_inv_sqrt: H_λ^{-1/2} (m, m)
+
+        Returns:
+            U: 左特異ベクトル (m, m)
+            Σ: 特異値 (正準相関係数) (m,)
+            V^T: 右特異ベクトル転置 (m, m)
+        """
+        # 白色化された交差ブロック
+        Ã = H_inv_sqrt @ A @ G_inv_sqrt  # (m, m)
+
+        # SVD分解
+        U, Σ, Vt = torch.linalg.svd(Ã, full_matrices=False)
+
+        return U, Σ, Vt
+
+    def _extract_canonical_directions(
+        self,
+        U: torch.Tensor,
+        Vt: torch.Tensor,
+        G_inv_sqrt: torch.Tensor,
+        H_inv_sqrt: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        定式化対応: 正準方向の抽出と逆変換
+
+        定式化 Section 3.5:
+        正準方向の逆変換:
+        a_i = G_λ^{-1/2} v_i ∈ R^m (過去空間での正準方向)
+        b_i = H_λ^{-1/2} u_i ∈ R^m (未来空間での正準方向)
+
+        Args:
+            U: 左特異ベクトル (m, m)
+            Vt: 右特異ベクトル転置 (m, m)
+            G_inv_sqrt: G_λ^{-1/2} (m, m)
+            H_inv_sqrt: H_λ^{-1/2} (m, m)
+
+        Returns:
+            canonical_dirs_past: 過去正準方向 a_i (m, r)
+            canonical_dirs_future: 未来正準方向 b_i (m, r)
+        """
+        # 上位 r 個の正準方向選択
+        r = min(self.num_components, U.size(1))
+
+        # 正準方向の逆変換
+        canonical_dirs_past = G_inv_sqrt @ Vt[:r, :].T  # (m, r)
+        canonical_dirs_future = H_inv_sqrt @ U[:, :r]   # (m, r)
+
+        return canonical_dirs_past, canonical_dirs_future
+
+    def fit(self, Y: torch.Tensor, encoder: Optional[nn.Module] = None) -> 'StochasticRealizationWithEncoder':
+        """
+        定式化対応: 関数的CCAに基づく確率的実現の学習
+
+        定式化 Section 3 全体の実装:
+        1. 時不変エンコーダーとの統合
+        2. Hilbert空間での特徴量プロセス構築
+        3. 関数的CCA制約最適化問題の解決
+        4. 正準方向から状態変数への変換
+
+        Args:
+            Y: 観測時系列 (T, n)
+            encoder: エンコーダー（Noneの場合は初期化時のものを使用）
+
+        Returns:
+            self: 学習済みインスタンス
+        """
+        if encoder is not None:
+            self.encoder = encoder
+
+        Y = Y.to(self.device)
+        self.encoder = self.encoder.to(self.device)
+
+        # Step 1: 時不変エンコーダーを用いた特徴量行列構築
+        Φ_X, Φ_Y = self._build_feature_matrices(Y)
+
+        # Step 2: サンプル共分散ブロック計算
+        G, H, A = self._compute_covariance_blocks(Φ_X, Φ_Y)
+
+        # Step 3: Ridge正則化
+        G_λ, H_λ = self._apply_ridge_regularization(G, H)
+
+        # Step 4: 白色化行列計算
+        G_inv_sqrt, H_inv_sqrt = self._compute_whitening_matrices(G_λ, H_λ)
+
+        # Step 5: 正準相関分析（SVD）
+        U, Σ, Vt = self._solve_canonical_correlation(A, G_inv_sqrt, H_inv_sqrt)
+
+        # Step 6: 正準方向抽出
+        canonical_dirs_past, canonical_dirs_future = self._extract_canonical_directions(
+            U, Vt, G_inv_sqrt, H_inv_sqrt
+        )
+
+        # 学習結果保存
+        self.canonical_directions_past = canonical_dirs_past
+        self.canonical_directions_future = canonical_dirs_future
+        self.canonical_correlations = Σ[:min(self.num_components, len(Σ))]
+
+        # 既存実装との整合性: B行列の構築 (B = Σ^{1/2} a^T 形式)
+        # 既存filter()メソッドとの互換性確保のため
+        sqrt_correlations = torch.sqrt(self.canonical_correlations)  # Σ^{1/2}
+        self.B_matrix = torch.diag(sqrt_correlations) @ canonical_dirs_past.T  # (r, m)
+
+        self.is_fitted = True
+
+        return self
+
+    def estimate_states(self, Y: torch.Tensor) -> torch.Tensor:
+        """
+        定式化準拠: 正準変量から状態変数への変換
+
+        定式化対応:
+        過去プロセス正準変量: z_p(t) = [a_1^T φ_m(p(t)), ..., a_r^T φ_m(p(t))]^T ∈ R^r
+        状態変数: x(t) = Σ^{1/2} z_p(t)
+
+        計算フロー最適化: fit()で計算済みの情報を再利用
+
+        Args:
+            Y: 観測時系列 (T, n)
+
+        Returns:
+            X: 状態系列 (T_eff, r)
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        Y = Y.to(self.device)
+
+        # キャッシュされた特徴量行列を再利用（fit()で計算済み）
+        if self._cached_feature_matrices is not None:
+            Φ_X = self._cached_feature_matrices['Φ_X']  # 過去ブロック特徴量
+            Φ_Y = self._cached_feature_matrices['Φ_Y']  # 未来ブロック特徴量 (未使用)
+        else:
+            # キャッシュがない場合のみ再計算
+            Φ_X, Φ_Y = self._build_feature_matrices(Y)
+
+        # 定式化準拠の状態変数計算
+        # Step 1: 過去プロセス正準変量 z_p(t) = [a_1^T φ_m(p(t)), ..., a_r^T φ_m(p(t))]^T
+        z_p = self.canonical_directions_past.T @ Φ_X  # (r, N)
+
+        # Step 2: 正準相関係数による重み付け x(t) = Σ^{1/2} z_p(t)
+        sqrt_canonical_corrs = torch.sqrt(self.canonical_correlations)  # Σ^{1/2} ∈ R^r
+
+        # 重み付け適用: 各正準変量に対応する相関係数の平方根を乗算
+        X_weighted = sqrt_canonical_corrs.unsqueeze(1) * z_p  # (r, N)
+        X = X_weighted.T  # (N, r)
+
+        return X
+
+    def filter_compatible(self, Y: torch.Tensor) -> torch.Tensor:
+        """
+        既存filter()メソッドとの互換性確保
+
+        定式化準拠: estimate_states()の結果と数値的に一致するよう修正
+        短期解決として内部でestimate_states()を呼び出して数値精度を統一
+
+        Args:
+            Y: 観測時系列 (T, n)
+
+        Returns:
+            X: 状態系列 (T_eff, r) - estimate_states()と数値的に同一結果
+        """
+        # 定式化準拠のestimate_states()を呼び出して数値精度を統一
+        return self.estimate_states(Y)
+
+    def get_canonical_analysis_results(self) -> Dict[str, Any]:
+        """
+        正準相関分析の結果取得
+
+        Returns:
+            Dict: 分析結果
+        """
+        if not self.is_fitted:
+            return {"status": "not_fitted"}
+
+        return {
+            "canonical_correlations": self.canonical_correlations.cpu().numpy().tolist(),
+            "num_components": self.num_components,
+            "feature_dim": self.feature_dim,
+            "window_length": self.window_length,
+            "ridge_param": self.ridge_param,
+            "condition_numbers": {
+                "correlations_range": {
+                    "min": self.canonical_correlations.min().item(),
+                    "max": self.canonical_correlations.max().item()
+                }
+            }
+        }
 
 class Realization:
     """
@@ -32,6 +595,7 @@ class Realization:
         cond_thresh: float = 1e12,
         rank: int | None = None,
         reg_type : str = "sum",
+        m: int | None = None,
     ):
         """
         Args:
@@ -51,7 +615,10 @@ class Realization:
             self.rank = rank
             
         self.reg_type = str(reg_type)  # **追加**: 明示的なstr変換
-        
+
+        # mパラメータ（ラグ共分散推定用サンプル数）
+        self.m = int(m) if m is not None else None
+
         # 初期化
         self.B = None
         self._L_vals = None
@@ -79,8 +646,22 @@ class Realization:
         # H_f = H_f_float.double()
 
         device = Y_c.device
-        # m      = getattr(self, "m", 2048)
-        m = 500
+        # mを自動決定（設定可能、適応的デフォルト）
+        max_available = T - 2 * h
+        if max_available <= 0:
+            # past_horizonを自動調整
+            h_new = max(1, (T - 1) // 2)
+            print(f"⚠️  realization調整: past_horizon {h} → {h_new} (データ長: {T})")
+            h = h_new
+            self.h = h_new  # 属性も更新
+            max_available = T - 2 * h
+
+        m_default = min(500, max(1, max_available))
+        m = getattr(self, 'm', None)
+        if m is None:
+            m = m_default
+        else:
+            m = min(m, max_available)  # 利用可能範囲に制限
         rank   = self.rank      # 低ランク近似の次数
         # eps_chol   = 1e-7
         # eps_jitter = 1e-10
@@ -89,7 +670,7 @@ class Realization:
         q_over     = 5
 
         # 1. ── ラグ共分散 (バッチ外積, float32) -----------------
-        idx = torch.randint(0, T - 2 * h - 1, (m,), device=device)
+        idx = torch.randint(0, max_available, (m,), device=device)
         Y0  = Y_c[idx]                          # (m, p)
         Lambda    = {}
         
@@ -436,8 +1017,8 @@ class Realization:
             raise RuntimeError("U_A not found in DF-A layer")
         if not (hasattr(df_obs_layer, 'V_B') and df_obs_layer.V_B is not None):
             raise RuntimeError("V_B not found in DF-B layer")  
-        if not (hasattr(df_obs_layer, 'u_B') and df_obs_layer.u_B is not None):
-            raise RuntimeError("u_B not found in DF-B layer")
+        if not (hasattr(df_obs_layer, 'U_B') and df_obs_layer.U_B is not None):
+            raise RuntimeError("U_B not found in DF-B layer")
         
         # StateEstimator設定
         estimator_config = {
@@ -478,7 +1059,7 @@ class Realization:
         estimator.V_A = df_state_layer.V_A.clone().detach()
         estimator.V_B = df_obs_layer.V_B.clone().detach() 
         estimator.U_A = df_state_layer.U_A.clone().detach()
-        estimator.u_B = df_obs_layer.u_B.clone().detach()
+        estimator.U_B = df_obs_layer.U_B.clone().detach()
         
         return estimator
 
@@ -624,7 +1205,7 @@ class Realization:
             ("df_state_layer.V_A", hasattr(df_state_layer, 'V_A') and df_state_layer.V_A is not None),
             ("df_state_layer.U_A", hasattr(df_state_layer, 'U_A') and df_state_layer.U_A is not None),
             ("df_obs_layer.V_B", hasattr(df_obs_layer, 'V_B') and df_obs_layer.V_B is not None),
-            ("df_obs_layer.u_B", hasattr(df_obs_layer, 'u_B') and df_obs_layer.u_B is not None),
+            ("df_obs_layer.U_B", hasattr(df_obs_layer, 'U_B') and df_obs_layer.U_B is not None),
             ("realization_fitted", hasattr(self, 'X_state_torch') and self.X_state_torch is not None)
         ]
         
@@ -713,22 +1294,53 @@ class Realization:
         return config
     
 
-def build_realization(cfg) -> Realization:
+def build_realization(cfg):
     """
-    Factory for convenience: 
-      - cfg.h, cfg.jitter, cfg.cond_thresh are required.
-      - cfg.rank may be None or >=0.
-    Raises ValueError if rank is negative.
-    """
-    # rank の検証
-    r = getattr(cfg, "rank", None)
-    if r is not None and r < 0:
-        raise ValueError(f"Invalid rank: {r} (must be >= 0 or None)")
+    修正版Factory: エンコーダーの有無によって適切な実装を選択
 
-    return Realization(
-        past_horizon=cfg.h,
-        jitter=cfg.jitter,
-        cond_thresh=cfg.cond_thresh,
-        rank=r,
-        reg_type=getattr(cfg, "svd_reg_type", "sum"),
-    )
+    設定エラーハンドリング対応:
+    - エンコーダーありの場合: encoder_output_dim必須
+    - エンコーダーなしの場合: 従来のRealization
+
+    Args:
+        cfg: 設定オブジェクト
+
+    Returns:
+        Realization または StochasticRealizationWithEncoder
+
+    Raises:
+        ValueError: encoder_output_dim未指定など設定エラー
+    """
+    # エンコーダーの有無で分岐
+    use_encoder = getattr(cfg, 'use_encoder', False) and hasattr(cfg, 'encoder')
+
+    if use_encoder:
+        # 新型: エンコーダー対応版
+        # encoder_output_dimの明示指定を要求（設定エラーハンドリング）
+        if not hasattr(cfg, 'encoder_output_dim'):
+            raise ValueError(
+                "encoder_output_dim must be specified when using encoder. "
+                "Example: cfg.encoder_output_dim = 16"
+            )
+
+        return StochasticRealizationWithEncoder(
+            encoder=cfg.encoder,
+            encoder_output_dim=cfg.encoder_output_dim,
+            window_length=getattr(cfg, 'window_length', 5),
+            num_components=getattr(cfg, 'num_components', 4),
+            ridge_param=getattr(cfg, 'ridge_param', 1e-6),
+            device=getattr(cfg, 'device', 'cpu')
+        )
+    else:
+        # 従来型: Realizationクラス
+        r = getattr(cfg, "rank", None)
+        if r is not None and r < 0:
+            raise ValueError(f"Invalid rank: {r} (must be >= 0 or None)")
+
+        return Realization(
+            past_horizon=cfg.h,
+            jitter=cfg.jitter,
+            cond_thresh=cfg.cond_thresh,
+            rank=r,
+            reg_type=getattr(cfg, "svd_reg_type", "sum"),
+        )

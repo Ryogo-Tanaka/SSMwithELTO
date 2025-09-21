@@ -44,6 +44,10 @@ from src.utils.data_loader import load_experimental_data, DataMetadata
 from src.training.two_stage_trainer import TwoStageTrainer
 from src.utils.gpu_utils import select_device
 
+# 新しい確率実現クラスとモード分解機能
+from src.ssm.realization import StochasticRealizationWithEncoder
+from src.evaluation.mode_decomposition import TrainedModelSpectrumAnalysis, SpectrumResultsSaver
+
 
 class FullExperimentPipeline:
     """
@@ -260,40 +264,44 @@ class FullExperimentPipeline:
     def step_3_model_analysis(self, trainer: TwoStageTrainer, data_dict: Dict[str, torch.Tensor]):
         """
         Step 3.3: 学習済み転送作用素の表現確認
-        
+
         Args:
             trainer: 学習済み学習器
             data_dict: データ辞書
         """
         print("\n" + "="*50)
-        print("Step 3.3: 転送作用素・表現分析")
+        print("Step 3.3: 転送作用素・表現分析・モード分解")
         print("="*50)
-        
+
         start_time = datetime.now()
-        
+
         # 転送作用素取得・保存
         operators_info = self._analyze_transfer_operators(trainer)
-        
+
         # 内部表現分析
         representations_info = self._analyze_internal_representations(trainer, data_dict)
-        
+
         # 状態空間可視化
         self._visualize_state_space(trainer, data_dict['test'])
-        
+
+        # モード分解分析（新機能）
+        mode_decomp_info = self._perform_mode_decomposition_analysis(trainer)
+
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"✅ 表現分析完了 ({elapsed:.1f}秒)")
-        
+        print(f"✅ 表現分析・モード分解完了 ({elapsed:.1f}秒)")
+
         # 分析結果保存
         analysis_results = {
             'operators': operators_info,
             'representations': representations_info,
+            'mode_decomposition': mode_decomp_info,
             'analysis_time': elapsed
         }
-        
+
         with open(self.output_dir / 'logs' / 'model_analysis.json', 'w') as f:
             serializable_analysis = self._make_json_serializable(analysis_results)
             json.dump(serializable_analysis, f, indent=2)
-        
+
         # ログ記録
         self.experiment_log.append({
             'timestamp': datetime.now().isoformat(),
@@ -545,7 +553,85 @@ class FullExperimentPipeline:
             
         except Exception as e:
             print(f"⚠️  状態空間可視化エラー: {e}")
-    
+
+    def _perform_mode_decomposition_analysis(self, trainer: TwoStageTrainer) -> Dict[str, Any]:
+        """モード分解分析実行"""
+        mode_decomp_info = {}
+
+        try:
+            # サンプリング間隔取得（設定から、またはデフォルト値）
+            sampling_interval = self.config.get('evaluation', {}).get('spectrum_analysis', {}).get('sampling_interval', 0.1)
+
+            print(f"📊 モード分解分析開始 (Δt={sampling_interval})")
+
+            # モデルスペクトル分析器作成
+            model_spectrum_analyzer = TrainedModelSpectrumAnalysis(sampling_interval)
+
+            # V_A行列抽出・スペクトル分析
+            if hasattr(trainer, 'df_state') and trainer.df_state is not None:
+                try:
+                    # DF-A状態層からV_A抽出
+                    state_dict = trainer.df_state.get_state_dict()
+                    if 'V_A' in state_dict:
+                        V_A = state_dict['V_A']
+
+                        # スペクトル分析実行
+                        spectrum_analysis = model_spectrum_analyzer.analyzer.analyze_spectrum(V_A)
+
+                        # 結果統計
+                        mode_decomp_info = {
+                            'V_A_shape': list(V_A.shape),
+                            'spectral_radius': spectrum_analysis['spectral_radius'],
+                            'n_stable_modes': spectrum_analysis['n_stable_modes'],
+                            'n_dominant_modes': spectrum_analysis['n_dominant_modes'],
+                            'dominant_indices': spectrum_analysis['dominant_indices'],
+                            'stable_indices': spectrum_analysis['stable_indices'],
+                            'sampling_interval': sampling_interval
+                        }
+
+                        # 固有値統計（複素数は分離して保存）
+                        eigenvals_continuous = spectrum_analysis['eigenvalues_continuous']
+                        mode_decomp_info['eigenvalues_statistics'] = {
+                            'mean_growth_rate': float(eigenvals_continuous.real.mean().item()),
+                            'std_growth_rate': float(eigenvals_continuous.real.std().item()),
+                            'mean_frequency_hz': float(spectrum_analysis['frequencies_hz'].mean().item()),
+                            'std_frequency_hz': float(spectrum_analysis['frequencies_hz'].std().item())
+                        }
+
+                        # スペクトル分析結果の詳細保存
+                        spectrum_save_path = self.output_dir / 'artifacts' / 'mode_decomposition'
+                        SpectrumResultsSaver.save_results(
+                            {'spectrum': spectrum_analysis, 'V_A': V_A, 'sampling_interval': sampling_interval},
+                            str(spectrum_save_path),
+                            save_format='both'
+                        )
+
+                        mode_decomp_info['detailed_results_saved'] = True
+                        mode_decomp_info['save_path'] = str(spectrum_save_path)
+
+                        print(f"✅ モード分解完了:")
+                        print(f"  - スペクトル半径: {spectrum_analysis['spectral_radius']:.4f}")
+                        print(f"  - 安定モード数: {spectrum_analysis['n_stable_modes']}")
+                        print(f"  - 主要モード数: {spectrum_analysis['n_dominant_modes']}")
+                        print(f"  - 詳細結果保存: {spectrum_save_path}")
+
+                    else:
+                        print(f"⚠️  V_A行列が見つかりません")
+                        mode_decomp_info['error'] = 'V_A not found in df_state'
+
+                except Exception as e:
+                    print(f"⚠️  モード分解分析エラー: {e}")
+                    mode_decomp_info['error'] = str(e)
+            else:
+                print(f"⚠️  DF-A状態層が見つかりません")
+                mode_decomp_info['error'] = 'df_state layer not found'
+
+        except Exception as e:
+            print(f"⚠️  モード分解分析初期化エラー: {e}")
+            mode_decomp_info['error'] = str(e)
+
+        return mode_decomp_info
+
     def _make_json_serializable(self, obj):
         """JSON対応形式に変換"""
         if isinstance(obj, dict):

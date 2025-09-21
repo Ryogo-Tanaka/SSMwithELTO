@@ -60,7 +60,7 @@ class StateEstimator:
         self.V_A: Optional[torch.Tensor] = None
         self.V_B: Optional[torch.Tensor] = None
         self.U_A: Optional[torch.Tensor] = None
-        self.u_B: Optional[torch.Tensor] = None
+        self.U_B: Optional[torch.Tensor] = None
         self.Q: Optional[torch.Tensor] = None
         self.R: Optional[Union[torch.Tensor, float]] = None
         
@@ -195,45 +195,38 @@ class StateEstimator:
         self.df_obs_layer.eval()
 
     def _load_encoder_component(self, encoder_dict: Dict[str, Any]):
-        """エンコーダ読み込み"""
-        from ..models.architectures.tcn import tcnEncoder
-        
+        """time_invariantエンコーダ読み込み"""
+        from ..models.architectures.time_invariant import time_invariantEncoder
+
         encoder_config = self.config.get('model', {}).get('encoder', {})
-        
-        # 保存されたパラメータから実際の構造を逆算
-        actual_channels = self._detect_encoder_channels(encoder_dict)
-        actual_layers = self._detect_encoder_layers(encoder_dict)
-        
-        print(f"DEBUG: Detected encoder - channels: {actual_channels}, layers: {actual_layers}")
-        
-        self.encoder = tcnEncoder(
-            input_dim=encoder_config.get('input_dim', 6),
-            output_dim=1,  # スカラー特徴量
-            channels=actual_channels,
-            layers=actual_layers
+
+        # time_invariantエンコーダーのパラメータから構造を推定
+        input_dim = encoder_config.get('input_dim', 6)
+        output_dim = self._detect_time_invariant_output_dim(encoder_dict)
+
+        print(f"DEBUG: time_invariant encoder - input_dim: {input_dim}, output_dim: {output_dim}")
+
+        self.encoder = time_invariantEncoder(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            architecture="mlp",  # デフォルト
+            normalize_input=True,
+            normalize_output=True,
+            track_running_stats=True
         ).to(self.device)
-        
+
         self.encoder.load_state_dict(encoder_dict)
         self.encoder.eval()
-    
-    def _detect_encoder_channels(self, encoder_dict: Dict[str, Any]) -> int:
-        """保存されたパラメータからchannels数を検出"""
-        if 'in_proj.weight' in encoder_dict:
-            return encoder_dict['in_proj.weight'].shape[0]
-        return 64  # デフォルト
-    
-    def _detect_encoder_layers(self, encoder_dict: Dict[str, Any]) -> int:
-        """保存されたパラメータからlayers数を検出"""
-        tcn_layers = []
+
+    def _detect_time_invariant_output_dim(self, encoder_dict: Dict[str, Any]) -> int:
+        """time_invariantエンコーダーの出力次元を検出"""
+        if 'output_mean' in encoder_dict:
+            return encoder_dict['output_mean'].shape[0]
+        # core_netの最終層から推定
         for key in encoder_dict.keys():
-            if key.startswith('tcn.') and '.conv.weight' in key:
-                layer_num = int(key.split('.')[1])
-                tcn_layers.append(layer_num)
-        return max(tcn_layers) + 1 if tcn_layers else 6  # デフォルト
-        
-        # 推論時は勾配なし
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+            if key.endswith('.bias') and 'core_net' in key:
+                return encoder_dict[key].shape[0]
+        return 8  # デフォルト
 
     def _extract_operators(self):
         """
@@ -262,8 +255,8 @@ class StateEstimator:
         else:
             raise RuntimeError("V_B not found in DF-B component")
             
-        if hasattr(self.df_obs_layer, 'u_B') and self.df_obs_layer.u_B is not None:
-            self.u_B = self.df_obs_layer.u_B.clone().detach()
+        if hasattr(self.df_obs_layer, 'U_B') and self.df_obs_layer.U_B is not None:
+            self.U_B = self.df_obs_layer.U_B.clone().detach()
         else:
             raise RuntimeError("u_B not found in DF-B component")
             
@@ -271,7 +264,7 @@ class StateEstimator:
         print(f"  V_A: {self.V_A.shape}")
         print(f"  V_B: {self.V_B.shape}")
         print(f"  U_A: {self.U_A.shape}")
-        print(f"  u_B: {self.u_B.shape}")
+        print(f"  U_B: {self.U_B.shape}")
 
     def estimate_noise_covariances(
         self,
@@ -300,25 +293,34 @@ class StateEstimator:
         print(f"Estimating noise covariances from {T_cal} calibration samples...")
         
         with torch.no_grad():
-            # 1. エンコード: {y_t} → {m_t}
-            m_series = self.encoder(calibration_data.unsqueeze(0)).squeeze()  # (T_cal,)
+            # 1. エンコード: {y_t} → {m_t} (多変量特徴量対応)
+            m_series = self.encoder(calibration_data.unsqueeze(0)).squeeze(0)  # (T_cal, output_dim)
 
-            # 2. 状態空間実現: {m_t} → {x_t}
+            # 2. 状態空間実現: {m_t} → {x_t} (多変量入力対応)
             if self.realization is None:
                 # 設定からrealizationパラメータを取得
                 realization_config = self.config.get('ssm', {}).get('realization', {})
+                past_horizon = realization_config.get('past_horizon', 10)
+
+                # データ長に基づいてpast_horizonを自動調整
+                T_cal = m_series.size(0)
+                max_horizon = (T_cal - 1) // 2  # N >= 1を保証するための最大horizon
+                if past_horizon > max_horizon:
+                    past_horizon = max(1, max_horizon)
+                    print(f"⚠️  past_horizon調整: {realization_config.get('past_horizon', 10)} → {past_horizon} (データ長: {T_cal})")
+
                 self.realization = Realization(
-                    past_horizon=realization_config.get('past_horizon', 10),
+                    past_horizon=past_horizon,
                     jitter=realization_config.get('jitter', 1e-6),
                     cond_thresh=realization_config.get('cond_thresh', 1e10),
                     rank=realization_config.get('rank', 4),
                     reg_type=realization_config.get('reg_type', 'sum')
                 )
-                # スカラー系列を (T_cal, 1) に変換してfit
-                self.realization.fit(m_series.unsqueeze(-1))
+                # 多変量特徴量 (T_cal, output_dim) をそのままfit
+                self.realization.fit(m_series)
 
             # realizationで状態系列を生成: (N, rank) where N = T_cal - 2*h + 1
-            x_series = self.realization.filter(m_series.unsqueeze(-1))
+            x_series = self.realization.filter(m_series)
 
             # 時間対応を合わせるため、m_seriesも同じ範囲を使用
             # realization.filter は時点 h から h+N-1 に対応
@@ -467,7 +469,7 @@ class StateEstimator:
             initial_data: 初期化用データ (N0, n) or None
             method: 初期化方法 ("data_driven" | "zero")
         """
-        if not all([self.V_A is not None, self.V_B is not None, self.U_A is not None, self.u_B is not None]):
+        if not all([self.V_A is not None, self.V_B is not None, self.U_A is not None, self.U_B is not None]):
             raise RuntimeError("Operators not extracted. Call load_components() first.")
             
         if self.Q is None or self.R is None:
@@ -479,7 +481,7 @@ class StateEstimator:
             
         # 入力検証
         validation = validate_kalman_inputs(
-            self.V_A, self.V_B, self.U_A, self.u_B, self.Q, self.R
+            self.V_A, self.V_B, self.U_A, self.U_B, self.Q, self.R
         )
         
         if not validation["valid"]:
@@ -494,7 +496,7 @@ class StateEstimator:
             V_A=self.V_A,
             V_B=self.V_B,
             U_A=self.U_A,
-            u_B=self.u_B,
+            U_B=self.U_B,
             Q=self.Q,
             R=self.R,
             encoder=self.encoder,
@@ -640,7 +642,7 @@ class StateEstimator:
                 "V_A": self.V_A.shape,
                 "V_B": self.V_B.shape,
                 "U_A": self.U_A.shape,
-                "u_B": self.u_B.shape
+                "U_B": self.U_B.shape
             },
             "numerical_stability": self.kalman_filter.check_numerical_stability()
         }
@@ -679,7 +681,7 @@ class StateEstimator:
                 "V_A": self.V_A.cpu(),
                 "V_B": self.V_B.cpu(),
                 "U_A": self.U_A.cpu(),
-                "u_B": self.u_B.cpu()
+                "U_B": self.U_B.cpu()
             },
             "noise_covariances": {
                 "Q": self.Q.cpu(),
