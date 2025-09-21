@@ -1,0 +1,70 @@
+# ====================================================================
+# 学習用設定ファイル雛形 (run_full_experiment.py用)
+# 用途: 実データでのモデル学習時のパラメータ設定
+# 使用方法: 実験データに合わせてパラメータを調整して使用
+# ====================================================================
+
+# データ設定
+data:
+  train_ratio: 0.7          # 学習データ比率 (調整推奨: 0.6-0.8)
+  val_ratio: 0.2            # 検証データ比率 (調整推奨: 0.1-0.2)
+  test_ratio: 0.1           # テストデータ比率 (調整推奨: 0.1-0.3)
+  normalization: "standard" # 正規化方法 (standard/minmax/none)
+  batch_size: 32           # バッチサイズ (メモリに応じて調整)
+
+# モデルアーキテクチャ設定
+model:
+  architecture: "time_invariant"  # 固定値
+  encoder:
+    type: "time_invariantEncoder"
+    input_dim: 6            # 入力次元数 (データに合わせて調整)
+    hidden_dim: 64          # 隠れ層次元数 (調整推奨: 32-128)
+    output_dim: 8           # エンコーダー出力次元数 (調整推奨: 4-16)
+    num_layers: 3           # レイヤー数 (調整推奨: 2-5)
+
+  decoder:
+    type: "time_invariantDecoder"
+    hidden_dim: 64          # エンコーダーと合わせる
+    num_layers: 3           # エンコーダーと合わせる
+
+# 学習設定
+training:
+  max_epochs: 100           # 最大エポック数 (調整推奨: 50-200)
+  learning_rate: 0.001      # 学習率 (調整推奨: 0.0001-0.01)
+  patience: 10              # Early stopping忍耐度
+
+  # Phase-1設定 (エンコーダー・デコーダー学習)
+  phase1:
+    epochs: 50              # Phase-1エポック数 (調整推奨: 30-100)
+    weight_decay: 1e-4      # 正則化パラメータ
+
+  # Phase-2設定 (状態空間学習)
+  phase2:
+    epochs: 50              # Phase-2エポック数 (調整推奨: 30-100)
+    lambda_cca: 0.1         # CCA損失重み (調整推奨: 0.01-1.0)
+
+# SSM (状態空間モデル) 設定
+ssm:
+  realization:
+    past_horizon: 5         # 過去窓長 (調整推奨: 3-15, データ長の1/10程度)
+    rank: 4                 # 状態次元数 (調整推奨: 2-8)
+    jitter: 1e-6           # 数値安定化パラメータ
+    m: 500                  # ラグ共分散推定サンプル数 (新機能)
+
+# 計算設定
+computation:
+  device: "auto"            # デバイス選択 (auto/cuda/cpu)
+  num_workers: 4            # データローダー並列数
+  pin_memory: true          # GPU転送高速化
+
+# 出力設定
+output:
+  save_model: true          # モデル保存
+  save_history: true        # 学習履歴保存
+  create_plots: true        # 可視化作成
+
+# ログ設定
+logging:
+  level: "INFO"             # ログレベル (DEBUG/INFO/WARNING)
+  console_output: true      # コンソール出力
+  file_output: true         # ファイル出力
