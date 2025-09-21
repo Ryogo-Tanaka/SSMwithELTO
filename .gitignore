@@ -8,7 +8,8 @@ __pycache__/
 _tests/
 results/
 HANDOVER_TECHNICAL_GUIDE.md
-COMPREHENSIVE_HANDOVER_GUIDE.md 
+COMPREHENSIVE_HANDOVER_GUIDE.md
+DFIV_FORMULATION.md
 _myzipper.py
 test_*.py
 test_*.json
