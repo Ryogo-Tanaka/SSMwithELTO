@@ -53,6 +53,9 @@ class SpectrumAnalyzer:
                 - eigenvalues_magnitude: |λ| (離散時間振幅)
                 - eigenvalues_phase: arg(λ) (離散時間位相)
         """
+        # デバイス・形状情報をログ出力（デバッグ用）
+        print(f"📋 V_A分析開始: shape={V_A.shape}, device={V_A.device}, dtype={V_A.dtype}")
+
         with torch.no_grad():
             # 固有値分解
             eigenvalues_discrete, eigenvectors = torch.linalg.eig(V_A)
@@ -448,11 +451,20 @@ class SpectrumResultsSaver:
                 if isinstance(value, dict):
                     _flatten_dict(value, f"{full_key}_")
                 elif isinstance(value, torch.Tensor):
-                    if torch.is_complex(value):
-                        npz_data[f'{full_key}_real'] = value.real.numpy()
-                        npz_data[f'{full_key}_imag'] = value.imag.numpy()
-                    else:
-                        npz_data[full_key] = value.numpy()
+                    try:
+                        if torch.is_complex(value):
+                            # CUDA tensorの場合はCPUに移動してからnumpy変換
+                            tensor_cpu = value.cpu() if value.is_cuda else value
+                            npz_data[f'{full_key}_real'] = tensor_cpu.real.numpy()
+                            npz_data[f'{full_key}_imag'] = tensor_cpu.imag.numpy()
+                        else:
+                            # CUDA tensorの場合はCPUに移動してからnumpy変換
+                            tensor_cpu = value.cpu() if value.is_cuda else value
+                            npz_data[full_key] = tensor_cpu.numpy()
+                    except Exception as e:
+                        print(f"⚠️  Tensor変換エラー (key: {full_key}, shape: {value.shape}, device: {value.device}, dtype: {value.dtype}): {e}")
+                        # エラー時はテンソル情報のみ保存
+                        npz_data[f'{full_key}_error'] = f"Conversion failed: {str(e)}"
                 elif isinstance(value, (list, tuple)):
                     try:
                         npz_data[full_key] = np.array(value)

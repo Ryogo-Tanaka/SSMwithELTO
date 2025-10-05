@@ -182,7 +182,8 @@ class DFStateLayer(nn.Module):
         # クロス共分散
         YtX = Y_targets.T @ X_features  # (d_A, d_A)
         
-        # 逆行列計算（数値安定化）
+        # 逆行列計算（数値安定化 + デバイス維持）
+        original_device = X_features.device
         try:
             XtX_inv = torch.linalg.inv(XtX_reg)
             V = YtX @ XtX_inv
@@ -198,7 +199,9 @@ class DFStateLayer(nn.Module):
                 S_inv = torch.where(S > 1e-10, 1.0 / S, 0.0)
                 XtX_inv = (Vh.T * S_inv) @ Vh
                 V = YtX @ XtX_inv
-        
+
+        # 強制的に元のデバイスに保持（linalg操作でのCPU移動を防止）
+        V = V.to(original_device)
         return V
 
     def _ridge_stage1_with_grad(
@@ -228,7 +231,8 @@ class DFStateLayer(nn.Module):
         # クロス共分散（勾配計算あり）
         YtX = Y_targets.T @ X_features  # (d_A, d_A)
 
-        # 逆行列計算（勾配計算あり）
+        # 逆行列計算（勾配計算あり + デバイス維持）
+        original_device = X_features.device
         try:
             XtX_inv = torch.linalg.inv(XtX_reg)
             V = YtX @ XtX_inv
@@ -237,6 +241,8 @@ class DFStateLayer(nn.Module):
             XtX_inv = torch.linalg.pinv(XtX_reg)
             V = YtX @ XtX_inv
 
+        # 強制的に元のデバイスに保持（勾配グラフも維持）
+        V = V.to(original_device)
         return V
 
     def _ridge_stage2(
@@ -271,7 +277,8 @@ class DFStateLayer(nn.Module):
         # クロス項
         HXt = H_features.T @ X_targets  # (d_A, r)
         
-        # 逆行列計算（数値安定化）
+        # 逆行列計算（数値安定化 + デバイス維持）
+        original_device = H_features.device
         try:
             HHt_inv = torch.linalg.inv(HHt_reg)
             U = HHt_inv @ HXt
@@ -287,7 +294,9 @@ class DFStateLayer(nn.Module):
                 S_inv = torch.where(S > 1e-10, 1.0 / S, 0.0)
                 HHt_inv = (Vh.T * S_inv) @ Vh
                 U = HHt_inv @ HXt
-        
+
+        # 強制的に元のデバイスに保持（linalg操作でのCPU移動を防止）
+        U = U.to(original_device)
         return U
     
     def _initialize_cross_fitting(self, T_eff: int) -> CrossFittingManager:

@@ -230,12 +230,12 @@ class FilteringPerformanceEvaluator:
             # 利用可能なデータに基づいてキャリブレーションサイズを決定
             total_samples = observations.size(0)
 
-            # DEBUG: テストデータ不足の詳細ログ
-            print(f"🔍 DEBUG - データサイズ分析:")
-            print(f"   観測データ総数: {total_samples}")
-            print(f"   past_horizon: {past_horizon}")
-            print(f"   必要最小サンプル: {min_required} (2*{past_horizon}+1)")
-            print(f"   データ分割: {total_samples} // 4 = {total_samples // 4}")
+            # DEBUG: テストデータ不足の詳細ログ (Resolved in Step 7)
+            # print(f"🔍 DEBUG - データサイズ分析:")
+            # print(f"   観測データ総数: {total_samples}")
+            # print(f"   past_horizon: {past_horizon}")
+            # print(f"   必要最小サンプル: {min_required} (2*{past_horizon}+1)")
+            # print(f"   データ分割: {total_samples} // 4 = {total_samples // 4}")
 
             if total_samples >= min_required:
                 calibration_size = min(50, max(min_required, total_samples // 4))

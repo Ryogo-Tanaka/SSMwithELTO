@@ -63,26 +63,31 @@ class StochasticRealizationWithEncoder(nn.Module):
         self,
         encoder: nn.Module,
         encoder_output_dim: int,  # 設定ファイルから明示指定
-        window_length: int = 10,
-        num_components: int = 8,
+        past_horizon: int = 10,   # 旧: window_length → 互換性のため変更
+        rank: int = 8,            # 旧: num_components → 互換性のため変更
         ridge_param: float = 1e-3,
-        min_eigenvalue: float = 1e-8,
+        jitter: float = 1e-8,     # 旧: min_eigenvalue → 互換性のため変更
+        m: int = 500,             # ラグ共分散推定サンプル数
         device: str = 'cpu'
     ):
         """
         Args:
             encoder: 時不変エンコーダー u_η: R^n → R^m
-            window_length: Galerkin近似のウィンドウ長 ℓ
-            num_components: 状態次元 r（上位正準方向数）
+            past_horizon: Galerkin近似のウィンドウ長 ℓ (旧名: window_length)
+            rank: 状態次元 r（上位正準方向数）(旧名: num_components)
             ridge_param: Ridge正則化パラメータ λ
+            jitter: 最小固有値クリッピング (旧名: min_eigenvalue)
+            m: ラグ共分散推定サンプル数
             device: 計算デバイス
         """
         super().__init__()
 
         self.encoder = encoder
-        self.window_length = int(window_length)  # ℓ
-        self.num_components = int(num_components)  # r
+        self.window_length = int(past_horizon)  # ℓ (内部では元の変数名を使用)
+        self.num_components = int(rank)  # r (内部では元の変数名を使用)
         self.ridge_param = float(ridge_param)  # λ
+        self.min_eigenvalue = float(jitter)  # 数値安定化 (内部では元の変数名を使用)
+        self.m = int(m)  # ラグ共分散推定サンプル数
         self.device = device
 
         # 定式化対応: エンコーダー出力次元 m の取得
@@ -156,29 +161,42 @@ class StochasticRealizationWithEncoder(nn.Module):
             Φ_X: 過去特徴量行列 (m, N)
             Φ_Y: 未来特徴量行列 (m, N)
         """
-        T, n = Y.shape
-        current_shape = (T, n)
+        # キャッシュ機能: 一時的に無効化（安全性のため）
+        # 将来的にデータハッシュベースのキャッシュに変更予定
+        use_cache = False
 
-        # キャッシュチェック: 同一データに対する再計算を避ける
+        # 入力形状の記録（キャッシュ機構維持のため）
+        input_shape = Y.shape
+
+        # キャッシュチェック（現在は無効化されているため常にスキップ）
         if (use_cache and
             self._cached_feature_matrices is not None and
-            self._last_input_shape == current_shape):
+            self._last_input_shape == input_shape):
             return self._cached_feature_matrices['Φ_X'], self._cached_feature_matrices['Φ_Y']
-
-        ℓ = self.window_length
-        N = T - 2 * ℓ + 1  # 有効サンプル数
-
-        if N <= 0:
-            raise ValueError(f"Time series too short for window length {ℓ}")
 
         # Step 1: 全時点でエンコーダー適用（バッチ処理対応）
         # u_η(y_t) → m_t ∈ R^m (定式化 Section 3.1)
 
-        # バッチ処理でエンコーダーを呼び出し（BatchNorm対応）
-        self.encoder.eval()  # 推論モードに設定してBatchNormを無効化
-        with torch.no_grad():
-            # Y全体をバッチとして処理: (T, n) → (T, m)
-            M = self.encoder(Y)  # バッチ処理でエンコーダー適用
+        # バッチ処理でエンコーダーを呼び出し
+        # 訓練時は勾配保持、推論時は効率化のため勾配無効化
+        if self.encoder.training:
+            # 訓練時: 勾配を保持してエンコーダーパラメータ更新を可能にする
+            # Phase-2でのCCA損失勾配フロー確保のため重要
+            M = self.encoder(Y)  # (T, H, W, C) or (T, n) → (T, m)
+        else:
+            # 推論時: 勾配無効化で効率化
+            self.encoder.eval()  # BatchNorm無効化
+            with torch.no_grad():
+                M = self.encoder(Y)  # (T, H, W, C) or (T, n) → (T, m)
+
+        # エンコーダー出力から統一的に形状を取得
+        T, m = M.shape  # エンコーダー後は常に(T, m)
+
+        L = self.window_length
+        N = T - 2 * L + 1  # 有効サンプル数
+
+        if N <= 0:
+            raise ValueError(f"Time series too short for window length {L}")
 
             # 次元確認と調整
             if M.dim() == 1:  # (m,) の場合
@@ -192,15 +210,15 @@ class StochasticRealizationWithEncoder(nn.Module):
         Φ_Y_list = []
 
         for i in range(N):
-            t = i + ℓ  # 実際の時点（ℓから開始）
+            t = i + L  # 実際の時点（Lから開始）
 
-            # 過去ブロック: p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-ℓ)^T)^T
-            # 時点t-1からt-ℓまで逆順で取得
-            past_indices = list(range(t-1, t-ℓ-1, -1))  # [t-1, t-2, ..., t-ℓ]
-            past_features = M[past_indices]  # (ℓ, m)
+            # 過去ブロック: p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-L)^T)^T
+            # 時点t-1からt-Lまで逆順で取得
+            past_indices = list(range(t-1, t-L-1, -1))  # [t-1, t-2, ..., t-L]
+            past_features = M[past_indices]  # (L, m)
 
-            # 未来ブロック: f(t) = (y(t)^T, y(t+1)^T, ..., y(t+ℓ-1)^T)^T
-            future_features = M[t:t+ℓ]  # (ℓ, m)
+            # 未来ブロック: f(t) = (y(t)^T, y(t+1)^T, ..., y(t+L-1)^T)^T
+            future_features = M[t:t+L]  # (L, m)
 
             # φ_m 変換: 成分別グループ化 → スカラー出力
             φ_past = self._apply_feature_mapping(past_features)  # (m,)
@@ -215,7 +233,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         # キャッシュ保存
         if use_cache:
             self._cached_feature_matrices = {'Φ_X': Φ_X.clone(), 'Φ_Y': Φ_Y.clone()}
-            self._last_input_shape = current_shape
+            self._last_input_shape = input_shape
 
         return Φ_X, Φ_Y
 

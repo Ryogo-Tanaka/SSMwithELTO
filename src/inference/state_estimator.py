@@ -204,7 +204,7 @@ class StateEstimator:
         input_dim = encoder_config.get('input_dim', 6)
         output_dim = self._detect_time_invariant_output_dim(encoder_dict)
 
-        print(f"DEBUG: time_invariant encoder - input_dim: {input_dim}, output_dim: {output_dim}")
+        # print(f"DEBUG: time_invariant encoder - input_dim: {input_dim}, output_dim: {output_dim}")  # Resolved in Step 7
 
         self.encoder = time_invariantEncoder(
             input_dim=input_dim,

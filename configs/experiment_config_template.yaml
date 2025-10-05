@@ -48,8 +48,37 @@ ssm:
   realization:
     past_horizon: 5         # 過去窓長 (調整推奨: 3-15, データ長の1/10程度)
     rank: 4                 # 状態次元数 (調整推奨: 2-8)
+    encoder_output_dim: 8   # エンコーダー出力次元 (model.encoder.output_dimと合わせる)
+    ridge_param: 1e-3       # Ridge正則化パラメータ
     jitter: 1e-6           # 数値安定化パラメータ
-    m: 500                  # ラグ共分散推定サンプル数 (新機能)
+    m: 500                  # ラグ共分散推定サンプル数
+
+  # DF-A (状態層) 設定
+  df_state:
+    feature_dim: 16         # d_A: 状態特徴次元 (調整推奨: 8-32)
+    lambda_A: 1e-4          # V_A正則化パラメータ
+    lambda_B: 1e-4          # U_A正則化パラメータ
+    feature_net:            # StateFeatureNet (φ_θ) 深層学習設定
+      hidden_sizes: [64, 32]  # MLP隠れ層サイズ (調整推奨)
+      activation: "ReLU"      # 活性化関数
+      dropout: 0.0            # ドロップアウト率
+    cross_fitting:
+      n_blocks: 2           # クロスフィッティングブロック数
+      min_block_size: 100   # 最小ブロックサイズ
+
+  # DF-B (観測層) 設定
+  df_observation:
+    obs_feature_dim: 8          # d_B: 観測特徴次元 (調整推奨: feature_dimの半分程度)
+    multivariate_feature_dim: 8  # m: エンコーダー出力次元 (encoder_output_dimと合わせる)
+    lambda_B: 1e-4              # V_B正則化パラメータ
+    lambda_dB: 1e-4             # u_B正則化パラメータ
+    obs_net:                    # ObservationFeatureNet (ψ_ω) 深層学習設定
+      hidden_sizes: [32, 16]      # MLP隠れ層サイズ (調整推奨)
+      activation: "ReLU"          # 活性化関数
+      dropout: 0.0                # ドロップアウト率
+    cross_fitting:
+      n_blocks: 2               # クロスフィッティングブロック数
+      min_block_size: 100       # 最小ブロックサイズ
 
 # 計算設定
 computation:

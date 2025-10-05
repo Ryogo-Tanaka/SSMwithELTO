@@ -83,9 +83,38 @@ inference:
 ssm:
   realization:
     past_horizon: 10            # 過去窓長 (調整推奨: 学習時設定と合わせる)
-    jitter: 1e-6               # 数値安定化パラメータ
     rank: 4                    # 状態次元数 (学習時設定と合わせる)
-    m: 500                     # ラグ共分散推定サンプル数 (新機能)
+    encoder_output_dim: 8      # エンコーダー出力次元 (学習時設定と合わせる)
+    ridge_param: 1e-3          # Ridge正則化パラメータ
+    jitter: 1e-6               # 数値安定化パラメータ
+    m: 500                     # ラグ共分散推定サンプル数
+
+  # DF-A (状態層) 設定 - 評価時は学習時設定と合わせる
+  df_state:
+    feature_dim: 16            # d_A: 状態特徴次元 (学習時設定と合わせる)
+    lambda_A: 1e-4             # V_A正則化パラメータ
+    lambda_B: 1e-4             # U_A正則化パラメータ
+    feature_net:               # StateFeatureNet設定 (学習時と同じ)
+      hidden_sizes: [64, 32]
+      activation: "ReLU"
+      dropout: 0.0
+    cross_fitting:
+      n_blocks: 2
+      min_block_size: 100
+
+  # DF-B (観測層) 設定 - 評価時は学習時設定と合わせる
+  df_observation:
+    obs_feature_dim: 8             # d_B: 観測特徴次元 (学習時設定と合わせる)
+    multivariate_feature_dim: 8   # m: エンコーダー出力次元 (学習時設定と合わせる)
+    lambda_B: 1e-4                # V_B正則化パラメータ
+    lambda_dB: 1e-4               # u_B正則化パラメータ
+    obs_net:                      # ObservationFeatureNet設定 (学習時と同じ)
+      hidden_sizes: [32, 16]
+      activation: "ReLU"
+      dropout: 0.0
+    cross_fitting:
+      n_blocks: 2
+      min_block_size: 100
 
 ---
 # ====================================================================
@@ -144,9 +173,38 @@ quick_test_evaluation:
   ssm:
     realization:
       past_horizon: 5              # 短縮版
-      jitter: 1e-6
       rank: 2                      # 短縮版
+      encoder_output_dim: 8        # エンコーダー出力次元
+      ridge_param: 1e-3            # Ridge正則化パラメータ
+      jitter: 1e-6                # 数値安定化パラメータ
       m: 200                       # 短縮版
+
+    # DF-A (状態層) 設定 - クイック版
+    df_state:
+      feature_dim: 8               # 短縮版
+      lambda_A: 1e-4
+      lambda_B: 1e-4
+      feature_net:
+        hidden_sizes: [32, 16]     # 短縮版
+        activation: "ReLU"
+        dropout: 0.0
+      cross_fitting:
+        n_blocks: 2
+        min_block_size: 50         # 短縮版
+
+    # DF-B (観測層) 設定 - クイック版
+    df_observation:
+      obs_feature_dim: 4           # 短縮版
+      multivariate_feature_dim: 8  # エンコーダー出力次元と合わせる
+      lambda_B: 1e-4
+      lambda_dB: 1e-4
+      obs_net:
+        hidden_sizes: [16, 8]      # 短縮版
+        activation: "ReLU"
+        dropout: 0.0
+      cross_fitting:
+        n_blocks: 2
+        min_block_size: 50         # 短縮版
 
 ---
 # ====================================================================
@@ -215,6 +273,35 @@ comprehensive_evaluation:
   ssm:
     realization:
       past_horizon: 15              # より長い窓
-      jitter: 1e-8                 # 高精度
       rank: 6                      # より高次元
+      encoder_output_dim: 8        # エンコーダー出力次元
+      ridge_param: 1e-3            # Ridge正則化パラメータ
+      jitter: 1e-8                 # 高精度
       m: 1000                      # より多くのサンプル
+
+    # DF-A (状態層) 設定 - 包括版
+    df_state:
+      feature_dim: 24              # より高次元
+      lambda_A: 1e-4
+      lambda_B: 1e-4
+      feature_net:
+        hidden_sizes: [128, 64, 32]  # より深いネットワーク
+        activation: "ReLU"
+        dropout: 0.1               # 正則化強化
+      cross_fitting:
+        n_blocks: 3                # より細かい分割
+        min_block_size: 200        # より大きなブロック
+
+    # DF-B (観測層) 設定 - 包括版
+    df_observation:
+      obs_feature_dim: 12            # より高次元
+      multivariate_feature_dim: 8   # エンコーダー出力次元と合わせる
+      lambda_B: 1e-4
+      lambda_dB: 1e-4
+      obs_net:
+        hidden_sizes: [64, 32, 16]   # より深いネットワーク
+        activation: "ReLU"
+        dropout: 0.1               # 正則化強化
+      cross_fitting:
+        n_blocks: 3                # より細かい分割
+        min_block_size: 200        # より大きなブロック
