@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.linalg import cholesky, solve_triangular, eigvalsh, svd
 import warnings
-from typing import Optional, Dict, Any, Tuple, Union
+from typing import Optional, Dict, Any, Tuple, Union, List
 import math
 
 class RealizationError(Exception):
@@ -68,7 +68,11 @@ class StochasticRealizationWithEncoder(nn.Module):
         ridge_param: float = 1e-3,
         jitter: float = 1e-8,     # 旧: min_eigenvalue → 互換性のため変更
         m: int = 500,             # ラグ共分散推定サンプル数
-        device: str = 'cpu'
+        device: str = 'cpu',
+        # ======== 新規追加: 特徴写像設定 ========
+        feature_mapping_type: str = "averaging",  # "averaging" | "linear" | "mlp"
+        feature_mapping_hidden_dims: Optional[List[int]] = None,  # MLPの隠れ層 (例: [32] or [64, 32])
+        feature_mapping_activation: str = "relu"  # "relu" | "tanh" | "gelu"
     ):
         """
         Args:
@@ -115,6 +119,92 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         # デバッグ・統計用
         self._feature_statistics: Optional[Dict[str, torch.Tensor]] = None
+
+        # ======== 追加: 特徴写像変換の初期化 ========
+        self.feature_mapping_type = feature_mapping_type
+
+        if feature_mapping_type == "averaging":
+            # 従来の時間平均（パラメータなし）
+            self.component_transforms = None
+
+        elif feature_mapping_type in ["linear", "mlp"]:
+            # 成分別変換: m個の独立したネットワーク
+            # 各ネットワークは ℓ → 1 の変換
+
+            if feature_mapping_type == "linear":
+                # 線形層のみ（隠れ層なし）
+                hidden_dims = []
+            else:
+                # MLP（隠れ層あり）
+                if feature_mapping_hidden_dims is None:
+                    hidden_dims = [32]
+                else:
+                    hidden_dims = feature_mapping_hidden_dims
+
+            # m個の成分別変換を構築
+            self.component_transforms = nn.ModuleList([
+                self._build_component_transform(
+                    input_dim=self.window_length,  # ℓ
+                    hidden_dims=hidden_dims,
+                    activation=feature_mapping_activation
+                )
+                for _ in range(self.feature_dim)  # m個の成分
+            ])
+        else:
+            raise ValueError(
+                f"Unknown feature_mapping_type: {feature_mapping_type}. "
+                f"Choose from: 'averaging', 'linear', 'mlp'"
+            )
+
+    def _build_component_transform(
+        self,
+        input_dim: int,
+        hidden_dims: List[int],
+        activation: str
+    ) -> nn.Sequential:
+        """
+        成分別変換ネットワーク構築: ℝˡ → ℝ
+
+        Theory Section 4.4.1, equation 333:
+        φ̃_m^(i)(p(t)) = MLP(φ_u^(i)(p(t))) ∈ ℝ
+
+        実装選択肢:
+        - hidden_dims = [] → 線形層のみ: Linear(ℓ, 1)
+        - hidden_dims = [h] → 浅いMLP: Linear(ℓ, h) → Act → Linear(h, 1)
+        - hidden_dims = [h1, h2] → 2層MLP: Linear(ℓ, h1) → Act → Linear(h1, h2) → Act → Linear(h2, 1)
+
+        Args:
+            input_dim: 入力次元 ℓ (window_length)
+            hidden_dims: 隠れ層次元リスト（空リスト=線形層のみ）
+            activation: 活性化関数 ("relu", "tanh", "gelu")
+
+        Returns:
+            nn.Sequential: 変換ネットワーク
+        """
+        activation_map = {
+            "relu": nn.ReLU,
+            "tanh": nn.Tanh,
+            "gelu": nn.GELU
+        }
+
+        if activation not in activation_map:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        act_fn = activation_map[activation]
+
+        layers = []
+        in_dim = input_dim
+
+        # 隠れ層の構築
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(act_fn())
+            in_dim = h_dim
+
+        # 最終層: → ℝ (スカラー出力)
+        layers.append(nn.Linear(in_dim, 1))
+
+        return nn.Sequential(*layers)
 
     def _get_encoder_output_dim(self) -> int:
         """
@@ -239,24 +329,53 @@ class StochasticRealizationWithEncoder(nn.Module):
 
     def _apply_feature_mapping(self, features: torch.Tensor) -> torch.Tensor:
         """
-        定式化対応: 特徴量マッピング φ_m の実装
+        定式化対応: 特徴量マッピング φ_m の実装（成分別変換）
 
-        定式化 Section 3.3:
-        1. 同一成分のグループ化: φ_u^{(i)}(p(t)) := (φ_u^{(i)}(y(t-1)), ..., φ_u^{(i)}(y(t-ℓ)))^T
-        2. スカラー出力変換: φ̃_m^{(i)}(p(t)) := MLP(φ_u^{(i)}(p(t)))
-        3. 最終出力: φ_m(p(t)) = (φ̃_m^{(1)}(p(t)), ..., φ̃_m^{(m)}(p(t)))^T
+        Theory Section 4.4.1:
+        1. 同一成分のグループ化: φ_u^(i)(p(t)) := [φ_u^(i)(y(t-1)), ..., φ_u^(i)(y(t-ℓ))]^T ∈ ℝˡ
+        2. 成分別スカラー変換: φ̃_m^(i)(p(t)) = Transform_i(φ_u^(i)(p(t))) ∈ ℝ
+        3. 最終ベクトル構成: φ_m(p(t)) = [φ̃_m^(1)(p(t)), ..., φ̃_m^(m)(p(t))]^T ∈ ℝᵐ
 
-        簡易実装: 各成分の平均値を使用（理論的にはMLPが必要）
+        実装選択肢（feature_mapping_type設定で切り替え）:
+        - "averaging": 時間平均 (1/ℓ) Σ φ_u^(i)(y(t-j)) （Theory equation 345）
+        - "linear":    線形変換 w_i^T φ_u^(i)(p(t)) （パラメータ学習可能）
+        - "mlp":       浅いMLP MLP_i(φ_u^(i)(p(t))) （Theory equation 333）
 
         Args:
             features: (ℓ, m) 特徴量ブロック
+                ℓ: window_length
+                m: feature_dim (エンコーダー出力次元)
 
         Returns:
             φ_output: (m,) マッピング結果
         """
-        # 簡易実装: 各成分の時間平均（理論的にはMLPを使用すべき）
-        # TODO: 本格実装では成分別MLPを使用
-        φ_output = torch.mean(features, dim=0)  # (m,)
+        ℓ, m = features.shape
+
+        if self.feature_mapping_type == "averaging":
+            # 従来の時間平均実装 (Theory equation 345)
+            # φ̃_m^(i) ≈ (1/ℓ) Σ_{j=1}^ℓ φ_u^(i)(y(t-j))
+            φ_output = torch.mean(features, dim=0)  # (m,)
+
+        elif self.feature_mapping_type in ["linear", "mlp"]:
+            # 成分別変換実装 (Theory equation 333)
+            φ_components = []
+
+            for i in range(m):
+                # Step 1: 成分iのグループ化
+                # φ_u^(i)(p(t)) = [φ_u^(i)(y(t-1)), ..., φ_u^(i)(y(t-ℓ))]^T ∈ ℝˡ
+                φ_u_i = features[:, i]  # (ℓ,)
+
+                # Step 2: 成分別変換適用
+                # φ̃_m^(i)(p(t)) = Transform_i(φ_u^(i)(p(t))) ∈ ℝ
+                φ_tilde_i = self.component_transforms[i](φ_u_i)  # (1,)
+                φ_components.append(φ_tilde_i.squeeze())
+
+            # Step 3: 最終ベクトル構成
+            φ_output = torch.stack(φ_components)  # (m,)
+
+        else:
+            raise ValueError(f"Unknown feature_mapping_type: {self.feature_mapping_type}")
+
         return φ_output
 
     def _compute_covariance_blocks(

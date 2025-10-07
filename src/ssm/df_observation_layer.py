@@ -278,12 +278,13 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # V_B推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
-            with torch.no_grad():
-                V_B_list = cf_fitter.cross_fit_stage1(
-                    phi_prev, psi_curr,
-                    stage1_estimator=lambda X, Y: self._ridge_stage1_vb(X, Y, self.lambda_B)
-                )
+            # V_B推定（クロスフィッティング）- 勾配計算あり（θ更新用）
+            # 修正: no_grad()を削除し、_ridge_stage1_vb_with_gradを使用してθへの勾配を有効化
+            # 注: psi_currは呼び出し側でno_grad()内で計算済み（ω固定維持）
+            V_B_list = cf_fitter.cross_fit_stage1(
+                phi_prev, psi_curr,
+                stage1_estimator=lambda X, Y: self._ridge_stage1_vb_with_grad(X, Y, self.lambda_B)
+            )
 
             # **理論準拠**: out-of-fold予測計算（勾配あり）
             psi_pred_cf = cf_fitter.compute_out_of_fold_features(phi_prev, V_B_list)
@@ -438,12 +439,13 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # U_B推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
-            with torch.no_grad():
-                U_B_list = cf_fitter.cross_fit_stage2_matrix(
-                    H_features, M_target,
-                    stage2_estimator=lambda H, M: self._ridge_stage2_ub_matrix(H, M, self.lambda_dB)
-                )
+            # U_B推定（クロスフィッティング）- 勾配計算あり（ω更新用）
+            # 修正: no_grad()を削除し、_ridge_stage2_ub_matrix_with_gradを使用してωへの勾配を有効化
+            # 注: H_featuresは勾配計算ありで渡される（ω依存）
+            U_B_list = cf_fitter.cross_fit_stage2_matrix(
+                H_features, M_target,
+                stage2_estimator=lambda H, M: self._ridge_stage2_ub_matrix_with_grad(H, M, self.lambda_dB)
+            )
 
             # **理論準拠**: out-of-fold予測計算（勾配あり）
             M_pred_cf = torch.zeros_like(M_target)

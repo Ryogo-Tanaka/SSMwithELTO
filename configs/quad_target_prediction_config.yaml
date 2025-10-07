@@ -96,6 +96,12 @@ ssm:
     jitter: 1e-6           # 数値安定化パラメータ
     m: 50                  # ラグ共分散推定サンプル数
 
+    # ======== 特徴写像設定 (Step 14追加) ========
+    feature_mapping:
+      type: "averaging"      # "averaging" | "linear" | "mlp"
+      hidden_dims: []        # MLPの隠れ層（[] で線形のみ、[32] で浅いMLP）
+      activation: "relu"     # "relu" | "tanh" | "gelu"
+
   # DF-A (状態層) 設定
   df_state:
     feature_dim: 50         # d_A: 状態特徴次元 (R^r → R^{d_A})
@@ -106,7 +112,7 @@ ssm:
       activation: "ReLU"       # 活性化関数
       dropout: 0.1             # ドロップアウト率 (過学習防止)
     cross_fitting:
-      n_blocks: 2           # クロスフィッティングブロック数
+      n_blocks: 5           # クロスフィッティングブロック数
       min_block_size: 100   # 最小ブロックサイズ
 
   # DF-B (観測層) 設定
@@ -120,7 +126,7 @@ ssm:
       activation: "ReLU"          # 活性化関数
       dropout: 0.1                # ドロップアウト率 (過学習防止)
     cross_fitting:
-      n_blocks: 2               # クロスフィッティングブロック数
+      n_blocks: 5               # クロスフィッティングブロック数
       min_block_size: 100       # 最小ブロックサイズ
 
 # 計算設定

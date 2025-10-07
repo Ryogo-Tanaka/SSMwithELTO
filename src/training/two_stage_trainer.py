@@ -363,9 +363,23 @@ class TwoStageTrainer:
         if config.get('evaluation', {}).get('use_new_realization', True):
             # StochasticRealizationWithEncoderはencoder引数が必要
             realization_config_copy = realization_config.copy()
+
+            # 特徴写像設定の読み込み (Step 14追加)
+            feature_mapping_cfg = realization_config.get('feature_mapping', {})
+
             realization = StochasticRealizationWithEncoder(
                 encoder=encoder,
-                **realization_config_copy
+                encoder_output_dim=realization_config_copy['encoder_output_dim'],
+                past_horizon=realization_config_copy.get('past_horizon', 10),
+                rank=realization_config_copy.get('rank', 8),
+                ridge_param=realization_config_copy.get('ridge_param', 1e-3),
+                jitter=realization_config_copy.get('jitter', 1e-8),
+                m=realization_config_copy.get('m', 500),
+                device=str(device),
+                # 特徴写像設定
+                feature_mapping_type=feature_mapping_cfg.get('type', 'averaging'),
+                feature_mapping_hidden_dims=feature_mapping_cfg.get('hidden_dims', None),
+                feature_mapping_activation=feature_mapping_cfg.get('activation', 'relu')
             )
         else:
             realization = Realization(**realization_config)
@@ -665,7 +679,14 @@ class TwoStageTrainer:
             print(f"✅ target_decoder設定完了: {type(target_decoder).__name__}")
         else:
             self.target_decoder = None
-        self.realization = realization
+
+        # Step 14対応: component_transformsを含む全パラメータをデバイスに移動
+        # realization は nn.Module を継承しており、encoder/decoder と同様に扱うべき
+        if hasattr(realization, 'to'):
+            self.realization = realization.to(device)
+        else:
+            self.realization = realization
+
         self.config = training_config
         self.device = device
         self.output_dir = Path(output_dir)
@@ -1085,18 +1106,30 @@ class TwoStageTrainer:
             epoch, TrainingPhase.PHASE1_DF_A, 'stage1', 0,
             stage1_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
         )
-        
-        # Stage-2: U_A推定（一度だけ実行）
-        with torch.no_grad():  # **修正2: Stage-2は勾配なし**
-            stage2_metrics = self.df_state.train_stage2_closed_form()
 
-            # ログ記録
-            self.logger.log_phase1(
-                epoch, TrainingPhase.PHASE1_DF_A, 'stage2', 0,
-                stage2_metrics, {}
-            )
+        # **修正2: 明示的グラフクリア**
+        self._clear_computation_graph()
 
-        metrics['df_a_stage2_loss'] = stage2_metrics['stage2_loss']
+        # Stage-2: U_A推定 + φ_θ更新（T2回反復、計算グラフ分離）
+        stage2_losses = []
+        for t in range(self.config.T2_iterations):  # ← DF-Bと同じパラメータ
+            with torch.enable_grad():
+                # **DF-B参照**: 各反復で独立した計算グラフを作成
+                X_states_independent = X_states_detached.detach().requires_grad_(True)
+
+                stage2_metrics = self.df_state.train_stage2_with_gradients(
+                    X_states_independent,
+                    opt_phi
+                )
+                stage2_losses.append(stage2_metrics['stage2_loss'])
+
+                # ログ記録
+                self.logger.log_phase1(
+                    epoch, TrainingPhase.PHASE1_DF_A, 'stage2', t,
+                    stage2_metrics, {'lr_phi': opt_phi.param_groups[0]['lr']}
+                )
+
+        metrics['df_a_stage2_loss'] = sum(stage2_losses) / len(stage2_losses)
         
         # **修正2: 明示的グラフクリア**
         self._clear_computation_graph()
@@ -1457,6 +1490,16 @@ class TwoStageTrainer:
                 {'params': list(self.encoder.parameters()), 'lr': self.config.lr_encoder},
                 {'params': list(self.decoder.parameters()), 'lr': self.config.lr_decoder}
             ]
+
+            # ======== 追加: component_transformsのパラメータをエンコーダーグループに追加 (Step 14) ========
+            # StochasticRealizationWithEncoderの場合、feature mappingパラメータを含める
+            if hasattr(self.realization, 'component_transforms') and \
+               self.realization.component_transforms is not None:
+                # component_transformsのパラメータをエンコーダーと同じ学習率で更新
+                param_groups.append({
+                    'params': list(self.realization.component_transforms.parameters()),
+                    'lr': self.config.lr_encoder  # エンコーダーと同じ学習率
+                })
 
             # DF層パラメータの扱い（update_strategy設定による）
             if self.config.update_strategy == "all":

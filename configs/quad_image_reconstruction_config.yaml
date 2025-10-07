@@ -60,7 +60,7 @@ training:
   # 統合学習設定 (各エポックでPhase-1 + Phase-2を連続実行)
   epochs: 10               # 総エポック数
   T1_iterations: 5         # DF-A/DF-B Stage-1反復数（各エポック内）
-  T2_iterations: 1          # DF-A/DF-B Stage-2反復数（各エポック内）
+  T2_iterations: 5          # DF-A/DF-B Stage-2反復数（各エポック内）
   phase1_warmup_epochs: 5   # Phase-2(End-to-end)開始前のPhase-1(DF-A/DF-B)ウォームアップ
 
   # 実験モード設定（デフォルトは再構成モード）
@@ -94,6 +94,12 @@ ssm:
     jitter: 1e-6           # 数値安定化パラメータ
     m: 50                  # ラグ共分散推定サンプル数
 
+    # ======== 特徴写像設定 (Step 14追加) ========
+    feature_mapping:
+      type: "mlp"      # "averaging" | "linear" | "mlp"
+      hidden_dims: [32]        # MLPの隠れ層（[] で線形のみ、[32] で浅いMLP）
+      activation: "relu"     # "relu" | "tanh" | "gelu"
+
   # DF-A (状態層) 設定
   df_state:
     feature_dim: 50         # d_A: 状態特徴次元 (R^r → R^{d_A})
@@ -104,7 +110,7 @@ ssm:
       activation: "ReLU"       # 活性化関数
       dropout: 0.1             # ドロップアウト率 (過学習防止)
     cross_fitting:
-      n_blocks: 2           # クロスフィッティングブロック数
+      n_blocks: 5           # クロスフィッティングブロック数
       min_block_size: 100   # 最小ブロックサイズ
 
   # DF-B (観測層) 設定
@@ -118,7 +124,7 @@ ssm:
       activation: "ReLU"          # 活性化関数
       dropout: 0.1                # ドロップアウト率 (過学習防止)
     cross_fitting:
-      n_blocks: 2               # クロスフィッティングブロック数
+      n_blocks: 5               # クロスフィッティングブロック数
       min_block_size: 100       # 最小ブロックサイズ
 
 # 計算設定

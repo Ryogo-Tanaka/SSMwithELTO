@@ -503,54 +503,132 @@ class DFStateLayer(nn.Module):
             'final_loss': loss_stage1.item()
         }
     
-    def train_stage2_closed_form(self) -> Dict[str, float]:
+    def _compute_cross_fitting_prediction_ua_matrix(
+        self,
+        H_features: torch.Tensor,
+        X_targets: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Stage-2学習（閉形式解のみ、勾配なし）
-        
-        資料の学習戦略に対応:
-        for t = 1 to T2:  # Stage-2
-            U_A = 閉形式解(H^{(cf)}_A, X_+)        # U_A更新（閉形式解のみ）
-        
+        **DF-B参照**: U_A用クロスフィッティングでout-of-fold予測計算
+
+        Args:
+            H_features: 操作変数特徴量 (T-1, d_A)
+            X_targets: 状態目標 (T-1, r)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (X_pred_cf, U_A_final)
+                - X_pred_cf: out-of-fold予測 (T-1, r)
+                - U_A_final: 最終U_A行列 (d_A, r)
+        """
+        T_eff = H_features.size(0)
+
+        # クロスフィッティング設定取得
+        n_blocks = self.cf_config.get('n_blocks', 6)
+        min_block_size = self.cf_config.get('min_block_size', 20)
+
+        # データ量チェック：クロスフィッティング実行可能性
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # データ不足時：従来の全データRidge回帰（勾配あり）
+            U_A = self._ridge_stage2(H_features, X_targets, self.lambda_B)
+            X_pred = (U_A.T @ H_features.T).T
+            return X_pred, U_A
+
+        # クロスフィッティング実行
+        try:
+            from .cross_fitting import CrossFittingManager, TwoStageCrossFitter
+
+            # クロスフィッティング管理
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+            cf_fitter = TwoStageCrossFitter(cf_manager)
+
+            # U_A推定（クロスフィッティング） - 勾配計算あり（θ更新用）
+            # 修正: no_grad()を削除してθへの勾配を有効化
+            # U_A^{(-k)}リストを構築（out-of-fold推定）
+            U_A_list = []
+            for k in range(cf_manager.n_blocks):
+                # out-of-foldインデックス I_{-k}
+                oof_indices = cf_manager.get_out_of_fold_indices(k)
+                H_oof = H_features[oof_indices]
+                X_oof = X_targets[oof_indices]
+
+                # U_A^{(-k)} 推定（勾配計算あり）
+                U_A_k = self._ridge_stage2(H_oof, X_oof, self.lambda_B)
+                U_A_list.append(U_A_k)
+
+            # **理論準拠**: out-of-fold予測計算（勾配あり）
+            X_pred_cf = torch.zeros_like(X_targets)
+            for k in range(cf_manager.n_blocks):
+                block_indices = cf_manager.get_block_indices(k)
+                H_block = H_features[block_indices]  # 勾配あり
+
+                # U_A^{(-k)}による予測: X_pred = (U_A^T @ H^T)^T = H @ U_A
+                X_pred_cf[block_indices] = (U_A_list[k].T @ H_block.T).T
+
+            # 最終U_A：全データでの推定（勾配あり、正則化用）
+            U_A_final = self._ridge_stage2(H_features, X_targets, self.lambda_B)
+
+            return X_pred_cf, U_A_final
+
+        except Exception as e:
+            print(f"クロスフィッティング失敗、従来方式を使用: {e}")
+            U_A = self._ridge_stage2(H_features, X_targets, self.lambda_B)
+            X_pred = (U_A.T @ H_features.T).T
+            return X_pred, U_A
+
+    def train_stage2_with_gradients(
+        self,
+        X_states: torch.Tensor,
+        optimizer_phi: torch.optim.Optimizer,
+    ) -> Dict[str, float]:
+        """
+        **新実装**: Stage-2学習 + φ_θ勾配更新
+
+        理論定式化:
+        min_{φ_θ} E[||x_t - U_A^T H^{(cf)}_A(x̂_t)||²] + λ_B ||U_A||²
+        s.t. V_A = f(φ_θ), U_A = f(V_A, x_t)
+
+        DF-B Stage-2の実装パターンを参照（パラメータ固定なし版）
+
+        Args:
+            X_states: 状態系列 (T, r)
+            optimizer_phi: φ_θ用オプティマイザ
+
         Returns:
             Dict[str, float]: 損失メトリクス
         """
-        if 'V_A' not in self._stage1_cache:
+        if 'X_plus' not in self._stage1_cache:
             raise RuntimeError("Stage-1が先に実行されている必要があります")
-        
-        # Stage-1からの結果を取得
-        V_A = self._stage1_cache['V_A']
-        phi_minus = self._stage1_cache['phi_minus']
-        X_plus = self._stage1_cache['X_plus']
-        
-        # **修正**: クロスフィッティングを考慮したStage-2
-        with torch.no_grad():
-            if 'cf_manager' in self._stage1_cache and 'V_A_list' in self._stage1_cache:
-                # クロスフィッティング使用時：out-of-fold特徴量を使用
-                cf_manager = self._stage1_cache['cf_manager']
-                V_A_list = self._stage1_cache['V_A_list']
-                cf_fitter = TwoStageCrossFitter(cf_manager)
-                
-                # Out-of-fold特徴量計算
-                H_cf = cf_fitter.compute_out_of_fold_features(phi_minus, V_A_list)
-                
-                # U_A推定
-                U_A = self._ridge_stage2(H_cf, X_plus, self.lambda_B)
-                
-                # 損失計算（参考用、正規化済み）
-                X_pred = (U_A.T @ H_cf.T).T
-                loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.numel()
-            else:
-                # 非クロスフィッティング時：直接計算
-                H_cf = (V_A @ phi_minus.T).T
-                U_A = self._ridge_stage2(H_cf, X_plus, self.lambda_B)
-                
-                # 損失計算（参考用、正規化済み）
-                X_pred = (U_A.T @ H_cf.T).T
-                loss_stage2 = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.numel()
-        
+
+        # Stage-1からの結果を取得（データのみ）
+        X_plus = self._stage1_cache['X_plus']  # (T-1, r)
+
+        # **DF-B参照**: φ_θで特徴量を動的計算（勾配あり）
+        phi_seq = self.phi_theta(X_states)  # (T, d_A) 勾配あり
+        phi_minus = phi_seq[:-1]  # (T-1, d_A)
+        phi_plus = phi_seq[1:]    # (T-1, d_A)
+
+        # **DF-B参照**: V_A動的再計算（φ_θ勾配を通す）
+        V_A_current = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+
+        # **DF-B参照**: H計算（φ_θ勾配あり）
+        H = (V_A_current @ phi_minus.T).T  # (T-1, d_A) 勾配あり
+
+        # **理論準拠**: クロスフィッティングでU_A推定とout-of-fold予測
+        X_pred, U_A = self._compute_cross_fitting_prediction_ua_matrix(H, X_plus)
+
+        # **DF-B参照**: Stage-2損失 - 予測誤差（正規化済み） + U_A正則化項
+        prediction_loss = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.numel()
+        regularization_loss = self.lambda_B * torch.norm(U_A, p='fro') ** 2
+        loss_stage2 = prediction_loss + regularization_loss
+
+        # **DF-B参照**: φ_θ更新
+        optimizer_phi.zero_grad()
+        loss_stage2.backward()
+        optimizer_phi.step()
+
         # U_A をキャッシュ
-        self._stage2_cache['U_A'] = U_A
-        
+        self._stage2_cache['U_A'] = U_A.detach()
+
         return {'stage2_loss': loss_stage2.item()}
     
     def fit_two_stage(
@@ -693,12 +771,12 @@ class DFStateLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # V_A推定（クロスフィッティング）- 勾配計算なし（out-of-fold用）
-            with torch.no_grad():
-                V_A_list = cf_fitter.cross_fit_stage1(
-                    phi_minus, phi_plus,
-                    stage1_estimator=lambda X, Y: self._ridge_stage1(X, Y, self.lambda_A)
-                )
+            # V_A推定（クロスフィッティング）- 勾配計算あり（θ更新用）
+            # 修正: no_grad()を削除し、_ridge_stage1_with_gradを使用してθへの勾配を有効化
+            V_A_list = cf_fitter.cross_fit_stage1(
+                phi_minus, phi_plus,
+                stage1_estimator=lambda X, Y: self._ridge_stage1_with_grad(X, Y, self.lambda_A)
+            )
 
             # **理論準拠**: out-of-fold予測計算（勾配あり）
             phi_pred_cf = cf_fitter.compute_out_of_fold_features(phi_minus, V_A_list)
