@@ -269,7 +269,9 @@ _train_integrated_phase2_epoch(Y_train)
 ## ⚙️ 設定ファイル
 
 ### 基本構造
-```yaml
+
+configs/内のyamlファイルを参照ください
+<!-- ```yaml
 experiment:
   mode: "reconstruction"  # または "target_prediction"
 
@@ -341,7 +343,7 @@ training:
   experiment_mode: "target_prediction"
   target_loss_weight: 1.0
   reconstruction_loss_weight: 0.0
-```
+``` -->
 
 ---
 
@@ -449,8 +451,10 @@ checkpoint['config']:
 # }
 ```
 
-### 評価結果（JSON）
-```json
+### 評価結果
+
+jsonファイルで、results/フォルダに保存されます
+<!-- ```json
 {
   "reconstruction_metrics": {
     "rmse": 0.0567,
@@ -463,7 +467,7 @@ checkpoint['config']:
     "n_dominant_modes": 5
   }
 }
-```
+``` -->
 
 ---
 
@@ -523,9 +527,3 @@ M̂ → decoder → Ŷ
 5. **モジュール設計**: Factoryパターンで拡張性確保
 
 ---
-
-## 📚 参考資料
-
-- 詳細定式化: `_prompt/Theory_and_Formulation.md`
-- 実装ガイド: `_prompt/Code_Implementation_Guide.md`
-- コードフロー: `_prompt/CODE_FLOW_ANALYSIS.md`
