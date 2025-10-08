@@ -1,49 +1,48 @@
 import subprocess
 import torch
 
-# Cached device to ensure the selection logic (and its print) runs only once
+# デバイス選択結果をキャッシュ
 _cached_device: torch.device | None = None
 _cached_all: list[torch.device] | None = None
 
 def select_device(prefer_memory: bool = True) -> torch.device:
     """
-    Selects and returns the most appropriate torch.device.
-    
-    1) If CUDA is not available -> CPU
-    2) If CUDA is available and prefer_memory=True -> use nvidia-smi to pick
-       the GPU with the most free memory
-    3) If CUDA is available and prefer_memory=False -> use cuda:0
+    最適なtorch.deviceを選択
+
+    1) CUDA利用不可 → CPU
+    2) prefer_memory=True → 空きメモリ最大のGPU
+    3) prefer_memory=False → cuda:0
     """
     global _cached_device
-    # Return cached device if already chosen
+    # キャッシュ済みならそれを返す
     if _cached_device is not None:
         return _cached_device
 
-    # Case 1: No CUDA -> CPU
+    # CUDA利用不可 → CPU
     if not torch.cuda.is_available():
         print("CUDA is not available. Using CPU.")
         _cached_device = torch.device("cpu")
         return _cached_device
 
-    # Case 2 & 3: CUDA is available
+    # CUDA利用可
     if prefer_memory:
         try:
-            # Query free memory on all GPUs (MiB) via nvidia-smi
+            # nvidia-smiで空きメモリ取得
             output = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,nounits,noheader"],
                 encoding="utf-8"
             )
             free_memories = [int(line) for line in output.strip().splitlines()]
-            # Pick the GPU index with the maximum free memory
+            # 空きメモリ最大のGPUを選択
             best_index = max(range(len(free_memories)), key=lambda i: free_memories[i])
             print(f"Selecting GPU:{best_index} (free memory: {free_memories[best_index]} MiB)")
             _cached_device = torch.device(f"cuda:{best_index}")
         except Exception as e:
-            # Fall back to default GPU 0 on failure
+            # 失敗時はcuda:0にフォールバック
             print(f"nvidia-smi query failed ({e}); falling back to cuda:0")
             _cached_device = torch.device("cuda:0")
     else:
-        # Always use GPU 0 when not preferring memory-based selection
+        # デフォルトでGPU 0を使用
         print("Using default GPU:0")
         _cached_device = torch.device("cuda:0")
 
@@ -51,10 +50,10 @@ def select_device(prefer_memory: bool = True) -> torch.device:
 
 def list_available_devices(prefer_memory: bool = True) -> list[torch.device]:
     """
-    Returns a list of all available devices:
-    - If no CUDA, returns [cpu]
-    - If CUDA and prefer_memory=True, returns GPUs sorted by free memory desc
-    - If CUDA and prefer_memory=False, returns [cuda:0, cuda:1, ...]
+    利用可能なデバイスリストを返す
+    - CUDA無し: [cpu]
+    - prefer_memory=True: 空きメモリ降順でGPUをソート
+    - prefer_memory=False: [cuda:0, cuda:1, ...]
     """
     global _cached_all
     if _cached_all is not None:
@@ -75,7 +74,7 @@ def list_available_devices(prefer_memory: bool = True) -> list[torch.device]:
                 encoding="utf-8"
             )
             free_memories = [int(l) for l in out.strip().splitlines()]
-            # GPU indices sorted by free memory descending
+            # 空きメモリ降順でソート
             sorted_idx = sorted(range(n), key=lambda i: free_memories[i], reverse=True)
             _cached_all = [torch.device(f"cuda:{i}") for i in sorted_idx]
         except Exception:
