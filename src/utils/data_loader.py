@@ -159,7 +159,7 @@ class UniversalTimeSeriesDataset(Dataset):
                     target_train = candidate.reshape(candidate.shape[1], candidate.shape[2])
                 elif candidate.ndim == 2:
                     target_train = candidate
-                print(f"🎯 訓練ターゲットデータ検出: '{key}' → shape={target_train.shape}")
+                print(f"訓練ターゲットデータ検出: '{key}' → shape={target_train.shape}")
                 break
 
         for key in target_keys_test:
@@ -170,19 +170,19 @@ class UniversalTimeSeriesDataset(Dataset):
                     target_test = candidate.reshape(candidate.shape[1], candidate.shape[2])
                 elif candidate.ndim == 2:
                     target_test = candidate
-                print(f"🎯 テストターゲットデータ検出: '{key}' → shape={target_test.shape}")
+                print(f"テストターゲットデータ検出: '{key}' → shape={target_test.shape}")
                 break
 
         for key in input_keys_train:
             if key in data:
                 input_train = data[key]
-                print(f"📥 訓練入力データ検出: '{key}' → shape={input_train.shape}")
+                print(f"訓練入力データ検出: '{key}' → shape={input_train.shape}")
                 break
 
         for key in input_keys_test:
             if key in data:
                 input_test = data[key]
-                print(f"📥 テスト入力データ検出: '{key}' → shape={input_test.shape}")
+                print(f"テスト入力データ検出: '{key}' → shape={input_test.shape}")
                 break
 
         # ターゲットデータがある場合
@@ -193,7 +193,7 @@ class UniversalTimeSeriesDataset(Dataset):
             target_info['target_test_data'] = target_test  # テストターゲット（オプション）
             target_info['input_test_data'] = input_test    # テスト入力（オプション）
 
-            print(f"✅ ターゲットデータ構造確認完了:")
+            print(f"ターゲットデータ構造確認完了:")
             print(f"   - 入力: {input_train.shape} ({input_train.dtype})")
             print(f"   - ターゲット: {target_train.shape} ({target_train.dtype})")
             if target_test is not None:
@@ -225,7 +225,7 @@ class UniversalTimeSeriesDataset(Dataset):
                         self.target_test_data = target_info.get('target_test_data', None)
                         self.input_test_data = target_info.get('input_test_data', None)
                         raw_data = target_info['input_data']
-                        print(f"🎯 ターゲット予測モード: 入力{raw_data.shape} → ターゲット{self.target_data.shape}")
+                        print(f"ターゲット予測モード: 入力{raw_data.shape} → ターゲット{self.target_data.shape}")
                     else:
                         raise DataLoaderError(
                             f"ターゲット予測モードが指定されましたが、ターゲットデータが見つかりません。\n"
@@ -238,7 +238,7 @@ class UniversalTimeSeriesDataset(Dataset):
                     self.target_data = None
                     self.target_test_data = None
                     self.input_test_data = None
-                    print(f"🔄 再構成モード: ターゲットデータは使用しません")
+                    print(f"再構成モード: ターゲットデータは使用しません")
 
                     # 柔軟なキー探索: 優先度順で適切なデータを自動選択（画像データ対応）
                     candidate_keys = ['Y', 'X', 'data', 'arr_0', 'train_obs', 'test_obs']
@@ -252,7 +252,7 @@ class UniversalTimeSeriesDataset(Dataset):
                             if ((candidate.ndim == 2 and candidate.shape[0] > 1) or
                                 (candidate.ndim == 4 and candidate.shape[0] > 1)):
                                 raw_data = candidate
-                                print(f"💡 npzファイルからキー '{key}' を使用: shape={candidate.shape}")
+                                print(f"npzファイルからキー '{key}' を使用: shape={candidate.shape}")
                                 break
 
                     # 優先キーがない場合、利用可能な全キーから最適なものを選択
@@ -265,7 +265,7 @@ class UniversalTimeSeriesDataset(Dataset):
                                 ((candidate.ndim == 2 and candidate.shape[0] > 1 and candidate.shape[1] > 0) or
                                  (candidate.ndim == 4 and candidate.shape[0] > 1))):
                                 raw_data = candidate
-                                print(f"💡 npzファイルから推定キー '{key}' を使用: shape={candidate.shape}")
+                                print(f"npzファイルから推定キー '{key}' を使用: shape={candidate.shape}")
                                 break
 
                     # それでも見つからない場合はエラー
@@ -292,14 +292,14 @@ class UniversalTimeSeriesDataset(Dataset):
                 if raw_data.ndim == 1:
                     # 1次元の場合は単変量時系列として扱う
                     raw_data = raw_data.reshape(-1, 1)
-                    print(f"💡 npyファイル: 1次元データを2次元に変換 shape={raw_data.shape}")
+                    print(f"npyファイル: 1次元データを2次元に変換 shape={raw_data.shape}")
                 elif raw_data.ndim > 2:
                     # 3次元以上の場合は最初の2次元を使用
                     original_shape = raw_data.shape
                     raw_data = raw_data.reshape(raw_data.shape[0], -1)
-                    print(f"💡 npyファイル: {original_shape} → {raw_data.shape} に変換")
+                    print(f"npyファイル: {original_shape} → {raw_data.shape} に変換")
                 elif raw_data.ndim == 2:
-                    print(f"💡 npyファイル: 2次元データを使用 shape={raw_data.shape}")
+                    print(f"npyファイル: 2次元データを使用 shape={raw_data.shape}")
                 else:
                     raise DataLoaderError(f"npyファイルのデータが0次元です: shape={raw_data.shape}")
                 
@@ -337,7 +337,7 @@ class UniversalTimeSeriesDataset(Dataset):
         elif data.ndim == 4:
             # 画像データ (T, H, W, C) - RKN画像データ対応
             T, H, W, C = data.shape
-            print(f"📸 画像データ検出: {data.shape} (T={T}, H={H}, W={W}, C={C})")
+            print(f"画像データ検出: {data.shape} (T={T}, H={H}, W={W}, C={C})")
             # 画像データはそのまま保持（フラット化しない）
         else:
             raise DataLoaderError(f"サポートしていないデータ形状: {data.shape}. サポート形状: (T,), (T, d), (T, H, W, C)")
@@ -373,7 +373,7 @@ class UniversalTimeSeriesDataset(Dataset):
                                 col_data[missing_idx] = 0.0
                 elif data.ndim == 4:
                     # 4次元画像データの場合は0で置換（uint8画像データは通常欠損値なし）
-                    print("📸 画像データの欠損値を0で置換")
+                    print("画像データの欠損値を0で置換")
                     data = np.nan_to_num(data, nan=0.0, posinf=255.0, neginf=0.0)
 
             elif handle_missing == "forward_fill":
@@ -432,7 +432,7 @@ class UniversalTimeSeriesDataset(Dataset):
 
         elif method == "unit_scale":
             # Unit Scale正規化: [0, 255] → [0, 1] (画像用)
-            print(f"🎨 Unit Scale正規化: {data.dtype} [{data.min()}, {data.max()}] → [0, 1]")
+            print(f"Unit Scale正規化: {data.dtype} [{data.min()}, {data.max()}] → [0, 1]")
             if data.dtype == np.uint8:
                 # uint8画像データ: [0, 255] → [0, 1]
                 normalized = data.astype(np.float32) / 255.0
@@ -1038,7 +1038,7 @@ if __name__ == "__main__":
             else:
                 print(f"  {split}: {type(data)}")
         
-        print("\n✅ 統一データローダーのテストが完了しました")
+        print("\n統一データローダーのテストが完了しました")
         
     finally:
         # テストファイル削除

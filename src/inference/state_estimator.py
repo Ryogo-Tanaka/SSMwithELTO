@@ -307,7 +307,7 @@ class StateEstimator:
                 max_horizon = (T_cal - 1) // 2  # N >= 1を保証するための最大horizon
                 if past_horizon > max_horizon:
                     past_horizon = max(1, max_horizon)
-                    print(f"⚠️  past_horizon調整: {realization_config.get('past_horizon', 10)} → {past_horizon} (データ長: {T_cal})")
+                    print(f"past_horizon調整: {realization_config.get('past_horizon', 10)} → {past_horizon} (データ長: {T_cal})")
 
                 self.realization = Realization(
                     past_horizon=past_horizon,

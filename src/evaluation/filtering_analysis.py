@@ -102,7 +102,7 @@ class FilteringAnalyzer:
             self._save_analysis_results(complete_analysis, experiment_name)
             
         if verbose:
-            print(f"\n✅ 分析完了: {experiment_name}")
+            print(f"\n分析完了: {experiment_name}")
             print(f"📁 結果保存先: {self.output_dir}")
             
         return complete_analysis
@@ -116,7 +116,7 @@ class FilteringAnalyzer:
     ) -> Dict[str, Any]:
         """バッチフィルタリングの分析"""
         if verbose:
-            print("\n📊 バッチフィルタリング分析...")
+            print("\nバッチフィルタリング分析...")
             
         # フィルタリング実行
         start_time = datetime.now()
@@ -148,7 +148,7 @@ class FilteringAnalyzer:
             processing_time = (end_time - start_time).total_seconds()
             
             if verbose:
-                print(f"  ✅ バッチフィルタリング完了 ({processing_time:.2f}秒)")
+                print(f"  バッチフィルタリング完了 ({processing_time:.2f}秒)")
                 print(f"  📏 推定状態形状: {X_means.shape}")
                 print(f"  📏 共分散形状: {X_covariances.shape}")
                 
@@ -169,8 +169,8 @@ class FilteringAnalyzer:
             if verbose:
                 print(f"  ❌ バッチフィルタリングエラー: {e}")
                 print(f"  🔍 エラータイプ: {type(e).__name__}")
-                print(f"  📊 データ形状: {test_data.shape} (dtype: {test_data.dtype})")
-                print(f"  🎯 モデルタイプ: {type(inference_model).__name__}")
+                print(f"  データ形状: {test_data.shape} (dtype: {test_data.dtype})")
+                print(f"  モデルタイプ: {type(inference_model).__name__}")
                 print(f"  🔧 利用可能なfilterメソッド: {error_details['filter_methods']}")
                 print(f"  ⚙️  モデルセットアップ状況: {error_details['model_setup_status']}")
                 print(f"  📝 詳細トレース:\n{traceback.format_exc()}")
@@ -256,7 +256,7 @@ class FilteringAnalyzer:
             likelihoods_online = torch.tensor(online_likelihoods)
             
             if verbose:
-                print(f"  ✅ オンラインフィルタリング完了 ({total_time:.2f}秒)")
+                print(f"  オンラインフィルタリング完了 ({total_time:.2f}秒)")
                 print(f"  📏 推定状態形状: {X_means_online.shape}")
                 print(f"  ⚡ 平均ステップ時間: {np.mean(step_times):.4f}秒")
                 
@@ -279,8 +279,8 @@ class FilteringAnalyzer:
             if verbose:
                 print(f"  ❌ オンラインフィルタリングエラー: {e}")
                 print(f"  🔍 エラータイプ: {type(e).__name__}")
-                print(f"  📊 データ形状: {test_data.shape} (dtype: {test_data.dtype})")
-                print(f"  🎯 モデルタイプ: {type(inference_model).__name__}")
+                print(f"  データ形状: {test_data.shape} (dtype: {test_data.dtype})")
+                print(f"  モデルタイプ: {type(inference_model).__name__}")
                 print(f"  🔧 利用可能なresetメソッド: {error_details['reset_methods']}")
                 print(f"  🌊 利用可能なstreamingメソッド: {error_details['streaming_methods']}")
                 print(f"  ⚙️  モデルセットアップ状況: {error_details['model_setup_status']}")
@@ -404,7 +404,7 @@ class FilteringAnalyzer:
     
     def _print_batch_summary(self, metrics: Dict, processing_time: float):
         """バッチ結果サマリ出力"""
-        print(f"\n  📊 バッチフィルタリング結果:")
+        print(f"\n  バッチフィルタリング結果:")
         print(f"    処理時間: {processing_time:.4f}秒")
         
         if 'accuracy' in metrics:
@@ -526,7 +526,7 @@ class FilteringAnalyzer:
                         analysis['online_filtering']['total_processing_time']
                     ])
                     
-        print(f"📊 メトリクスCSV保存: {csv_path}")
+        print(f"メトリクスCSV保存: {csv_path}")
     
     def _save_numerical_data(self, analysis: Dict, experiment_name: str, timestamp: str):
         """数値データをNPZ形式で保存"""

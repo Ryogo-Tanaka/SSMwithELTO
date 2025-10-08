@@ -49,12 +49,12 @@ def build_decoder(cfg, experiment_mode=None):
         if cfg_type in _TARGET_DECODERS:
             # <type>_targetDecoderが存在する場合は使用
             cls = _TARGET_DECODERS[cfg_type]
-            print(f"🎯 ターゲット予測モード: {cfg_type}_targetDecoderを使用")
+            print(f"ターゲット予測モード: {cfg_type}_targetDecoderを使用")
         else:
             # fallback: 通常のDecoderを使用（警告表示）
             if cfg_type in _DECODERS:
                 cls = _DECODERS[cfg_type]
-                print(f"⚠️ 警告: {cfg_type}_targetDecoderが見つかりません。通常の{cfg_type}Decoderを使用します")
+                print(f"警告: {cfg_type}_targetDecoderが見つかりません。通常の{cfg_type}Decoderを使用します")
             else:
                 available_types = list(_DECODERS.keys())
                 available_target_types = list(_TARGET_DECODERS.keys())

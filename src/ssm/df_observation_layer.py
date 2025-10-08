@@ -428,7 +428,7 @@ class DFObservationLayer(nn.Module):
         if T_eff < max(n_blocks * min_block_size, 100):
             # データ不足時：従来の全データRidge回帰（勾配あり）
             U_B = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
-            M_pred = (H_features @ U_B)  # TODO: 多変量対応修正 - U_B.T -> U_B (T-1, d_B) @ (d_B, m) = (T-1, m)
+            M_pred = (H_features @ U_B)  # (T-1, d_B) @ (d_B, m) = (T-1, m)
             return M_pred, U_B
 
         # クロスフィッティング実行
@@ -452,7 +452,7 @@ class DFObservationLayer(nn.Module):
             for k in range(cf_manager.n_blocks):
                 block_indices = cf_manager.get_block_indices(k)
                 H_block = H_features[block_indices]
-                M_pred_cf[block_indices] = H_block @ U_B_list[k]  # TODO: 多変量対応修正 - U_B_list[k].T -> U_B_list[k]
+                M_pred_cf[block_indices] = H_block @ U_B_list[k]
 
             # 最終U_B：全データでの推定（勾配あり、正則化用）
             U_B_final = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
@@ -859,7 +859,7 @@ class DFObservationLayer(nn.Module):
             return U_B.T @ h_pred    # (m,) - スカラー入力: U_B^T @ h
         else:
             h_pred = (V_B @ phi_prev.T).T  # (batch, d_B)
-            return h_pred @ U_B    # TODO: 多変量対応修正 - U_B.T -> U_B for batch input
+            return h_pred @ U_B
     
     def predict_sequence(
         self,

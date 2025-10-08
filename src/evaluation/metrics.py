@@ -247,7 +247,7 @@ class StateEstimationMetrics:
     def _print_metrics_summary(self, metrics: Dict) -> None:
         """メトリクス結果のターミナル出力"""
         print("\n" + "="*50)
-        print("📊 フィルタリング性能評価結果")
+        print("フィルタリング性能評価結果")
         print("="*50)
         
         # 基本統計
@@ -262,7 +262,7 @@ class StateEstimationMetrics:
         # 精度指標
         if 'accuracy' in metrics:
             acc = metrics['accuracy']
-            print(f"\n🎯 推定精度:")
+            print(f"\n推定精度:")
             print(f"  MSE: {acc['mse']:.6f}")
             print(f"  MAE: {acc['mae']:.6f}")
             print(f"  RMSE: {acc['rmse']:.6f}")
@@ -419,7 +419,7 @@ def print_comparison_summary(
         acc1 = method1_metrics['accuracy']
         acc2 = method2_metrics['accuracy']
 
-        print(f"\n📊 精度比較:")
+        print(f"\n精度比較:")
         print(f"  MSE:  {method1_name}: {acc1['mse']:.6f}  |  {method2_name}: {acc2['mse']:.6f}")
         print(f"  MAE:  {method1_name}: {acc1['mae']:.6f}  |  {method2_name}: {acc2['mae']:.6f}")
         print(f"  RMSE: {method1_name}: {acc1['rmse']:.6f}  |  {method2_name}: {acc2['rmse']:.6f}")
@@ -428,7 +428,7 @@ def print_comparison_summary(
         mse_improvement = (acc1['mse'] - acc2['mse']) / acc1['mse'] * 100
         mae_improvement = (acc1['mae'] - acc2['mae']) / acc1['mae'] * 100
 
-        print(f"\n💡 改善率 ({method2_name} vs {method1_name}):")
+        print(f"\n改善率 ({method2_name} vs {method1_name}):")
         print(f"  MSE改善: {mse_improvement:+.2f}%")
         print(f"  MAE改善: {mae_improvement:+.2f}%")
 
@@ -511,10 +511,10 @@ class TargetPredictionMetrics:
                 try:
                     results[metric] = available_metrics[metric]()
                 except Exception as e:
-                    print(f"⚠️  指標 '{metric}' の計算でエラー: {e}")
+                    print(f"指標 '{metric}' の計算でエラー: {e}")
                     results[metric] = None
             else:
-                print(f"⚠️  未知の指標: '{metric}'. 利用可能: {list(available_metrics.keys())}")
+                print(f"未知の指標: '{metric}'. 利用可能: {list(available_metrics.keys())}")
 
         # ターミナル出力（既存パターンと統一）
         if verbose:
@@ -560,7 +560,7 @@ class TargetPredictionMetrics:
         with open(save_file, 'w') as f:
             json.dump(save_data, f, indent=2, ensure_ascii=False)
 
-        print(f"✅ ターゲット予測評価結果保存: {save_file}")
+        print(f"ターゲット予測評価結果保存: {save_file}")
         return str(save_file)
 
     def create_target_visualizations(
@@ -590,7 +590,7 @@ class TargetPredictionMetrics:
         """
         # TODO: 実装検討中
         # 可視化機能は一旦無効化し、数値出力・保存のみに変更
-        print(f"🔄 可視化処理はスキップ（数値出力・保存機能で代替）")
+        print(f"可視化処理はスキップ（数値出力・保存機能で代替）")
 
         generated_files = []
         # 可視化コードはコメントアウト
@@ -605,10 +605,10 @@ class TargetPredictionMetrics:
         #         if save_path:
         #             generated_files.append(str(save_path))
         #     except Exception as e:
-        #         print(f"⚠️  指標 '{metric}' の可視化でエラー: {e}")
+        #         print(f"指標 '{metric}' の可視化でエラー: {e}")
         #
         # if output_dir and generated_files:
-        #     print(f"✅ ターゲット予測可視化生成完了: {len(generated_files)}個のファイル")
+        #     print(f"ターゲット予測可視化生成完了: {len(generated_files)}個のファイル")
         #     print(f"📁 保存先: {output_dir}")
 
         return generated_files
@@ -620,7 +620,7 @@ class TargetPredictionMetrics:
             y_pred_np = y_pred.cpu().numpy()
             return float(r2_score(y_true_np, y_pred_np, multioutput='uniform_average'))
         except Exception as e:
-            print(f"⚠️  R²計算エラー: {e}")
+            print(f"R²計算エラー: {e}")
             return 0.0
 
     def _compute_r2_per_dimension(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> List[float]:
@@ -631,7 +631,7 @@ class TargetPredictionMetrics:
             r2_values = r2_score(y_true_np, y_pred_np, multioutput='raw_values')
             return r2_values.tolist()
         except Exception as e:
-            print(f"⚠️  次元別R²計算エラー: {e}")
+            print(f"次元別R²計算エラー: {e}")
             return [0.0]
 
     def _plot_individual_metric(
@@ -653,7 +653,7 @@ class TargetPredictionMetrics:
         """
         # TODO: 実装検討中
         # 可視化機能は一旦無効化、数値出力・保存機能で代替
-        print(f"🔄 可視化機能（{metric}）はスキップされました")
+        print(f"可視化機能（{metric}）はスキップされました")
 
         # 全ての可視化コードをコメントアウト
         # plt.style.use('default')  # スタイル初期化
@@ -763,14 +763,14 @@ class TargetPredictionMetrics:
         # if save_path:
         #     save_path.parent.mkdir(parents=True, exist_ok=True)
         #     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        #     print(f"📊 可視化保存: {save_path}")
+        #     print(f"可視化保存: {save_path}")
         #
         # plt.close()  # メモリリーク防止
 
     def _print_target_metrics_summary(self, metrics: Dict[str, Union[float, List[float]]]) -> None:
         """ターゲット予測メトリクス結果のターミナル出力（既存パターンと統一）"""
         print("\n" + "="*50)
-        print("🎯 ターゲット予測評価結果")
+        print("ターゲット予測評価結果")
         print("="*50)
 
         for metric_name, value in metrics.items():
@@ -850,7 +850,7 @@ class ReconstructionMetrics:
 
         # 形状確認・警告
         if y_true.shape != y_pred.shape:
-            print(f"⚠️  形状不一致: y_true{y_true.shape} vs y_pred{y_pred.shape}")
+            print(f"形状不一致: y_true{y_true.shape} vs y_pred{y_pred.shape}")
             return {'error': 1.0}
 
         results = {}
@@ -864,11 +864,11 @@ class ReconstructionMetrics:
                 elif metric == 'temporal_correlation':
                     results[metric] = self._compute_temporal_correlation(y_true, y_pred)
                 else:
-                    print(f"⚠️  未知の指標: '{metric}'")
+                    print(f"未知の指標: '{metric}'")
                     results[metric] = 0.0
 
             except Exception as e:
-                print(f"⚠️  指標 '{metric}' 計算エラー: {e}")
+                print(f"指標 '{metric}' 計算エラー: {e}")
                 results[metric] = 0.0
 
         # ターミナル出力
@@ -898,7 +898,7 @@ class ReconstructionMetrics:
         """
         # TODO: 可視化機能は段階的実装
         # Step 8では評価指標計算に集中し、可視化は後続で実装
-        print(f"🔄 可視化処理はスキップ（数値出力・保存機能で代替）")
+        print(f"可視化処理はスキップ（数値出力・保存機能で代替）")
 
         generated_files = []
         return generated_files
@@ -926,7 +926,7 @@ class ReconstructionMetrics:
             return float(psnr.item())
 
         except Exception as e:
-            print(f"⚠️  PSNR計算エラー: {e}")
+            print(f"PSNR計算エラー: {e}")
             return 0.0
 
     def _compute_temporal_correlation(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
@@ -958,13 +958,13 @@ class ReconstructionMetrics:
                 return 0.0
 
         except Exception as e:
-            print(f"⚠️  時系列相関計算エラー: {e}")
+            print(f"時系列相関計算エラー: {e}")
             return 0.0
 
     def _print_reconstruction_metrics_summary(self, results: Dict[str, float]):
         """再構成評価結果ターミナル出力（統一フォーマット）"""
         print("\n" + "="*50)
-        print("📊 データ再構成評価結果 (Reconstruction Metrics)")
+        print("データ再構成評価結果 (Reconstruction Metrics)")
         print("="*50)
 
         for metric, value in results.items():

@@ -788,7 +788,7 @@ class Realization:
         if max_available <= 0:
             # past_horizonを自動調整
             h_new = max(1, (T - 1) // 2)
-            print(f"⚠️  realization調整: past_horizon {h} → {h_new} (データ長: {T})")
+            print(f"realization調整: past_horizon {h} → {h_new} (データ長: {T})")
             h = h_new
             self.h = h_new  # 属性も更新
             max_available = T - 2 * h

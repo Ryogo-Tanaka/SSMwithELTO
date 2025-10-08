@@ -111,7 +111,7 @@ class UncertaintyEvaluator:
                 stats['uncertainty_std_per_dimension'] = uncertainties.std(dim=0).tolist()
             
             if verbose:
-                print(f"\n📊 不確実性基本統計:")
+                print(f"\n不確実性基本統計:")
                 print(f"  平均不確実性: {stats['mean_uncertainty']:.6f}")
                 print(f"  不確実性標準偏差: {stats['std_uncertainty']:.6f}")
                 print(f"  不確実性範囲: [{stats['min_uncertainty']:.6f}, {stats['max_uncertainty']:.6f}]")
@@ -168,7 +168,7 @@ class UncertaintyEvaluator:
             }
         
         if verbose:
-            print(f"\n🎯 信頼区間評価:")
+            print(f"\n信頼区間評価:")
             for level, result in interval_results.items():
                 expected = result['expected_coverage']
                 actual = result['actual_coverage']
@@ -235,7 +235,7 @@ class UncertaintyEvaluator:
             }
             
             if verbose:
-                print(f"\n🎯 キャリブレーション評価:")
+                print(f"\nキャリブレーション評価:")
                 print(f"  Expected Calibration Error: {ece:.4f}")
                 print(f"  正規化残差 - 平均: {residual_stats['mean_normalized_error']:.4f}")
                 print(f"  正規化残差 - 標準偏差: {residual_stats['std_normalized_error']:.4f}")
@@ -293,7 +293,7 @@ class UncertaintyEvaluator:
             }
             
             if verbose:
-                print(f"\n💡 不確実性有用性:")
+                print(f"\n不確実性有用性:")
                 print(f"  誤差-不確実性相関: {correlation:.4f}")
                 print(f"  不確実性効果: {uncertainty_effectiveness:.4f}")
             
@@ -522,7 +522,7 @@ class UncertaintyEvaluator:
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"🎨 不確実性可視化保存: {plot_path}")
+        print(f"不確実性可視化保存: {plot_path}")
     
     def _plot_calibration_curve(
         self, 
@@ -558,11 +558,11 @@ class UncertaintyEvaluator:
     
     def _print_uncertainty_summary(self, results: Dict):
         """不確実性評価サマリ出力"""
-        print(f"\n✅ 不確実性定量化評価完了")
+        print(f"\n不確実性定量化評価完了")
         print("="*50)
         
         if 'confidence_intervals' in results:
-            print(f"\n🎯 主要カバレッジ結果:")
+            print(f"\n主要カバレッジ結果:")
             ci_results = results['confidence_intervals']
             for level in [68, 95]:
                 key = f'confidence_{level}'
@@ -572,12 +572,12 @@ class UncertaintyEvaluator:
         
         if 'calibration' in results:
             cal_results = results['calibration']
-            print(f"\n🎯 キャリブレーション:")
+            print(f"\nキャリブレーション:")
             print(f"  ECE: {cal_results['ece']:.4f}")
             
         if 'uncertainty_utility' in results:
             utility = results['uncertainty_utility']
-            print(f"\n💡 不確実性有用性:")
+            print(f"\n不確実性有用性:")
             print(f"  誤差-不確実性相関: {utility['error_uncertainty_correlation']:.4f}")
 
 

@@ -1,4 +1,4 @@
-# ===== src/training/two_stage_trainer.py 完全修正版 =====
+# =
 # 修正1-4統合: 時間調整 + 計算グラフ分離 + ヘルパー関数
 
 """
@@ -354,9 +354,9 @@ class TwoStageTrainer:
         if experiment_mode == "target_prediction" and 'target_decoder' in config['model']:
             target_decoder_config = config['model']['target_decoder'].copy()
             target_decoder = build_decoder(target_decoder_config, experiment_mode="target_prediction")
-            print(f"✅ target_decoder作成完了: {target_decoder_config.get('type', 'unknown')}")
+            print(f"target_decoder作成完了: {target_decoder_config.get('type', 'unknown')}")
         elif experiment_mode == "target_prediction":
-            print(f"⚠️  target_prediction mode指定されましたが、target_decoderの設定が見つかりません")
+            print(f"target_prediction mode指定されましたが、target_decoderの設定が見つかりません")
 
         # 確率実現（新しいクラス優先）
         realization_config = config['ssm']['realization']
@@ -676,7 +676,7 @@ class TwoStageTrainer:
         # target_decoder設定（experiment_mode対応）
         if target_decoder is not None:
             self.target_decoder = target_decoder.to(device)
-            print(f"✅ target_decoder設定完了: {type(target_decoder).__name__}")
+            print(f"target_decoder設定完了: {type(target_decoder).__name__}")
         else:
             self.target_decoder = None
 
@@ -695,12 +695,12 @@ class TwoStageTrainer:
         # **修正4: 時間調整用の状態管理**
         self._last_X_states_length = None  # 状態系列長キャッシュ
         
-        # ===== 追加：Kalman関連設定 =====
+        # =
         self.use_kalman_filtering = use_kalman_filtering
         self.calibration_ratio = calibration_ratio
         self.auto_inference_setup = auto_inference_setup
         
-        # ===== 追加：Kalman用データ =====
+        # =
         self.calibration_data: Optional[torch.Tensor] = None
         self.inference_model: Optional[Any] = None
 
@@ -811,7 +811,8 @@ class TwoStageTrainer:
         """
         # 初回のみデータ形状を表示
         if 'input_data_shape' not in self._static_logs_shown:
-            print(f"📊 入力データ: Y_train.shape = {Y_train.shape}")
+            # データ形状確認（デバッグ用）
+            # print(f"データ: {Y_train.shape}")
             self._static_logs_shown.add('input_data_shape')
 
         # 入力データをGPUに移動
@@ -836,12 +837,12 @@ class TwoStageTrainer:
 
         # 初回のみエンコーダ出力形状を表示
         if 'encoder_output_shape' not in self._static_logs_shown:
-            print(f"📊 エンコーダ出力: M_features.shape = {M_features.shape} (多変量特徴量)")
+            # print(f"エンコーダ出力: {M_features.shape}")
             self._static_logs_shown.add('encoder_output_shape')
 
         # 2. StochasticRealizationWithEncoderを使用して多変量特徴量を直接処理
         
-        # ===== 追加：キャリブレーションデータ分割 =====
+        # =
         if hasattr(self, 'use_kalman_filtering') and self.use_kalman_filtering:
             n_calib = int(Y_train.size(0) * getattr(self, 'calibration_ratio', 0.1))
             self.calibration_data = Y_train[:n_calib].clone()
@@ -856,7 +857,7 @@ class TwoStageTrainer:
                 self.realization.fit(Y_train, self.encoder)
                 X_states = self.realization.estimate_states(Y_train)
                 if 'stochastic_realization_shapes' not in self._static_logs_shown:
-                    print(f"📊 StochasticRealization使用: {Y_train.shape} → M_features={M_features.shape} → X_states={X_states.shape}")
+                    # print(f"状態推定: {Y_train.shape} → {X_states.shape}")
                     self._static_logs_shown.add('stochastic_realization_shapes')
             else:
                 # 従来のRealizationの場合：多変量特徴量をスカラー化
@@ -864,14 +865,14 @@ class TwoStageTrainer:
                 self.realization.fit(m_scalar.unsqueeze(1))  # (T,) → (T, 1)
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
                 if 'traditional_realization_shapes' not in self._static_logs_shown:
-                    print(f"📊 従来Realization使用: M_features={M_features.shape} → m_scalar={m_scalar.shape} → X_states={X_states.shape}")
+                    # print(f"従来Realization: {M_features.shape} → {X_states.shape}")
                     self._static_logs_shown.add('traditional_realization_shapes')
         except RealizationError as e:
-            print(f"⚠️ RealizationError発生: {e}")
+            print(f"RealizationError発生: {e}")
             # RealizationErrorを上位に再投げして完全エポックスキップを実行
             raise RealizationError(f"Phase1 realization failed: {e}") from e
 
-        # ===== 追加：Kalman使用時の分岐処理（StochasticRealizationWithEncoder対応）=====
+        # =
         if (hasattr(self, 'use_kalman_filtering') and self.use_kalman_filtering and
             hasattr(self, 'phase1_complete') and self.phase1_complete and
             hasattr(self, 'df_state') and self.df_state is not None and
@@ -894,7 +895,7 @@ class TwoStageTrainer:
                     print(f"Kalman filtering applied: {X_means.shape}")
                     self._static_logs_shown.add('kalman_filtering_shape')
 
-                # ===== 重要：共分散は内部保存、戻り値は既存形式 =====
+                # =
                 self._last_covariances = X_covariances  # 新しい内部属性
                 X_states = X_means  # 既存変数名で返す
 
@@ -929,7 +930,7 @@ class TwoStageTrainer:
         Returns:
             Phase-1メトリクス
         """
-        print("\n=== Phase-1: DF学習開始 ===")
+        print("\n=")
 
         # データ準備（多変量特徴量対応）
         M_features, X_states = self._prepare_data(Y_train)
@@ -965,7 +966,7 @@ class TwoStageTrainer:
                 self._save_checkpoint(epoch, TrainingPhase.PHASE1_DF_A)
         
         # Phase-1完了後: DFLayerのfit()でV_A/V_B/U_A/u_Bを計算
-        print("🔄 最終作用素（V_A/V_B/U_A/u_B）計算中...")
+        print("最終作用素（V_A/V_B/U_A/u_B）計算中...")
         self._compute_final_operators(Y_train)
 
         self.phase1_complete = True
@@ -1000,19 +1001,19 @@ class TwoStageTrainer:
             X_plus = X_states[1:]      # x_{t}: t=1,...,T-1 (元の学習と同じ)
 
         # DF-A: V_A, U_A計算
-        print("  🔄 DF-A作用素（V_A/U_A）計算中...")
+        print("  DF-A作用素（V_A/U_A）計算中...")
         if hasattr(self.df_state, 'cf_config') and self.df_state.cf_config:
             self.df_state._fit_with_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=True)
         else:
             self.df_state._fit_without_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=True)
 
         if 'v_a_u_a_shapes' not in self._static_logs_shown:
-            print(f"  ✅ V_A shape: {self.df_state.V_A.shape}, U_A shape: {self.df_state.U_A.shape}")
+            # print(f"  DF-A学習完了: V_A={self.df_state.V_A.shape}, U_A={self.df_state.U_A.shape}")
             self._static_logs_shown.add('v_a_u_a_shapes')
 
         # DFObservationLayer用データ準備（DF-Aの結果を使用）
         if hasattr(self, 'df_obs') and self.df_obs is not None:
-            print("  🔄 DF-B作用素（V_B/u_B）計算中...")
+            print("  DF-B作用素（V_B/u_B）計算中...")
 
             # DF-Aによる1ステップ予測とエンコーダ出力の正しい使用
             with torch.no_grad():
@@ -1047,8 +1048,8 @@ class TwoStageTrainer:
                 m_curr = m_curr[:min_size]     # m_t
 
             if 'df_b_learning_data' not in self._static_logs_shown:
-                print(f"    📊 DF-B学習データ: Phi_pred={Phi_pred.shape}, Psi_curr={Psi_curr.shape}, m_curr={m_curr.shape}")
-                print(f"    🕐 時間範囲: h={h}, T_states={T_states}, range=[{h}:{h+T_states}]")
+                # print(f"    DF-B: Phi_pred={Phi_pred.shape}, Psi_curr={Psi_curr.shape}")
+                # print(f"    時間範囲: h={h}, T_states={T_states}")
                 self._static_logs_shown.add('df_b_learning_data')
 
             # DF-B: V_B, u_B計算 (φ_θ(x̂_{t|t-1}) → ψ_ω(h_t)の写像学習)
@@ -1058,10 +1059,10 @@ class TwoStageTrainer:
                 self.df_obs._fit_without_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=True)
 
             if 'v_b_u_b_shapes' not in self._static_logs_shown:
-                print(f"  ✅ V_B shape: {self.df_obs.V_B.shape}, U_B shape: {self.df_obs.U_B.shape}")
+                # print(f"  DF-B学習完了: V_B={self.df_obs.V_B.shape}, U_B={self.df_obs.U_B.shape}")
                 self._static_logs_shown.add('v_b_u_b_shapes')
 
-        print("🔄 最終作用素計算完了")
+        print("最終作用素計算完了")
 
         # Phase-1完了時に正準相関係数をログ記録
         try:
@@ -1073,10 +1074,9 @@ class TwoStageTrainer:
 
                 if self.config.verbose:
                     rho_values = canonical_correlations.cpu().numpy()
-                    print(f"  📊 Phase-1完了時正準相関係数: sum={rho_values.sum():.4f}, "
-                          f"min={rho_values.min():.4f}, max={rho_values.max():.4f}")
+                    # print(f"  CCA: sum={rho_values.sum():.4f}")
         except Exception as e:
-            print(f"⚠️ Phase-1完了時正準相関係数ログ記録エラー: {e}")
+            print(f"Phase-1完了時正準相関係数ログ記録エラー: {e}")
 
     def _train_df_a_epoch(self, X_states: torch.Tensor, epoch: int) -> Dict[str, float]:
         """
@@ -1231,7 +1231,7 @@ class TwoStageTrainer:
             Y_train: 訓練観測系列
             Y_val: 検証観測系列（オプション）
         """
-        print("\n=== Phase-2: End-to-end微調整開始 ===")
+        print("\n=")
 
         # Phase-2開始時のデバイス状態初期化（Phase-1後の状態リセット）
         if 'device_allocation' not in self._static_logs_shown:
@@ -1264,7 +1264,7 @@ class TwoStageTrainer:
                 opt_e2e.step()
                 
             except RealizationError as e:
-                print(f"🔄 Epoch {epoch} スキップ (Phase2数値実現失敗): {e}")
+                print(f"Epoch {epoch} スキップ (Phase2数値実現失敗): {e}")
                 # このエポックを完全スキップして次のエポックに進む
                 continue
             
@@ -1307,7 +1307,7 @@ class TwoStageTrainer:
         Returns:
             統合学習結果
         """
-        print(f"\n=== 統合学習開始: {self.config.epochs}エポック ===")
+        print(f"\n=")
 
         # 初期データ準備
         M_features, X_states = self._prepare_data(Y_train)
@@ -1374,10 +1374,10 @@ class TwoStageTrainer:
                     self._save_checkpoint(epoch, TrainingPhase.PHASE2_E2E)
 
             except Exception as e:
-                print(f"⚠️ エポック {epoch} でエラー発生: {e}")
+                print(f"エポック {epoch} でエラー発生: {e}")
                 continue
 
-        print(f"✅ 統合学習完了 ({self.config.epochs}エポック)")
+        print(f"統合学習完了 ({self.config.epochs}エポック)")
         return self.training_history
 
     def _train_integrated_phase1_epoch(self, X_states: torch.Tensor, M_features: torch.Tensor,
@@ -1442,7 +1442,7 @@ class TwoStageTrainer:
             }
 
         except RealizationError as e:
-            print(f"🔄 エポック {epoch} Phase-2スキップ (数値実現失敗): {e}")
+            print(f"エポック {epoch} Phase-2スキップ (数値実現失敗): {e}")
             # 既存パターンに合わせたエラー処理
             return {
                 'epoch': epoch,
@@ -1473,7 +1473,7 @@ class TwoStageTrainer:
                 self.realization.fit(Y_train, self.encoder)
 
         except Exception as e:
-            print(f"⚠️ 軽量作用素更新でエラー: {e}")
+            print(f"軽量作用素更新でエラー: {e}")
 
     def _initialize_phase2_optimizer(self):
         """
@@ -1491,7 +1491,7 @@ class TwoStageTrainer:
                 {'params': list(self.decoder.parameters()), 'lr': self.config.lr_decoder}
             ]
 
-            # ======== 追加: component_transformsのパラメータをエンコーダーグループに追加 (Step 14) ========
+            # =
             # StochasticRealizationWithEncoderの場合、feature mappingパラメータを含める
             if hasattr(self.realization, 'component_transforms') and \
                self.realization.component_transforms is not None:
@@ -1508,10 +1508,10 @@ class TwoStageTrainer:
                     {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
                     {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi}
                 ])
-                print("⚠️ Phase-2でDF層も更新します（update_strategy='all'）")
+                print("Phase-2でDF層も更新します（update_strategy='all'）")
             else:
                 # 標準設計：encoder/decoderのみ更新
-                print("✅ Phase-2はencoder/decoderのみ更新（設計通り）")
+                print("Phase-2はencoder/decoderのみ更新（設計通り）")
 
             self.optimizers['e2e'] = torch.optim.Adam(param_groups)
 
@@ -1566,7 +1566,7 @@ class TwoStageTrainer:
                 self.realization.fit(m_scalar.unsqueeze(1))
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
         except RealizationError as e:
-            print(f"⚠️ Phase2 RealizationError発生: {e}")
+            print(f"Phase2 RealizationError発生: {e}")
             # RealizationErrorを上位に再投げして完全エポックスキップを実行
             raise RealizationError(f"Phase2 realization failed: {e}") from e
 
@@ -1637,7 +1637,7 @@ class TwoStageTrainer:
                 self.realization.fit(m_scalar.unsqueeze(1))
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
         except RealizationError as e:
-            print(f"⚠️ Phase2 Target RealizationError発生: {e}")
+            print(f"Phase2 Target RealizationError発生: {e}")
             raise RealizationError(f"Phase2 target realization failed: {e}") from e
 
         # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}
@@ -1655,10 +1655,10 @@ class TwoStageTrainer:
         # Step 5: デコード m̂_{t|t-1} → target_pred（experiment_mode対応修正）
         if hasattr(self, 'target_decoder') and self.target_decoder is not None:
             target_pred = self.target_decoder(M_hat_tensor)  # ターゲット予測モード
-            print(f"✅ ターゲット予測モード学習: target_decoder使用 → {target_pred.shape}")
+            print(f"ターゲット予測モード学習: target_decoder使用 → {target_pred.shape}")
         else:
             target_pred = self.decoder(M_hat_tensor)  # 再構成モード（後方互換）
-            print(f"⚠️  ターゲット予測モード学習: target_decoder未設定、decoder使用 → {target_pred.shape}")
+            print(f"ターゲット予測モード学習: target_decoder未設定、decoder使用 → {target_pred.shape}")
 
         # (T_pred, state_dim) - ターゲット予測
 
@@ -1697,7 +1697,7 @@ class TwoStageTrainer:
             if canonical_correlations is None:
                 # 正準相関係数が利用できない場合の警告とフォールバック
                 if self.config.verbose:
-                    print("⚠️ 正準相関係数が利用できません。CCA損失を0とします。")
+                    print("正準相関係数が利用できません。CCA損失を0とします。")
                 return torch.tensor(0.0, requires_grad=True, device=self.device)
 
             # 正準相関係数の和の最大化 → 負号で最小化問題に変換
@@ -1746,7 +1746,7 @@ class TwoStageTrainer:
             warnings.warn(f"正準相関係数取得エラー: {e}")
             return None
     
-    # ===== 修正4: ヘルパーメソッド群 =====
+    # =
     
     def _align_time_series(self, X_hat_states: torch.Tensor, m_series: torch.Tensor, 
                           T_states: int, epoch: int, component: str) -> torch.Tensor:
@@ -2051,16 +2051,16 @@ class TwoStageTrainer:
                     if verification["status"] == "error":
                         print(f"❌ 次元エラー: {verification['errors']}")
                     elif verification["status"] == "warning":
-                        print(f"⚠️  数値警告: {verification['warnings']}")
+                        print(f"数値警告: {verification['warnings']}")
                     else:
-                        print(f"✅ 次元整合性: OK")
+                        print(f"次元整合性: OK")
 
                 self._multivariate_logged.add(phase)
 
         except Exception as e:
             print(f"❌ ログ出力エラー: {e}")
     
-    # ===== 既存メソッド（修正なし） =====
+    # =
     
     def forecast(self, Y_test: torch.Tensor, forecast_steps: int) -> torch.Tensor:
         """予測実行"""
@@ -2082,7 +2082,7 @@ class TwoStageTrainer:
             try:
                 self.realization.fit(m_warmup.unsqueeze(1))
             except RealizationError as e:
-                print(f"⚠️ Warmup RealizationError発生: {e}")
+                print(f"Warmup RealizationError発生: {e}")
                 # ウォームアップ時はエラーを上位に投げて処理をスキップ
                 raise RealizationError(f"Warmup realization failed: {e}") from e
             X_warmup = self.realization.filter(m_warmup.unsqueeze(1))
@@ -2185,8 +2185,6 @@ class TwoStageTrainer:
     
     def _save_final_model(self):
         """最終モデル保存"""
-        # # print("DEBUG: [Resolved in Step 7] _save_final_model called")  # Resolved in Step 7
-        # 学習時の完全な設定を復元
         complete_config = self._build_complete_config()
         
         model_state = {
@@ -2206,8 +2204,6 @@ class TwoStageTrainer:
     
     def _build_complete_config(self) -> Dict[str, Any]:
         """学習時の完全な設定を構築（推論時に使用）"""
-        # print("DEBUG: [Resolved in Step 7] _build_complete_config called")
-        
         complete_config = {
             'model': {
                 'encoder': {
@@ -2235,58 +2231,31 @@ class TwoStageTrainer:
                 'df_observation': self._extract_df_obs_config()
             }
         }
-        
-        # print("DEBUG: [Resolved in Step 7] _build_complete_config completed")
+
         return complete_config
     
     def _extract_df_state_config(self) -> Dict[str, Any]:
         """実際のDFStateLayerから設定を抽出"""
         base_config = self.df_state_config.copy()
-        
-        # print(f"DEBUG: [Resolved in Step 7] df_state exists: {self.df_state is not None}")
-        
-        # 実際のDFStateLayerから詳細設定を抽出
+
         if self.df_state and hasattr(self.df_state, 'phi_theta'):
-            # print("DEBUG: [Resolved in Step 7] df_state has phi_theta")
-            # StateFeatureNetの構造を解析
             phi_theta = self.df_state.phi_theta
-            # print(f"DEBUG: [Resolved in Step 7] phi_theta type: {type(phi_theta)}")
-            # print(f"DEBUG: [Resolved in Step 7] phi_theta has net: {hasattr(phi_theta, 'net')}")
-            
+
             if hasattr(phi_theta, 'net') and len(phi_theta.net) > 0:
-                # print(f"DEBUG: [Resolved in Step 7] phi_theta.net length: {len(phi_theta.net)}")
-                # print(f"DEBUG: [Resolved in Step 7] phi_theta.net layers: {[type(layer).__name__ for layer in phi_theta.net]}")
-                
-                # ネットワーク構造から hidden_sizes を逆算
                 hidden_sizes = []
-                for i, layer in enumerate(phi_theta.net):
-                    # print(f"DEBUG: [Resolved in Step 7] Layer {i}: {type(layer).__name__}")
+                for layer in enumerate(phi_theta.net):
                     if hasattr(layer, 'out_features'):
-                        # print(f"DEBUG: [Resolved in Step 7] Layer {i} out_features: {layer.out_features}")
                         hidden_sizes.append(layer.out_features)
-                
-                # print(f"DEBUG: [Resolved in Step 7] Raw hidden_sizes: {hidden_sizes}")
-                
-                # 最後の層は除く（出力層）
+
                 if len(hidden_sizes) > 1:
                     hidden_sizes = hidden_sizes[:-1]
-                    # print(f"DEBUG: [Resolved in Step 7] Final hidden_sizes: {hidden_sizes}")
-                
-                # feature_net 設定を構築
+
                 base_config['feature_net'] = {
                     'hidden_sizes': hidden_sizes,
                     'activation': getattr(phi_theta, 'activation', 'ReLU'),
                     'dropout': getattr(phi_theta, 'dropout', 0.1)
                 }
-                # print(f"DEBUG: [Resolved in Step 7] Created feature_net config: {base_config['feature_net']}")
-            else:
-                # print("DEBUG: [Resolved in Step 7] phi_theta.net not found or empty")
-                pass
-        else:
-            # print("DEBUG: [Resolved in Step 7] df_state doesn't have phi_theta")
-            pass
-        
-        # print(f"DEBUG: [Resolved in Step 7] Final base_config keys: {list(base_config.keys())}")
+
         return base_config
     
     def _extract_df_obs_config(self) -> Dict[str, Any]:
@@ -2582,12 +2551,12 @@ def run_training_experiment(
             print(f"📂 統一データローダーでデータ読み込み: {data_path}")
             data_dict = load_experimental_data(data_path, config['data'])
             Y_train = data_dict['train'].to(device)
-            print(f"📊 データ形状: {Y_train.shape} (正規化: {data_dict['metadata'].normalization_method})")
+            print(f"データ形状: {Y_train.shape} (正規化: {data_dict['metadata'].normalization_method})")
         else:
             raise ImportError("data設定がないため従来方式を使用")
             
     except (ImportError, ModuleNotFoundError, Exception) as e:
-        print(f"⚠️  統一データローダー使用不可、従来方式: {e}")
+        print(f"統一データローダー使用不可、従来方式: {e}")
         
         data = np.load(data_path)
         if 'Y' in data:

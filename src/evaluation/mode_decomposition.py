@@ -462,7 +462,7 @@ class SpectrumResultsSaver:
                             tensor_cpu = value.cpu() if value.is_cuda else value
                             npz_data[full_key] = tensor_cpu.numpy()
                     except Exception as e:
-                        print(f"⚠️  Tensor変換エラー (key: {full_key}, shape: {value.shape}, device: {value.device}, dtype: {value.dtype}): {e}")
+                        print(f"Tensor変換エラー (key: {full_key}, shape: {value.shape}, device: {value.device}, dtype: {value.dtype}): {e}")
                         # エラー時はテンソル情報のみ保存
                         npz_data[f'{full_key}_error'] = f"Conversion failed: {str(e)}"
                 elif isinstance(value, (list, tuple)):
