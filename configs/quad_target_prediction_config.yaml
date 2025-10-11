@@ -1,148 +1,162 @@
-# ====================================================================
-# ターゲット予測実験用設定ファイル
-# 用途: クアッドコプター画像からの制御状態予測学習
-# ====================================================================
+# ターゲット予測実験用設定ファイル (run_full_experiment.py用)
+# データ: data/rkn_quad/quad1_y.npz (同じデータセット、ターゲット利用)
+# アーキテクチャ: rknEncoder + ZToStateMeanDecoder
 
+# 実験モード設定（手動切り替え）
 experiment:
-  mode: "target_prediction"  # 実験モード
+  mode: "target_prediction"      # "reconstruction" or "target_prediction"
 
 # データ設定
 data:
-  train_ratio: 0.7        # 学習データ比率
-  val_ratio: 0.2          # 検証データ比率
-  test_ratio: 0.1         # テストデータ比率
-  normalization: "unit_scale"  # 正規化方式
-  batch_size: 300         # バッチサイズ
+  train_ratio: 0.7          # 学習データ比率 
+  val_ratio: 0.2            # 検証データ比率 
+  test_ratio: 0.1           # テストデータ比率 
+  normalization: "unit_scale"  # 画像正規化: 
+  batch_size: 300            # バッチサイズ 
   image_shape: [48, 48, 1]  # 画像形状 (H, W, C)
 
-# モデルアーキテクチャ
+# モデルアーキテクチャ設定 - RKN画像対応
 model:
   encoder:
-    type: "rkn"                    # エンコーダタイプ
-    input_resolution: [48, 48, 1]  # 入力解像度
-    feature_dim: 50                # 潜在次元数
-    hidden: 200                    # FC層隠れ次元
-    conv_channels: [32, 64]        # CNNチャネル数
+    type: "rkn"                    # Factory Pattern: rknEncoder選択
+    input_resolution: [48, 48, 1]  # 入力画像解像度 (H, W, C)
+    feature_dim: 50               # 潜在次元数（RKN仕様固定）
+    hidden: 200                    # FC層隠れ次元数
+    conv_channels: [32, 64]        # CNN層チャネル数
     activation: "relu"             # 活性化関数
-    normalize_input: false         # 入力正規化
-    normalize_output: false        # 出力正規化
+    normalize_input: false         # 画像用は通常False
+    normalize_output: false        # 潜在表現正規化
     track_running_stats: true      # 統計量追跡
 
+  # ターゲット予測用デコーダ（rkn_targetDecoder使用）
   target_decoder:
-    type: "rkn"              # デコーダタイプ
-    feature_dim: 50          # 入力潜在次元
-    state_dim: 8             # 出力ターゲット次元
-    hidden: 50               # 隠れ層次元
-    activation: "relu"       # 活性化関数
-    output_activation: "tanh"  # 出力活性化関数
+    type: "rkn"                   # Factory Pattern
+    feature_dim: 50               # 入力潜在次元数
+    state_dim: 8                  # 出力ターゲット次元数（制御状態）
+    hidden: 50                    # 隠れ層次元数
+    activation: "relu"            # 活性化関数
+    output_activation: "tanh"     # 出力活性化関数（[-1,1]範囲）
 
+  # 画像再構成用デコーダ（互換性のため保持）
   decoder:
-    type: "rkn"                    # デコーダタイプ（互換性保持）
-    input_resolution: [48, 48, 1]  # 出力解像度
-    feature_dim: 50                # 入力潜在次元
-    hidden: 200                    # FC層隠れ次元
-    grid: [12, 12, 64]            # 中間グリッドサイズ
-    upsample_mode: "nearest"       # アップサンプリング方法
-    conv_channels: [64, 32, 1]     # 逆畳み込みチャネル数
-    activation: "relu"             # 活性化関数
-    output_activation: "sigmoid"   # 出力活性化関数
+    type: "rkn"                   # Factory Pattern: rknDecoder選択
+    input_resolution: [48, 48, 1] # 出力画像解像度 (H, W, C)
+    feature_dim: 50               # 入力潜在次元数
+    hidden: 200                   # FC層隠れ次元数
+    grid: [12, 12, 64]            # 中間グリッドサイズ (H/4, W/4, Ch)
+    upsample_mode: "nearest"      # アップサンプリング方法
+    conv_channels: [64, 32, 1]    # 逆畳み込み層チャネル数
+    activation: "relu"            # 活性化関数
+    output_activation: "sigmoid"  # 出力活性化関数（画像用）
 
 # 学習設定
 training:
+  # 統合学習設定 
   epochs: 10               # 総エポック数
-  T1_iterations: 5         # DF Stage-1反復数
-  T2_iterations: 1         # DF Stage-2反復数
-  phase1_warmup_epochs: 5  # Phase-1ウォームアップエポック数
+  T1_iterations: 5         # DF-A/DF-B Stage-1反復数（各エポック内）
+  T2_iterations: 1          # DF-A/DF-B Stage-2反復数（各エポック内）
+  phase1_warmup_epochs: 5   # Phase-2開始前のPhase-1ウォームアップ
 
-  experiment_mode: "target_prediction"  # 実験モード
-  target_loss_weight: 1.0               # ターゲット損失重み
-  reconstruction_loss_weight: 0.0       # 再構成損失重み
+  # 実験モード設定
+  experiment_mode: "target_prediction"  # Phase-2での動作切り替え
+  target_loss_weight: 1.0              # ターゲット損失重み
+  reconstruction_loss_weight: 0.0      # 再構成損失重み
 
-  # Phase-1学習率
-  lr_phi: 1e-3          # φ_θ学習率
-  lr_psi: 1e-3          # ψ_ω学習率
-  weight_decay: 1e-4    # 正則化パラメータ
+  # Phase-1関連学習率（各エポック内のDF学習用）
+  lr_phi: 1e-3             # φ_θ (状態特徴) 学習率
+  lr_psi: 1e-3             # ψ_ω (観測特徴) 学習率
+  weight_decay: 1e-4        # 正則化パラメータ
 
-  # Phase-2学習率
-  lr_encoder: 1e-3       # エンコーダ学習率
-  lr_decoder: 1e-3       # ターゲットデコーダ学習率
-  lambda_cca: 0.0001     # CCA損失重み
-  update_strategy: "encoder_decoder_only"  # 更新戦略
+  # Phase-2関連学習率（各エポック内のEnd-to-end学習用）
+  lr_encoder: 1e-3          # エンコーダ学習率
+  lr_decoder: 1e-3          # ターゲットデコーダ学習率
+  lambda_cca: 0.0001        # CCA損失重み（特徴学習用、小さめ）
+  update_strategy: "encoder_decoder_only"  # Phase-2はencoder/decoderのみ更新
 
-# SSM設定
+
+# SSM (状態空間モデル) 設定
 ssm:
   realization:
-    past_horizon: 20        # 過去窓長
-    rank: 30                # 状態次元数
-    encoder_output_dim: 50  # エンコーダ出力次元
-    ridge_param: 1e-3       # Ridge正則化
-    jitter: 1e-6           # 数値安定化
-    m: 50                  # ラグ共分散サンプル数
+    past_horizon: 20        # 過去窓長（画像時系列用）
+    rank: 30                 # 状態次元数（画像用に少し大きめ）
+    encoder_output_dim: 50   # エンコーダー出力次元 (model.encoder.feature_dimと合わせる)
+    ridge_param: 1e-3        # Ridge正則化パラメータ
+    jitter: 1e-6           # 数値安定化パラメータ
+    m: 50                  # ラグ共分散推定サンプル数
 
+    # 特徴写像設定
     feature_mapping:
-      type: "averaging"  # 特徴写像タイプ
-      hidden_dims: []    # MLP隠れ層
-      activation: "relu"  # 活性化関数
+      type: "averaging"      # "averaging" or "linear" or "mlp"
+      hidden_dims: []        # MLPの隠れ層
+      activation: "relu"     
 
+  # DF-A (状態層) 設定
   df_state:
-    feature_dim: 50      # 状態特徴次元
-    lambda_A: 1e-3       # V_A正則化
-    lambda_B: 1e-3       # U_A正則化
-    feature_net:
-      hidden_sizes: [128, 64]  # MLP隠れ層サイズ
+    feature_dim: 50         # d_A: 状態特徴次元
+    lambda_A: 1e-3          # V_A正則化パラメータ 
+    lambda_B: 1e-3          # U_A正則化パラメータ 
+    feature_net:            # StateFeatureNet 
+      hidden_sizes: [128, 64]  # MLP隠れ層サイズ (画像用に大きめ)
       activation: "ReLU"       # 活性化関数
-      dropout: 0.1             # ドロップアウト率
+      dropout: 0.1             # ドロップアウト率 (過学習防止)
     cross_fitting:
-      n_blocks: 5           # ブロック数
+      n_blocks: 5           # クロスフィッティングブロック数
       min_block_size: 100   # 最小ブロックサイズ
 
+  # DF-B (観測層) 設定
   df_observation:
-    obs_feature_dim: 25         # 観測特徴次元
-    multivariate_feature_dim: 50  # エンコーダ出力次元
-    lambda_B: 1e-3              # V_B正則化
-    lambda_dB: 1e-3             # u_B正則化
-    obs_net:
-      hidden_sizes: [64, 32]  # MLP隠れ層サイズ
-      activation: "ReLU"      # 活性化関数
-      dropout: 0.1            # ドロップアウト率
+    obs_feature_dim: 25         # d_B: 観測特徴次元 (R^m → R^{d_B})
+    multivariate_feature_dim: 50  # m: エンコーダー出力次元 (model.encoder.feature_dimと合わせる)
+    lambda_B: 1e-3              # V_B正則化パラメータ 
+    lambda_dB: 1e-3             # u_B正則化パラメータ 
+    obs_net:                    # ObservationFeatureNet
+      hidden_sizes: [64, 32]      # MLP隠れ層サイズ (観測用)
+      activation: "ReLU"          # 活性化関数
+      dropout: 0.1                # ドロップアウト率 (過学習防止)
     cross_fitting:
-      n_blocks: 5           # ブロック数
-      min_block_size: 100   # 最小ブロックサイズ
+      n_blocks: 5               # クロスフィッティングブロック数
+      min_block_size: 100       # 最小ブロックサイズ
 
 # 計算設定
 computation:
-  device: "auto"      # 計算デバイス
-  num_workers: 4      # 並列ワーカー数
-  pin_memory: true    # GPU転送高速化
+  device: "auto"            # デバイス選択 (auto/cuda/cpu)
+  num_workers: 4            # データローダー並列数
+  pin_memory: true          # GPU転送高速化
 
 # 出力設定
 output:
-  save_model: true           # モデル保存
-  save_history: true         # 学習履歴保存
-  create_plots: true         # 可視化作成
+  save_model: true          # モデル保存
+  save_history: true        # 学習履歴保存
+  create_plots: true        # 可視化作成
   save_reconstructions: true # 再構成画像保存
 
 # ログ設定
 logging:
-  level: "INFO"         # ログレベル
-  console_output: true  # コンソール出力
-  file_output: true     # ファイル出力
+  level: "INFO"             # ログレベル (DEBUG/INFO/WARNING)
+  console_output: true      # コンソール出力
+  file_output: true         # ファイル出力
 
 # 評価設定
 evaluation:
-  use_new_realization: true  # 新確率実現使用
+  use_new_realization: true # 新確率実現使用
 
+  # ターゲット予測評価指標
   target_metrics:
-    metrics: ["rmse", "mae", "r2"]  # 評価指標
-    save_predictions: true          # 予測値保存
-    plot_correlations: true         # 相関プロット作成
-    plot_time_series: true          # 時系列比較プロット
-    max_plot_samples: 200           # 最大プロットサンプル数
+    metrics: ["rmse", "mae", "r2"]       # 評価指標
+    save_predictions: true               # 予測値保存
+    plot_correlations: true              # 相関プロット作成
+    plot_time_series: true               # 時系列比較プロット
+    max_plot_samples: 200                # プロット最大サンプル数
 
+  # 画像再構成評価指標（互換性のため保持）
   reconstruction:
-    metrics: ["mse", "psnr", "ssim"]  # 評価指標
-    save_detailed_results: true       # 詳細結果保存
+    metrics:
+      - "mse"                 # 平均二乗誤差
+      - "psnr"                # ピーク信号対雑音比
+      - "ssim"                # 構造類似性指数
+    save_detailed_results: true
 
+  # エンコード特徴空間可視化設定
   encoded_feature_space_viz:
-    dim_indices: [0, 1]  # 表示次元インデックス
-    max_samples: 100     # 最大表示サンプル数
+    dim_indices: [0, 1]     # 表示する次元のインデックス
+    max_samples: 100        # 最大表示サンプル数
