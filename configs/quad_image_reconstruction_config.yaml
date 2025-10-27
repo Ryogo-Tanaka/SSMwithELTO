@@ -59,8 +59,8 @@ training:
 
   # 統合学習設定 (各エポックでPhase-1 + Phase-2を連続実行)
   epochs: 10               # 総エポック数
-  T1_iterations: 5         # DF-A/DF-B Stage-1反復数（各エポック内）
-  T2_iterations: 5          # DF-A/DF-B Stage-2反復数（各エポック内）
+  T1_iterations: 1         # DF-A/DF-B Stage-1反復数（各エポック内）
+  T2_iterations: 1         # DF-A/DF-B Stage-2反復数（各エポック内）
   phase1_warmup_epochs: 5   # Phase-2(End-to-end)開始前のPhase-1(DF-A/DF-B)ウォームアップ
 
   # 実験モード設定（デフォルトは再構成モード）
@@ -68,14 +68,14 @@ training:
   target_loss_weight: 0.0              # ターゲット損失重み（未使用）
   reconstruction_loss_weight: 1.0      # 再構成損失重み
 
-  # Phase-1関連学習率（各エポック内のDF学習用）
-  lr_phi: 1e-3             # φ_θ (状態特徴) 学習率
-  lr_psi: 1e-3             # ψ_ω (観測特徴) 学習率
-  weight_decay: 1e-4        # 正則化パラメータ
+  # Phase-1関連学習率（各エポック内のDF学習用）- Step 28修正C: 10倍削減
+  lr_phi: 1e-4             # φ_θ (状態特徴) 学習率 (1e-3 → 1e-4)
+  lr_psi: 1e-4             # ψ_ω (観測特徴) 学習率 (1e-3 → 1e-4)
+  weight_decay: 1e-6        # 正則化パラメータ
 
-  # Phase-2関連学習率（各エポック内のEnd-to-end学習用）
-  lr_encoder: 1e-3          # エンコーダ学習率
-  lr_decoder: 1e-3          # デコーダ学習率（再構成用）
+  # Phase-2関連学習率（各エポック内のEnd-to-end学習用）- Step 30対策A: さらに10倍削減
+  lr_encoder: 1e-5          # エンコーダ学習率 (1e-4 → 1e-5、X_states急変を抑制)
+  lr_decoder: 1e-4          # デコーダ学習率 (1e-3 → 1e-4、安定性向上)
   lambda_cca: 0.0001         # CCA損失重み（画像用に小さめ）
   update_strategy: "encoder_decoder_only"  # Phase-2はencoder/decoderのみ更新（設計通り）
 
@@ -103,8 +103,8 @@ ssm:
   # DF-A (状態層) 設定
   df_state:
     feature_dim: 50         # d_A: 状態特徴次元 (R^r → R^{d_A})
-    lambda_A: 1e-3          # V_A正則化パラメータ (特異値爆発抑制のため強化)
-    lambda_B: 1e-3          # U_A正則化パラメータ (特異値爆発抑制のため強化)
+    lambda_A: 1e-3          # V_A正則化パラメータ
+    lambda_B: 1e-3          # U_A正則化パラメータ
     feature_net:            # StateFeatureNet (φ_θ) 深層学習設定
       hidden_sizes: [128, 64]  # MLP隠れ層サイズ (画像用に大きめ)
       activation: "ReLU"       # 活性化関数
@@ -117,8 +117,8 @@ ssm:
   df_observation:
     obs_feature_dim: 25         # d_B: 観測特徴次元 (R^m → R^{d_B})
     multivariate_feature_dim: 50  # m: エンコーダー出力次元 (model.encoder.feature_dimと合わせる)
-    lambda_B: 1e-3              # V_B正則化パラメータ (特異値爆発抑制のため強化)
-    lambda_dB: 1e-3             # u_B正則化パラメータ (特異値爆発抑制のため強化)
+    lambda_B: 1e-3              # V_B正則化パラメータ
+    lambda_dB: 1e-3             # u_B正則化パラメータ
     obs_net:                    # ObservationFeatureNet (ψ_ω) 深層学習設定
       hidden_sizes: [64, 32]      # MLP隠れ層サイズ (観測用)
       activation: "ReLU"          # 活性化関数

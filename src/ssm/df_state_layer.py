@@ -139,6 +139,7 @@ class DFStateLayer(nn.Module):
         self._stage1_cache = {}  # V_A計算結果をキャッシュ
         self._stage2_cache = {}  # U_A計算結果をキャッシュ
         self._cf_manager: Optional[CrossFittingManager] = None  # クロスフィッティング管理
+        self._diagnostic_call_count = 0  # 診断カウンター
     
 
     
@@ -416,90 +417,207 @@ class DFStateLayer(nn.Module):
         self,
         X_states: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
-        T1_iterations: int = 1
+        epoch: int = 0
     ) -> Dict[str, float]:
         """
-        **修正版**: Stage-1学習 + φ_θ勾配更新（計算グラフ分離対応）
-        
-        修正内容:
-        - retain_graph=True による複数回backward対応
-        - 最後の反復のみ完全グラフ解放
-        - 反復回数の動的制御
-        
+        Stage-1学習（エポックごとに1ブロック処理）
+
+        理論（式42a）:
+        L_Stage-1(θ) = Σ_{t∈B_k} ||φ_θ(x_t) - V_A^{(-k)} φ_θ(x_{t-1})||² + λ_A ||V_A^{(-k)}||²_F
+
+        ポイント:
+        - エポックeではブロック k = (e mod K) を処理
+        - 1エポック = 1回パラメータ更新
+        - K個のエポックで全ブロックを1巡
+
         Args:
-            X_states: 状態系列 (T, r)  
+            X_states: 状態系列 (T, r)
             optimizer_phi: φ_θ用オプティマイザ
-            T1_iterations: Stage-1反復回数
-            
+            epoch: エポック番号
+
         Returns:
             Dict[str, float]: 損失メトリクス
         """
         if X_states.size(0) < 2:
             raise ValueError(f"状態系列が短すぎます: T={X_states.size(0)}")
-        
-        total_loss = 0.0
-        
-        # **理論準拠**: φ_θ反復学習（V_Aをクロスフィッティングで計算）
-        for t in range(T1_iterations):
-            optimizer_phi.zero_grad()
 
-            # 特徴量計算（φ_θ更新により変化）
-            phi_seq = self.phi_theta(X_states)  # (T, d_A)
+        optimizer_phi.zero_grad()
 
-            # 過去/未来分割
-            phi_minus = phi_seq[:-1]  # (T-1, d_A)
-            phi_plus = phi_seq[1:]    # (T-1, d_A)
+        # 特徴量計算（1回のみ）
+        phi_seq = self.phi_theta(X_states)  # (T, d_A)
 
-            # **理論準拠**: クロスフィッティングでV_A推定とout-of-fold予測
-            phi_pred, V_A = self._compute_cross_fitting_prediction(phi_minus, phi_plus)
+        phi_minus = phi_seq[:-1]  # (T-1, d_A)
+        phi_plus = phi_seq[1:]    # (T-1, d_A)
 
-            # 予測誤差（正規化済み） + V_A正則化項
-            prediction_loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2 / phi_plus.numel()
+        T_eff = phi_minus.size(0)
+
+        # クロスフィッティング設定
+        n_blocks = self.cf_config.get('n_blocks', 5)
+        min_block_size = self.cf_config.get('min_block_size', 20)
+
+        # データ量チェック
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # 小データ時：クロスフィッティングなし（全データRidge）
+            V_A = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+            phi_pred = (V_A @ phi_minus.T).T
+
+            prediction_loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2 / phi_plus.size(0)
             regularization_loss = self.lambda_A * torch.norm(V_A, p='fro') ** 2
             loss_stage1 = prediction_loss + regularization_loss
 
-            total_loss += loss_stage1.item()
+            loss_stage1.backward()
 
-            # **修正**: 計算グラフ管理
-            if t < T1_iterations - 1:
-                # 最後の反復以外: retain_graph=True
-                loss_stage1.backward(retain_graph=True)
-            else:
-                # 最後の反復: 完全解放
-                loss_stage1.backward()
+            # === Phase A診断: φ_θ勾配ノルム測定 ===
+            # 診断出力カウンター（最初の5回のみ出力）
+            if not hasattr(self, '_diagnostic_call_count'):
+                self._diagnostic_call_count = 0
+            self._diagnostic_call_count += 1
+
+            if self._diagnostic_call_count <= 5:
+                total_grad_norm = 0.0
+                max_grad = 0.0
+                min_grad = float('inf')
+                n_params_with_grad = 0
+                for p in self.phi_theta.parameters():
+                    if p.grad is not None:
+                        param_grad_norm = p.grad.norm().item()
+                        total_grad_norm += param_grad_norm ** 2
+                        max_grad = max(max_grad, p.grad.abs().max().item())
+                        min_grad = min(min_grad, p.grad.abs().min().item())
+                        n_params_with_grad += 1
+
+                total_grad_norm = total_grad_norm ** 0.5
+                print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] φ_θ勾配 - ノルム: {total_grad_norm:.6e}, "
+                      f"最大: {max_grad:.6e}, 最小: {min_grad:.6e}, パラメータ数: {n_params_with_grad}")
+
+                # === Phase A診断: 損失バランス測定 ===
+                if prediction_loss.item() > 0:
+                    loss_ratio = regularization_loss.item() / prediction_loss.item()
+                else:
+                    loss_ratio = float('inf')
+                print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] 損失 - 予測: {prediction_loss.item():.6e}, "
+                      f"正則化: {regularization_loss.item():.6e}, 比率(reg/pred): {loss_ratio:.2f}")
 
             optimizer_phi.step()
 
-            # **追加**: 反復間のメモリクリア（安全性向上）
-            if t < T1_iterations - 1:
-                # 中間反復では変数をデタッチ（メモリ効率向上）
-                phi_seq = phi_seq.detach()
-        
-        # Stage-1結果をキャッシュ（Stage-2用）
+            # === Phase A診断: φ変化量とV_A変化量測定 ===
+            if self._diagnostic_call_count <= 5:
+                with torch.no_grad():
+                    phi_seq_after = self.phi_theta(X_states)
+                    phi_change = torch.norm(phi_seq_after - phi_seq_before)
+                    print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] φ変化量: {phi_change.item():.6e}")
+
+                    # V_A変化量測定（前回のV_Aと比較）
+                    if hasattr(self, '_prev_V_A'):
+                        V_A_change = torch.norm(V_A - self._prev_V_A)
+                        print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] V_A変化量: {V_A_change.item():.6e}")
+                    self._prev_V_A = V_A.detach().clone()
+
+            # キャッシュ更新（通常パスと同じパターン）
+            with torch.no_grad():
+                self._stage1_cache = {
+                    'V_A': V_A,
+                    'phi_minus': phi_minus,
+                    'phi_plus': phi_plus,
+                    'X_plus': X_states[1:]
+                }
+
+            return {
+                'stage1_loss': loss_stage1.item(),
+                'n_blocks': 0,
+                'mode': 'no_crossfitting'
+            }
+
+        # クロスフィッティング実行
+        from .cross_fitting import CrossFittingManager
+
+        cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+
+        # === Phase A診断: カウンター初期化（クロスフィッティング） ===
+        if not hasattr(self, '_diagnostic_call_count'):
+            self._diagnostic_call_count = 0
+        self._diagnostic_call_count += 1
+
+        # エポックに対応するブロックを選択
+        k = epoch % cf_manager.n_blocks
+
+        optimizer_phi.zero_grad()
+
+        # === 診断: φ出力変化量測定用（学習前の出力を保存） ===
+        with torch.no_grad():
+            phi_seq_before = self.phi_theta(X_states).detach().clone()
+
+        # 現在のφ_θで特徴量を計算
+        phi_seq = self.phi_theta(X_states)
+        phi_minus = phi_seq[:-1]
+        phi_plus = phi_seq[1:]
+
+        # out-of-foldインデックス取得
+        oof_indices = cf_manager.get_out_of_fold_indices(k)
+        phi_minus_oof = phi_minus[oof_indices]
+        phi_plus_oof = phi_plus[oof_indices]
+
+        # V_A^{(-k)}計算
+        V_A_k = self._ridge_stage1_with_grad(phi_minus_oof, phi_plus_oof, self.lambda_A)
+
+        # in-foldインデックス取得
+        block_indices = cf_manager.get_block_indices(k)
+        phi_minus_block = phi_minus[block_indices]
+        phi_plus_block = phi_plus[block_indices]
+
+        # 予測
+        phi_pred_block = (V_A_k @ phi_minus_block.T).T
+
+        # ブロックkの損失
+        prediction_loss_k = torch.norm(phi_pred_block - phi_plus_block, p='fro') ** 2 / phi_plus_block.size(0)
+        regularization_loss_k = self.lambda_A * torch.norm(V_A_k, p='fro') ** 2
+        loss_k = prediction_loss_k + regularization_loss_k
+
+        # === Phase A診断: ブロック間損失測定 ===
+        if self._diagnostic_call_count <= 1:
+            if prediction_loss_k.item() > 0:
+                loss_ratio_k = regularization_loss_k.item() / prediction_loss_k.item()
+            else:
+                loss_ratio_k = float('inf')
+            print(f"[診断-DF-A-S1-CF-Block{k}] 損失 - 予測: {prediction_loss_k.item():.6e}, "
+                  f"正則化: {regularization_loss_k.item():.6e}, 比率: {loss_ratio_k:.2f}")
+
+        # ブロックkでbackward
+        loss_k.backward()
+
+        # ブロックkで更新
+        optimizer_phi.step()
+
+        # === 診断: φ出力変化量測定（学習後） ===
+        with torch.no_grad():
+            phi_seq_after = self.phi_theta(X_states)
+            phi_output_change = torch.norm(phi_seq_after - phi_seq_before).item()
+            print(f"[診断-DF-A-S1-epoch{epoch+1}] φ出力変化: {phi_output_change:.2e}")
+
+        # ===== [診断C] V_Aノルム進化の追跡 =====
+        with torch.no_grad():
+            V_A_norm = torch.norm(V_A_k, p='fro').item()
+            print(f"[診断C-V_A-epoch{epoch+1}] V_Aフロベニウスノルム: {V_A_norm:.2f}")
+        # ===== [診断C終了] =====
+
+        # 推論用キャッシュ更新（毎回全データで再計算、φ_θ更新を反映）
         with torch.no_grad():
             phi_seq_final = self.phi_theta(X_states)
             phi_minus_final = phi_seq_final[:-1]
             phi_plus_final = phi_seq_final[1:]
-            _, V_A_final = self._compute_cross_fitting_prediction(phi_minus_final, phi_plus_final)
+            V_A_final = self._ridge_stage1(phi_minus_final, phi_plus_final, self.lambda_A)
 
             self._stage1_cache = {
-                'V_A': V_A_final.detach(),
-                'phi_minus': phi_minus_final.detach(),
-                'phi_plus': phi_plus_final.detach(),
-                'X_plus': X_states[1:].detach()
+                'V_A': V_A_final,
+                'phi_minus': phi_minus_final,
+                'phi_plus': phi_plus_final,
+                'X_plus': X_states[1:]
             }
 
-            # クロスフィッティング情報もキャッシュ
-            if hasattr(self, '_cross_fitting_cache'):
-                self._stage1_cache.update({
-                    'V_A_list': [V.detach() for V in self._cross_fitting_cache['V_A_list']],
-                    'cf_manager': self._cross_fitting_cache['cf_manager']
-                })
-    
         return {
-            'stage1_loss': total_loss / T1_iterations,
-            'iterations_completed': T1_iterations,
-            'final_loss': loss_stage1.item()
+            'stage1_loss': loss_k.item(),
+            'current_block': k,
+            'n_blocks': cf_manager.n_blocks
         }
     
     def _compute_cross_fitting_prediction_ua_matrix(
@@ -578,19 +696,23 @@ class DFStateLayer(nn.Module):
         self,
         X_states: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
+        epoch: int = 0
     ) -> Dict[str, float]:
         """
-        **新実装**: Stage-2学習 + φ_θ勾配更新
+        Stage-2学習（エポックごとに1ブロック処理）
 
-        理論定式化:
-        min_{φ_θ} E[||x_t - U_A^T H^{(cf)}_A(x̂_t)||²] + λ_B ||U_A||²
-        s.t. V_A = f(φ_θ), U_A = f(V_A, x_t)
+        理論（式42b）:
+        L_Stage-2(θ) = Σ_{t∈B_k} ||x_t - U_A^{(-k)}^T H_k||² + λ_B ||U_A^{(-k)}||²_F
 
-        DF-B Stage-2の実装パターンを参照（パラメータ固定なし版）
+        ポイント:
+        - エポックeではブロック k = (e mod K) を処理
+        - V_Aを動的再計算（φ_θ勾配を通す）
+        - 1エポック = 1回パラメータ更新
 
         Args:
             X_states: 状態系列 (T, r)
             optimizer_phi: φ_θ用オプティマイザ
+            epoch: エポック番号
 
         Returns:
             Dict[str, float]: 損失メトリクス
@@ -598,37 +720,92 @@ class DFStateLayer(nn.Module):
         if 'X_plus' not in self._stage1_cache:
             raise RuntimeError("Stage-1が先に実行されている必要があります")
 
-        # Stage-1からの結果を取得（データのみ）
         X_plus = self._stage1_cache['X_plus']  # (T-1, r)
 
-        # **DF-B参照**: φ_θで特徴量を動的計算（勾配あり）
-        phi_seq = self.phi_theta(X_states)  # (T, d_A) 勾配あり
+        optimizer_phi.zero_grad()
+
+        # φ_θで特徴量を動的計算（勾配あり）
+        phi_seq = self.phi_theta(X_states)  # (T, d_A)
         phi_minus = phi_seq[:-1]  # (T-1, d_A)
         phi_plus = phi_seq[1:]    # (T-1, d_A)
 
-        # **DF-B参照**: V_A動的再計算（φ_θ勾配を通す）
+        # V_A動的再計算（φ_θ勾配を通す）
         V_A_current = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
 
-        # **DF-B参照**: H計算（φ_θ勾配あり）
-        H = (V_A_current @ phi_minus.T).T  # (T-1, d_A) 勾配あり
+        # H計算（φ_θ勾配あり）
+        H = (V_A_current @ phi_minus.T).T  # (T-1, d_A)
+        T_eff = H.size(0)
 
-        # **理論準拠**: クロスフィッティングでU_A推定とout-of-fold予測
-        X_pred, U_A = self._compute_cross_fitting_prediction_ua_matrix(H, X_plus)
+        # クロスフィッティング設定
+        n_blocks = self.cf_config.get('n_blocks', 5)
+        min_block_size = self.cf_config.get('min_block_size', 20)
 
-        # **DF-B参照**: Stage-2損失 - 予測誤差（正規化済み） + U_A正則化項
-        prediction_loss = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.numel()
-        regularization_loss = self.lambda_B * torch.norm(U_A, p='fro') ** 2
-        loss_stage2 = prediction_loss + regularization_loss
+        # データ量チェック
+        if T_eff < max(n_blocks * min_block_size, 100):
+            # 小データ時：クロスフィッティングなし
+            U_A = self._ridge_stage2(H, X_plus, self.lambda_B)
+            X_pred = (U_A.T @ H.T).T
 
-        # **DF-B参照**: φ_θ更新
+            prediction_loss = torch.norm(X_pred - X_plus, p='fro') ** 2 / X_plus.size(0)
+            regularization_loss = self.lambda_B * torch.norm(U_A, p='fro') ** 2
+            loss_stage2 = prediction_loss + regularization_loss
+
+            loss_stage2.backward()
+            optimizer_phi.step()
+
+            self._stage2_cache['U_A'] = U_A.detach()
+            return {'stage2_loss': loss_stage2.item(), 'n_blocks': 0, 'mode': 'no_crossfitting'}
+
+        # クロスフィッティング実行
+        from .cross_fitting import CrossFittingManager
+        cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+
+        # エポックに対応するブロックを選択
+        k = epoch % cf_manager.n_blocks
+
         optimizer_phi.zero_grad()
-        loss_stage2.backward()
+
+        # 現在のφ_θでHを計算
+        phi_seq = self.phi_theta(X_states)
+        phi_minus = phi_seq[:-1]
+        phi_plus = phi_seq[1:]
+        V_A_current = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
+        H = (V_A_current @ phi_minus.T).T
+
+        # out-of-foldでU_A^{(-k)}計算
+        oof_indices = cf_manager.get_out_of_fold_indices(k)
+        U_A_k = self._ridge_stage2(H[oof_indices], X_plus[oof_indices], self.lambda_B)
+
+        # in-foldブロックで予測
+        block_indices = cf_manager.get_block_indices(k)
+        X_pred_k = (U_A_k.T @ H[block_indices].T).T
+
+        # ブロックkの損失
+        pred_loss_k = torch.norm(X_pred_k - X_plus[block_indices], p='fro') ** 2 / X_plus[block_indices].size(0)
+        reg_loss_k = self.lambda_B * torch.norm(U_A_k, p='fro') ** 2
+        loss_k = pred_loss_k + reg_loss_k
+
+        # ブロックkでbackward
+        loss_k.backward()
+
+        # ブロックkで更新
         optimizer_phi.step()
 
-        # U_A をキャッシュ
-        self._stage2_cache['U_A'] = U_A.detach()
+        # 推論用キャッシュ更新（毎回全データで再計算、φ_θ更新を反映）
+        with torch.no_grad():
+            phi_seq_final = self.phi_theta(X_states)
+            phi_minus_final = phi_seq_final[:-1]
+            phi_plus_final = phi_seq_final[1:]
+            V_A_final = self._ridge_stage1(phi_minus_final, phi_plus_final, self.lambda_A)
+            H_final = (V_A_final @ phi_minus_final.T).T
+            U_A_final = self._ridge_stage2(H_final, X_plus, self.lambda_B)
+            self._stage2_cache['U_A'] = U_A_final
 
-        return {'stage2_loss': loss_stage2.item()}
+        return {
+            'stage2_loss': loss_k.item(),
+            'current_block': k,
+            'n_blocks': cf_manager.n_blocks
+        }
     
     def fit_two_stage(
         self, 
