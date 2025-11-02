@@ -86,7 +86,8 @@ class InferenceModel:
             # 推論設定のみを抽出
             inference_settings = config_dict.get('inference', {})
             if not inference_settings:
-                print("'inference'セクションが見つかりません。デフォルト設定を使用します。")
+                print("⚠️  'inference'セクションが見つかりません。デフォルト設定を使用します。")
+                print("📝 モデル構造情報はcheckpointから自動的に取得されます。")
             self.config = InferenceConfig(**inference_settings)
         elif isinstance(inference_config, dict):
             self.config = InferenceConfig(**inference_config)

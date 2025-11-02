@@ -134,12 +134,11 @@ class DFStateLayer(nn.Module):
         self.V_A: Optional[torch.Tensor] = None  # 転送作用素 (d_A, d_A)
         self.U_A: Optional[torch.Tensor] = None  # 読み出し行列 (d_A, r)
         self._is_fitted = False
-        
-        # **修正**: Phase-1学習用の内部状態管理（クロスフィッティング対応）
-        self._stage1_cache = {}  # V_A計算結果をキャッシュ
-        self._stage2_cache = {}  # U_A計算結果をキャッシュ
-        self._cf_manager: Optional[CrossFittingManager] = None  # クロスフィッティング管理
-        self._diagnostic_call_count = 0  # 診断カウンター
+
+        self._stage1_cache = {}  # V_A計算結果キャッシュ
+        self._stage2_cache = {}  # U_A計算結果キャッシュ
+        self._cf_manager: Optional[CrossFittingManager] = None
+        # # self._diagnostic_call_count = 0  # 診断用カウンター
     
 
     
@@ -467,53 +466,46 @@ class DFStateLayer(nn.Module):
 
             loss_stage1.backward()
 
-            # === Phase A診断: φ_θ勾配ノルム測定 ===
-            # 診断出力カウンター（最初の5回のみ出力）
-            if not hasattr(self, '_diagnostic_call_count'):
-                self._diagnostic_call_count = 0
-            self._diagnostic_call_count += 1
-
-            if self._diagnostic_call_count <= 5:
-                total_grad_norm = 0.0
-                max_grad = 0.0
-                min_grad = float('inf')
-                n_params_with_grad = 0
-                for p in self.phi_theta.parameters():
-                    if p.grad is not None:
-                        param_grad_norm = p.grad.norm().item()
-                        total_grad_norm += param_grad_norm ** 2
-                        max_grad = max(max_grad, p.grad.abs().max().item())
-                        min_grad = min(min_grad, p.grad.abs().min().item())
-                        n_params_with_grad += 1
-
-                total_grad_norm = total_grad_norm ** 0.5
-                print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] φ_θ勾配 - ノルム: {total_grad_norm:.6e}, "
-                      f"最大: {max_grad:.6e}, 最小: {min_grad:.6e}, パラメータ数: {n_params_with_grad}")
-
-                # === Phase A診断: 損失バランス測定 ===
-                if prediction_loss.item() > 0:
-                    loss_ratio = regularization_loss.item() / prediction_loss.item()
-                else:
-                    loss_ratio = float('inf')
-                print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] 損失 - 予測: {prediction_loss.item():.6e}, "
-                      f"正則化: {regularization_loss.item():.6e}, 比率(reg/pred): {loss_ratio:.2f}")
+            # # 診断: φ勾配測定・損失バランス・φ/V_A変化量
+            # if not hasattr(self, '_diagnostic_call_count'):
+            #     self._diagnostic_call_count = 0
+            # self._diagnostic_call_count += 1
+            # if self._diagnostic_call_count <= 5:
+            #     total_grad_norm = 0.0
+            #     max_grad = 0.0
+            #     min_grad = float('inf')
+            #     n_params_with_grad = 0
+            #     for p in self.phi_theta.parameters():
+            #         if p.grad is not None:
+            #             param_grad_norm = p.grad.norm().item()
+            #             total_grad_norm += param_grad_norm ** 2
+            #             max_grad = max(max_grad, p.grad.abs().max().item())
+            #             min_grad = min(min_grad, p.grad.abs().min().item())
+            #             n_params_with_grad += 1
+            #     total_grad_norm = total_grad_norm ** 0.5
+            #     print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}] φ勾配ノルム: {total_grad_norm:.6e}, "
+            #           f"最大: {max_grad:.6e}, 最小: {min_grad:.6e}, パラメータ数: {n_params_with_grad}")
+            #     if prediction_loss.item() > 0:
+            #         loss_ratio = regularization_loss.item() / prediction_loss.item()
+            #     else:
+            #         loss_ratio = float('inf')
+            #     print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}] 損失 - 予測: {prediction_loss.item():.6e}, "
+            #           f"正則化: {regularization_loss.item():.6e}, 比率: {loss_ratio:.2f}")
 
             optimizer_phi.step()
 
-            # === Phase A診断: φ変化量とV_A変化量測定 ===
-            if self._diagnostic_call_count <= 5:
-                with torch.no_grad():
-                    phi_seq_after = self.phi_theta(X_states)
-                    phi_change = torch.norm(phi_seq_after - phi_seq_before)
-                    print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] φ変化量: {phi_change.item():.6e}")
+            # # 診断: φ/V_A変化量測定
+            # if self._diagnostic_call_count <= 5:
+            #     with torch.no_grad():
+            #         phi_seq_after = self.phi_theta(X_states)
+            #         phi_change = torch.norm(phi_seq_after - phi_seq_before)
+            #         print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}] φ変化量: {phi_change.item():.6e}")
+            #         if hasattr(self, '_prev_V_A'):
+            #             V_A_change = torch.norm(V_A - self._prev_V_A)
+            #             print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}] V_A変化量: {V_A_change.item():.6e}")
+            #         self._prev_V_A = V_A.detach().clone()
 
-                    # V_A変化量測定（前回のV_Aと比較）
-                    if hasattr(self, '_prev_V_A'):
-                        V_A_change = torch.norm(V_A - self._prev_V_A)
-                        print(f"[診断-DF-A-S1-通常-{self._diagnostic_call_count}回目] V_A変化量: {V_A_change.item():.6e}")
-                    self._prev_V_A = V_A.detach().clone()
-
-            # キャッシュ更新（通常パスと同じパターン）
+            # キャッシュ更新
             with torch.no_grad():
                 self._stage1_cache = {
                     'V_A': V_A,
@@ -533,19 +525,17 @@ class DFStateLayer(nn.Module):
 
         cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
 
-        # === Phase A診断: カウンター初期化（クロスフィッティング） ===
-        if not hasattr(self, '_diagnostic_call_count'):
-            self._diagnostic_call_count = 0
-        self._diagnostic_call_count += 1
+        # # 診断: カウンター初期化
+        # if not hasattr(self, '_diagnostic_call_count'):
+        #     self._diagnostic_call_count = 0
+        # self._diagnostic_call_count += 1
 
-        # エポックに対応するブロックを選択
         k = epoch % cf_manager.n_blocks
-
         optimizer_phi.zero_grad()
 
-        # === 診断: φ出力変化量測定用（学習前の出力を保存） ===
-        with torch.no_grad():
-            phi_seq_before = self.phi_theta(X_states).detach().clone()
+        # # 診断: φ学習前出力保存
+        # with torch.no_grad():
+        #     phi_seq_before = self.phi_theta(X_states).detach().clone()
 
         # 現在のφ_θで特徴量を計算
         phi_seq = self.phi_theta(X_states)
@@ -573,34 +563,27 @@ class DFStateLayer(nn.Module):
         regularization_loss_k = self.lambda_A * torch.norm(V_A_k, p='fro') ** 2
         loss_k = prediction_loss_k + regularization_loss_k
 
-        # === Phase A診断: ブロック間損失測定 ===
-        if self._diagnostic_call_count <= 1:
-            if prediction_loss_k.item() > 0:
-                loss_ratio_k = regularization_loss_k.item() / prediction_loss_k.item()
-            else:
-                loss_ratio_k = float('inf')
-            print(f"[診断-DF-A-S1-CF-Block{k}] 損失 - 予測: {prediction_loss_k.item():.6e}, "
-                  f"正則化: {regularization_loss_k.item():.6e}, 比率: {loss_ratio_k:.2f}")
+        # # 診断: ブロック損失測定
+        # if self._diagnostic_call_count <= 1:
+        #     if prediction_loss_k.item() > 0:
+        #         loss_ratio_k = regularization_loss_k.item() / prediction_loss_k.item()
+        #     else:
+        #         loss_ratio_k = float('inf')
+        #     print(f"[診断-DF-A-S1-CF-Block{k}] 損失 - 予測: {prediction_loss_k.item():.6e}, "
+        #           f"正則化: {regularization_loss_k.item():.6e}, 比率: {loss_ratio_k:.2f}")
 
-        # ブロックkでbackward
         loss_k.backward()
-
-        # ブロックkで更新
         optimizer_phi.step()
 
-        # === 診断: φ出力変化量測定（学習後） ===
-        with torch.no_grad():
-            phi_seq_after = self.phi_theta(X_states)
-            phi_output_change = torch.norm(phi_seq_after - phi_seq_before).item()
-            print(f"[診断-DF-A-S1-epoch{epoch+1}] φ出力変化: {phi_output_change:.2e}")
+        # # 診断: φ出力変化量・V_Aノルム追跡
+        # with torch.no_grad():
+        #     phi_seq_after = self.phi_theta(X_states)
+        #     phi_output_change = torch.norm(phi_seq_after - phi_seq_before).item()
+        #     print(f"[診断-DF-A-S1-epoch{epoch+1}] φ出力変化: {phi_output_change:.2e}")
+        #     V_A_norm = torch.norm(V_A_k, p='fro').item()
+        #     print(f"[診断C-V_A-epoch{epoch+1}] V_Aノルム: {V_A_norm:.2f}")
 
-        # ===== [診断C] V_Aノルム進化の追跡 =====
-        with torch.no_grad():
-            V_A_norm = torch.norm(V_A_k, p='fro').item()
-            print(f"[診断C-V_A-epoch{epoch+1}] V_Aフロベニウスノルム: {V_A_norm:.2f}")
-        # ===== [診断C終了] =====
-
-        # 推論用キャッシュ更新（毎回全データで再計算、φ_θ更新を反映）
+        # キャッシュ更新
         with torch.no_grad():
             phi_seq_final = self.phi_theta(X_states)
             phi_minus_final = phi_seq_final[:-1]
@@ -658,9 +641,8 @@ class DFStateLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # U_A推定（クロスフィッティング） - 勾配計算あり（θ更新用）
-            # 修正: no_grad()を削除してθへの勾配を有効化
-            # U_A^{(-k)}リストを構築（out-of-fold推定）
+            # U_A推定（クロスフィッティング、勾配あり）
+            # U_A^{(-k)}リスト構築（out-of-fold）
             U_A_list = []
             for k in range(cf_manager.n_blocks):
                 # out-of-foldインデックス I_{-k}

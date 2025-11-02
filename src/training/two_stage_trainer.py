@@ -1119,19 +1119,16 @@ class TwoStageTrainer:
         with torch.no_grad():
             X_hat_states = self.df_state.predict_sequence(X_states_gpu)
 
-        # ===== [診断B] X_hatの予測精度（初回Activeのみ） =====
-        if epoch == self.config.phase1_warmup_epochs and not hasattr(self, '_xhat_accuracy_diag_logged'):
-            with torch.no_grad():
-                # X_statesとX_hatを時間合わせして比較
-                X_true = X_states_gpu[1:]  # (T-1, r)
-                if X_hat_states.size(0) == X_true.size(0):  # サイズ確認
-                    prediction_error = torch.norm(X_hat_states - X_true, p='fro') ** 2 / X_true.numel()
-                    X_norm = torch.norm(X_true, p='fro') ** 2 / X_true.numel()
-                    relative_error = (prediction_error / X_norm).item() if X_norm > 0 else 0.0
-                    print(f"[診断B-X_hat-epoch{epoch+1}] 予測MSE: {prediction_error.item():.6e}, "
-                          f"真値ノルム: {X_norm.item():.6e}, 相対誤差: {relative_error:.2%}")
-                self._xhat_accuracy_diag_logged = True
-        # ===== [診断B終了] =====
+        # # 診断: X_hat精度確認
+        # if epoch == self.config.phase1_warmup_epochs and not hasattr(self, '_xhat_accuracy_diag_logged'):
+        #     with torch.no_grad():
+        #         X_true = X_states_gpu[1:]
+        #         if X_hat_states.size(0) == X_true.size(0):
+        #             prediction_error = torch.norm(X_hat_states - X_true, p='fro') ** 2 / X_true.numel()
+        #             X_norm = torch.norm(X_true, p='fro') ** 2 / X_true.numel()
+        #             relative_error = (prediction_error / X_norm).item() if X_norm > 0 else 0.0
+        #             print(f"[Diag] X_hat pred MSE: {prediction_error.item():.6e}, rel_err: {relative_error:.2%}")
+        #         self._xhat_accuracy_diag_logged = True
 
         # 時間インデックス調整（多変量対応）
         M_aligned = self._align_time_series_multivariate(
@@ -1399,11 +1396,11 @@ class TwoStageTrainer:
 
         opt_e2e = self.optimizers['e2e']
 
-        # === 診断: Phase-2学習率確認（初回Active期間のみ） ===
-        if epoch == self.config.phase1_warmup_epochs and not hasattr(self, '_phase2_lr_logged'):
-            for idx, (name, group) in enumerate(zip(['encoder', 'decoder', 'phi', 'psi'], opt_e2e.param_groups)):
-                print(f"[診断-Phase2-epoch{epoch+1}] {name}学習率: {group['lr']:.6e}")
-            self._phase2_lr_logged = True
+        # # 診断: Phase-2学習率確認
+        # if epoch == self.config.phase1_warmup_epochs and not hasattr(self, '_phase2_lr_logged'):
+        #     for idx, (name, group) in enumerate(zip(['encoder', 'decoder', 'phi', 'psi'], opt_e2e.param_groups)):
+        #         print(f"[Diag] Phase-2 LR {name}: {group['lr']:.6e}")
+        #     self._phase2_lr_logged = True
 
         try:
             # 前向き推論と損失計算（experiment_mode対応）

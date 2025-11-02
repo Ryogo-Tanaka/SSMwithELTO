@@ -278,9 +278,8 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # V_B推定（クロスフィッティング）- 勾配計算あり（θ更新用）
-            # 修正: no_grad()を削除し、_ridge_stage1_vb_with_gradを使用してθへの勾配を有効化
-            # 注: psi_currは呼び出し側でno_grad()内で計算済み（ω固定維持）
+            # V_B推定（クロスフィッティング、勾配あり）
+            # 注: psi_currはno_grad()で計算済み（ω固定）
             V_B_list = cf_fitter.cross_fit_stage1(
                 phi_prev, psi_curr,
                 stage1_estimator=lambda X, Y: self._ridge_stage1_vb_with_grad(X, Y, self.lambda_B)
@@ -439,9 +438,8 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # U_B推定（クロスフィッティング）- 勾配計算あり（ω更新用）
-            # 修正: no_grad()を削除し、_ridge_stage2_ub_matrix_with_gradを使用してωへの勾配を有効化
-            # 注: H_featuresは勾配計算ありで渡される（ω依存）
+            # U_B推定（クロスフィッティング、勾配あり）
+            # 注: H_featuresは勾配あり（ω依存）
             U_B_list = cf_fitter.cross_fit_stage2_matrix(
                 H_features, M_target,
                 stage2_estimator=lambda H, M: self._ridge_stage2_ub_matrix_with_grad(H, M, self.lambda_dB)
@@ -545,17 +543,16 @@ class DFObservationLayer(nn.Module):
             # 操作変数特徴量（φ_θ使用、勾配あり）
             phi_instrument = self.phi_theta(X_hat_states)  # (T, d_A)
 
-            # ===== [診断A] φ(X_hat)の統計量（初回のみ） =====
-            if not hasattr(self, '_phi_xhat_diag_logged'):
-                with torch.no_grad():
-                    phi_mean = phi_instrument.abs().mean().item()
-                    phi_std = phi_instrument.std().item()
-                    phi_min = phi_instrument.min().item()
-                    phi_max = phi_instrument.max().item()
-                    print(f"[診断A-φ(X_hat)-epoch{epoch+1}] 範囲: [{phi_min:.3f}, {phi_max:.3f}], "
-                          f"平均絶対値: {phi_mean:.3f}, 標準偏差: {phi_std:.3f}")
-                self._phi_xhat_diag_logged = True
-            # ===== [診断A終了] =====
+            # # 診断: φ(X_hat)統計量
+            # if not hasattr(self, '_phi_xhat_diag_logged'):
+            #     with torch.no_grad():
+            #         phi_mean = phi_instrument.abs().mean().item()
+            #         phi_std = phi_instrument.std().item()
+            #         phi_min = phi_instrument.min().item()
+            #         phi_max = phi_instrument.max().item()
+            #         print(f"[診断A-φ(X_hat)-epoch{epoch+1}] 範囲: [{phi_min:.3f}, {phi_max:.3f}], "
+            #               f"平均絶対値: {phi_mean:.3f}, 標準偏差: {phi_std:.3f}")
+            #     self._phi_xhat_diag_logged = True
 
             # 観測特徴量（ψ_ω固定、勾配なし）
             with torch.no_grad():
@@ -639,30 +636,26 @@ class DFObservationLayer(nn.Module):
             regularization_loss_k = self.lambda_B * torch.norm(V_B_k, p='fro') ** 2
             loss_k = prediction_loss_k + regularization_loss_k
 
-            # === 診断: DF-B損失詳細（初回のみ） ===
-            if not hasattr(self, '_df_b_loss_logged'):
-                print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] 損失 - 予測: {prediction_loss_k.item():.6e}, "
-                      f"正則化: {regularization_loss_k.item():.6e}")
-                print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] ψ_pred範囲: [{psi_pred_block.min().item():.3f}, "
-                      f"{psi_pred_block.max().item():.3f}], ψ_curr範囲: [{psi_curr_block.min().item():.3f}, "
-                      f"{psi_curr_block.max().item():.3f}]")
-                print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] ブロックサイズ: {psi_curr_block.size(0)}, "
-                      f"特徴次元: {psi_curr_block.size(1)}")
-                self._df_b_loss_logged = True
+            # # 診断: DF-B損失詳細・V_Bノルム
+            # if not hasattr(self, '_df_b_loss_logged'):
+            #     print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] 損失 - 予測: {prediction_loss_k.item():.6e}, "
+            #           f"正則化: {regularization_loss_k.item():.6e}")
+            #     print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] ψ_pred範囲: [{psi_pred_block.min().item():.3f}, "
+            #           f"{psi_pred_block.max().item():.3f}], ψ_curr範囲: [{psi_curr_block.min().item():.3f}, "
+            #           f"{psi_curr_block.max().item():.3f}]")
+            #     print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] ブロックサイズ: {psi_curr_block.size(0)}, "
+            #           f"特徴次元: {psi_curr_block.size(1)}")
+            #     self._df_b_loss_logged = True
 
-            # ブロックkでbackward
             loss_k.backward()
-
-            # ブロックkで更新
             optimizer_phi.step()
 
-            # ===== [診断D] V_Bノルム進化の追跡 =====
-            with torch.no_grad():
-                V_B_norm = torch.norm(V_B_k, p='fro').item()
-                print(f"[診断D-V_B-epoch{epoch+1}] V_Bフロベニウスノルム: {V_B_norm:.2f}")
-            # ===== [診断D終了] =====
+            # # 診断: V_Bノルム追跡
+            # with torch.no_grad():
+            #     V_B_norm = torch.norm(V_B_k, p='fro').item()
+            #     print(f"[診断D-V_B-epoch{epoch+1}] V_Bノルム: {V_B_norm:.2f}")
 
-            # 推論用キャッシュ更新（毎回全データで再計算、φ_θ・ψ_ω更新を反映）
+            # キャッシュ更新
             with torch.no_grad():
                 phi_final = self.phi_theta(X_hat_states)
                 psi_final = self.psi_omega(m_features)

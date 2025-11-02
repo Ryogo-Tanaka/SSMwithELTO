@@ -163,10 +163,31 @@ class FilteringPerformanceEvaluator:
     def _load_evaluation_data(self, data_path: str, data_split: str) -> dict:
         """評価データの読み込み"""
         print(f"\n📂 データ読み込み中...")
-        
+
         try:
+            # エンコーダタイプを取得
+            encoder_type = self.config.get('model', {}).get('encoder', {}).get('type', 'time_invariant')
+            print(f"📝 エンコーダタイプ: {encoder_type}")
+
             # データローダーを使用
-            data_dict = load_experimental_data(data_path)
+            if encoder_type == 'rkn':
+                # 画像データ用: load_experimental_data_with_architecture を使用
+                from src.utils.data_loader import load_experimental_data_with_architecture
+                dataset = load_experimental_data_with_architecture(
+                    data_path=data_path,
+                    config=self.config,
+                    split=data_split if data_split != 'all' else 'test',
+                    return_dataloaders=False
+                )
+                # Datasetから全データを取得
+                if hasattr(dataset, 'data'):
+                    observations = dataset.data
+                else:
+                    raise RuntimeError("Dataset does not have 'data' attribute")
+                data_dict = {data_split: observations}
+            else:
+                # 1D系列データ用: load_experimental_data を使用
+                data_dict = load_experimental_data(data_path)
             
             # 指定された分割を取得
             if data_split == 'test' and 'test' in data_dict:
@@ -190,24 +211,34 @@ class FilteringPerformanceEvaluator:
             
             # デバイスに移動
             observations = observations.to(self.device)
-            
+
+            # データ形状の検証
+            print(f"📏 データ形状: {observations.shape}")
+            if encoder_type == 'rkn':
+                if observations.ndim != 4:
+                    raise ValueError(
+                        f"rknEncoderには4D入力が必要: (T, H, W, C), "
+                        f"got {observations.shape} (ndim={observations.ndim})"
+                    )
+
             # 真値状態（もしあれば）
             true_states = None
             if 'true_states' in data_dict:
                 true_states = data_dict['true_states'].to(self.device)
             elif f'{data_split}_states' in data_dict:
                 true_states = data_dict[f'{data_split}_states'].to(self.device)
-                
+
             evaluation_data = {
                 'observations': observations,
                 'true_states': true_states,
+                'encoder_type': encoder_type,
                 'metadata': {
                     'data_path': data_path,
                     'data_split': data_split,
                     'available_keys': list(data_dict.keys())
                 }
             }
-            
+
             print(f"✅ データ読み込み完了")
             return evaluation_data
             
