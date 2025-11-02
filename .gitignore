@@ -15,5 +15,15 @@ _myzipper.py
 test_*.py
 test_*.json
 debug_*.py
+generate_series.py
 
 .vscode
+
+# 生成物
+checkpoints/
+experiments/
+
+# 一時的設定
+main_proposed_method.py
+main_two_stage.py
+
