@@ -323,6 +323,9 @@ class TwoStageTrainer:
     def _init_from_config(self, config: Dict[str, Any], device: torch.device, output_dir: str,
                          use_kalman_filtering: bool):
         """設定辞書からの初期化"""
+        # 元のYAML設定を保存（_save_final_model()で使用）
+        self.yaml_config = config
+
         # Factory Pattern を使用したモデル初期化
         from ..models.encoder import build_encoder
         from ..models.decoder import build_decoder
@@ -397,28 +400,101 @@ class TwoStageTrainer:
                            calibration_ratio, auto_inference_setup, target_decoder)
 
     @classmethod
-    def from_trained_model(cls, model_path: str, device: torch.device = None,
-                          output_dir: str = None) -> 'TwoStageTrainer':
-        """学習済みモデルから推論専用インスタンス作成（設定ファイル不要）"""
+    def from_trained_model(cls, model_path: str, config_path: str = None,
+                          device: torch.device = None, output_dir: str = None) -> 'TwoStageTrainer':
+        """
+        学習済みモデルから推論専用インスタンス作成
+
+        Args:
+            model_path: 学習済みモデルのパス
+            config_path: 訓練時の設定ファイルパス（YAML）
+                        Noneの場合はcheckpoint['config']から復元を試みる
+            device: デバイス
+            output_dir: 出力ディレクトリ
+
+        Returns:
+            TwoStageTrainer: 推論専用インスタンス
+        """
+        import yaml
+
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if output_dir is None:
             output_dir = 'temp_inference'
 
         # 学習済みモデル読み込み
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+        # checkpoint構造の統一
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
 
-        # パラメータから構造検出
-        encoder_config = cls._detect_encoder_structure(state_dict.get('encoder', {}))
-        decoder_config = cls._detect_decoder_structure(state_dict.get('decoder', {}))
+        # 設定の取得: config_path優先、次にcheckpoint['config']
+        if config_path is not None:
+            # YAMLファイルから設定読み込み
+            with open(config_path, 'r') as f:
+                yaml_config = yaml.safe_load(f)
 
-        # 検出された構造でモデル初期化（新しいアーキテクチャ使用）
-        encoder = time_invariantEncoder(**encoder_config)
-        decoder = time_invariantDecoder(**decoder_config)
+            encoder_type = yaml_config.get('model', {}).get('encoder', {}).get('type')
+            decoder_type = yaml_config.get('model', {}).get('decoder', {}).get('type')
+            encoder_config = yaml_config.get('model', {}).get('encoder', {})
+            decoder_config = yaml_config.get('model', {}).get('decoder', {})
+
+            print(f"✅ YAML設定から読み込み: encoder={encoder_type}, decoder={decoder_type}")
+
+            # checkpoint['config']と一致確認（存在する場合）
+            checkpoint_config = checkpoint.get('config', {})
+            if checkpoint_config:
+                checkpoint_encoder_type = checkpoint_config.get('model', {}).get('encoder', {}).get('type')
+                if checkpoint_encoder_type and checkpoint_encoder_type != encoder_type:
+                    raise ValueError(
+                        f"❌ Encoder type不一致！\n"
+                        f"  YAML設定: '{encoder_type}'\n"
+                        f"  checkpoint['config']: '{checkpoint_encoder_type}'\n"
+                        f"設定ファイルとcheckpointが一致しません。正しいペアか確認してください。"
+                    )
+
+        else:
+            # config_pathがない場合、checkpoint['config']から復元
+            checkpoint_config = checkpoint.get('config', {})
+
+            if not checkpoint_config:
+                raise ValueError(
+                    "❌ 設定情報が見つかりません！\n"
+                    "  config_pathが指定されておらず、checkpoint['config']も存在しません。\n"
+                    "  修正方法:\n"
+                    "    1. from_trained_model()にconfig_path引数を渡す\n"
+                    "    2. または、完全なcheckpoint['config']を含むモデルで再訓練"
+                )
+
+            encoder_type = checkpoint_config.get('model', {}).get('encoder', {}).get('type')
+            decoder_type = checkpoint_config.get('model', {}).get('decoder', {}).get('type')
+            encoder_config = checkpoint_config.get('model', {}).get('encoder', {})
+            decoder_config = checkpoint_config.get('model', {}).get('decoder', {})
+
+            print(f"⚠️  checkpoint['config']から読み込み: encoder={encoder_type}, decoder={decoder_type}")
+
+        # Encoder/Decoder typeの検証
+        if not encoder_type:
+            raise ValueError(
+                f"❌ Encoder typeが取得できません！\n"
+                f"設定に 'model.encoder.type' が含まれているか確認してください。"
+            )
+
+        if not decoder_type:
+            raise ValueError(
+                f"❌ Decoder typeが取得できません！\n"
+                f"設定に 'model.decoder.type' が含まれているか確認してください。"
+            )
+
+        # Encoder/Decoder動的生成
+        from ..models.encoder import build_encoder
+        from ..models.decoder import build_decoder
+
+        encoder = build_encoder(encoder_config).to(device)
+        decoder = build_decoder(decoder_config).to(device)
 
         # 最小限の設定で初期化
         realization = Realization(past_horizon=10, rank=3)
@@ -435,6 +511,8 @@ class TwoStageTrainer:
         # 重みを読み込み
         instance.encoder.load_state_dict(state_dict.get('encoder', {}))
         instance.decoder.load_state_dict(state_dict.get('decoder', {}))
+
+        print(f"✅ モデル読み込み完了: {encoder_type}Encoder + {decoder_type}Decoder")
 
         return instance
 
@@ -1045,11 +1123,13 @@ class TwoStageTrainer:
             canonical_correlations = self._get_canonical_correlations_from_realization()
             if canonical_correlations is not None:
                 # Phase-1完了時点のログ記録（エポック番号は最終エポックとして記録）
-                final_epoch = getattr(self, 'current_epoch', self.config.phase1_epochs - 1)
+                # 統合学習と分離学習で異なる属性を使用
+                phase1_epochs = getattr(self.config, 'phase1_epochs', self.config.epochs)
+                final_epoch = getattr(self, 'current_epoch', phase1_epochs - 1)
                 self.logger.log_canonical_correlations(final_epoch, "Phase-1-Complete", canonical_correlations)
 
                 if self.config.verbose:
-                    rho_values = canonical_correlations.cpu().numpy()
+                    rho_values = canonical_correlations.detach().cpu().numpy()
                     # print(f"  CCA: sum={rho_values.sum():.4f}")
         except Exception as e:
             print(f"Phase-1完了時正準相関係数ログ記録エラー: {e}")
@@ -1066,6 +1146,8 @@ class TwoStageTrainer:
 
         # Stage-1: T1_iterations回呼び出し
         stage1_losses = []
+        stage1_pred_losses = []
+        stage1_reg_losses = []
         for t in range(self.config.T1_iterations):
             stage1_metrics = self.df_state.train_stage1_with_gradients(
                 X_states_gpu,
@@ -1073,6 +1155,8 @@ class TwoStageTrainer:
                 epoch=epoch
             )
             stage1_losses.append(stage1_metrics['stage1_loss'])
+            stage1_pred_losses.append(stage1_metrics['stage1_pred_loss'])
+            stage1_reg_losses.append(stage1_metrics['stage1_reg_loss'])
 
             self.logger.log_phase1(
                 epoch, TrainingPhase.PHASE1_DF_A, 'stage1', t,
@@ -1080,9 +1164,13 @@ class TwoStageTrainer:
             )
 
         metrics['df_a_stage1_loss'] = sum(stage1_losses) / len(stage1_losses)
+        metrics['df_a_stage1_pred'] = sum(stage1_pred_losses) / len(stage1_pred_losses)
+        metrics['df_a_stage1_reg'] = sum(stage1_reg_losses) / len(stage1_reg_losses)
 
         # Stage-2: T2_iterations回呼び出し
         stage2_losses = []
+        stage2_pred_losses = []
+        stage2_reg_losses = []
         for t in range(self.config.T2_iterations):
             stage2_metrics = self.df_state.train_stage2_with_gradients(
                 X_states_gpu,
@@ -1090,6 +1178,8 @@ class TwoStageTrainer:
                 epoch=epoch
             )
             stage2_losses.append(stage2_metrics['stage2_loss'])
+            stage2_pred_losses.append(stage2_metrics['stage2_pred_loss'])
+            stage2_reg_losses.append(stage2_metrics['stage2_reg_loss'])
 
             self.logger.log_phase1(
                 epoch, TrainingPhase.PHASE1_DF_A, 'stage2', t,
@@ -1097,6 +1187,8 @@ class TwoStageTrainer:
             )
 
         metrics['df_a_stage2_loss'] = sum(stage2_losses) / len(stage2_losses)
+        metrics['df_a_stage2_pred'] = sum(stage2_pred_losses) / len(stage2_pred_losses)
+        metrics['df_a_stage2_reg'] = sum(stage2_reg_losses) / len(stage2_reg_losses)
 
         return metrics
     
@@ -1137,6 +1229,8 @@ class TwoStageTrainer:
 
         # Stage-1: T1_iterations回呼び出し
         stage1_losses = []
+        stage1_pred_losses = []
+        stage1_reg_losses = []
         for t in range(self.config.T1_iterations):
             stage1_metrics = self.df_obs.train_stage1_with_gradients(
                 X_hat_states,
@@ -1146,6 +1240,8 @@ class TwoStageTrainer:
                 epoch=epoch
             )
             stage1_losses.append(stage1_metrics['stage1_loss'])
+            stage1_pred_losses.append(stage1_metrics['stage1_pred_loss'])
+            stage1_reg_losses.append(stage1_metrics['stage1_reg_loss'])
 
             # ログ記録
             self.logger.log_phase1(
@@ -1154,9 +1250,13 @@ class TwoStageTrainer:
             )
 
         metrics['df_b_stage1_loss'] = sum(stage1_losses) / len(stage1_losses)
+        metrics['df_b_stage1_pred'] = sum(stage1_pred_losses) / len(stage1_pred_losses)
+        metrics['df_b_stage1_reg'] = sum(stage1_reg_losses) / len(stage1_reg_losses)
 
         # Stage-2: T2_iterations回呼び出し
         stage2_losses = []
+        stage2_pred_losses = []
+        stage2_reg_losses = []
         for t in range(self.config.T2_iterations):
             stage2_metrics = self.df_obs.train_stage2_with_gradients(
                 M_aligned,
@@ -1165,6 +1265,8 @@ class TwoStageTrainer:
                 epoch=epoch
             )
             stage2_losses.append(stage2_metrics['stage2_loss'])
+            stage2_pred_losses.append(stage2_metrics['stage2_pred_loss'])
+            stage2_reg_losses.append(stage2_metrics['stage2_reg_loss'])
 
             # ログ記録
             self.logger.log_phase1(
@@ -1173,6 +1275,8 @@ class TwoStageTrainer:
             )
 
         metrics['df_b_stage2_loss'] = sum(stage2_losses) / len(stage2_losses)
+        metrics['df_b_stage2_pred'] = sum(stage2_pred_losses) / len(stage2_pred_losses)
+        metrics['df_b_stage2_reg'] = sum(stage2_reg_losses) / len(stage2_reg_losses)
 
         return metrics
     
@@ -1275,7 +1379,7 @@ class TwoStageTrainer:
         # 初期データ準備
         M_features, X_states = self._prepare_data(Y_train)
 
-        # DF layers初期化
+        # DF layers初期化（全モード統一）
         self._initialize_df_layers(X_states)
         self._initialize_optimizers()
 
@@ -1305,16 +1409,57 @@ class TwoStageTrainer:
                             self.realization.fit(m_scalar.unsqueeze(1))
                             X_states = self.realization.filter(m_scalar.unsqueeze(1))
 
-                # Phase-1: DF学習（1エポック分）
-                phase1_metrics = self._train_integrated_phase1_epoch(X_states, M_features, epoch)
+                # Phase-1: DF学習（joint_allモード時はスキップ）
+                if self.config.update_strategy == "joint_all":
+                    # 全パラメータ同時学習モード: Phase-1学習をスキップ
+                    if epoch == 0:
+                        print("[joint_all] Phase-1学習スキップ（全パラメータ同時学習モード）")
+                        print("[joint_all] 初回作用素を計算中...")
 
-                # Phase-1完了後に軽量作用素更新
-                self._lightweight_operator_update(Y_train)
+                        # 初回作用素計算（ランダム初期化された phi_theta/psi_omega から）
+                        self._compute_operators_for_joint_all(Y_train)
 
-                # Phase-2: End-to-end学習（ウォームアップ完了後のみ）
+                        # Phase-1完了フラグ（作用素計算済み）
+                        self.phase1_complete = True
+                        self.df_state._is_fitted = True
+                        self.df_obs._is_fitted = True
+                        print("[joint_all] 初回作用素計算完了（Phase-2へ）")
+
+                    # Phase-1損失は後でPhase-2から取得（作用素計算後）
+                    phase1_metrics = {
+                        'df_a_stage1_pred': 0.0,
+                        'df_a_stage1_reg': 0.0,
+                        'df_a_stage2_pred': 0.0,
+                        'df_a_stage2_reg': 0.0,
+                        'df_b_stage1_pred': 0.0,
+                        'df_b_stage1_reg': 0.0,
+                        'df_b_stage2_pred': 0.0,
+                        'df_b_stage2_reg': 0.0
+                    }
+                else:
+                    # 段階学習モード: Phase-1を実行
+                    phase1_metrics = self._train_integrated_phase1_epoch(X_states, M_features, epoch)
+
+                    # Phase-1完了後に軽量作用素更新
+                    self._lightweight_operator_update(Y_train)
+
+                # Phase-2: End-to-end学習（joint_allモード時は初回から実行、それ以外はウォームアップ完了後）
                 phase2_metrics = {}
-                if epoch >= self.config.phase1_warmup_epochs:
+                if self.config.update_strategy == "joint_all" or epoch >= self.config.phase1_warmup_epochs:
                     phase2_metrics = self._train_integrated_phase2_epoch(Y_train, epoch, target_train)
+
+                    # joint_all モード: Phase-2から返された検証損失をphase1_metricsにマージ
+                    if self.config.update_strategy == "joint_all":
+                        phase1_metrics.update({
+                            'df_a_stage1_pred': phase2_metrics.get('df_a_stage1_pred', 0.0),
+                            'df_a_stage1_reg': phase2_metrics.get('df_a_stage1_reg', 0.0),
+                            'df_a_stage2_pred': phase2_metrics.get('df_a_stage2_pred', 0.0),
+                            'df_a_stage2_reg': phase2_metrics.get('df_a_stage2_reg', 0.0),
+                            'df_b_stage1_pred': phase2_metrics.get('df_b_stage1_pred', 0.0),
+                            'df_b_stage1_reg': phase2_metrics.get('df_b_stage1_reg', 0.0),
+                            'df_b_stage2_pred': phase2_metrics.get('df_b_stage2_pred', 0.0),
+                            'df_b_stage2_reg': phase2_metrics.get('df_b_stage2_reg', 0.0)
+                        })
                 else:
                     # ウォームアップ期間中はPhase-2をスキップ
                     phase2_metrics = {
@@ -1336,25 +1481,46 @@ class TwoStageTrainer:
                 self.training_history['phase2_losses'].append(phase2_metrics)
                 self.training_history['integrated_metrics'].append(integrated_metrics)
 
-                # シンプルな1行ログ
-                df_a_loss = phase1_metrics.get('df_a_stage1_loss', 0.0)
-                df_b_loss = phase1_metrics.get('df_b_stage1_loss', 0.0)
+                # シンプルな1行ログ（予測損失と正則化損失を分離表示）
+                df_a_s1_pred = phase1_metrics.get('df_a_stage1_pred', 0.0)
+                df_a_s1_reg = phase1_metrics.get('df_a_stage1_reg', 0.0)
+                df_a_s2_pred = phase1_metrics.get('df_a_stage2_pred', 0.0)
+                df_a_s2_reg = phase1_metrics.get('df_a_stage2_reg', 0.0)
+                df_b_s1_pred = phase1_metrics.get('df_b_stage1_pred', 0.0)
+                df_b_s1_reg = phase1_metrics.get('df_b_stage1_reg', 0.0)
+                df_b_s2_pred = phase1_metrics.get('df_b_stage2_pred', 0.0)
+                df_b_s2_reg = phase1_metrics.get('df_b_stage2_reg', 0.0)
                 rec_loss = phase2_metrics['rec_loss']
                 cca_loss = phase2_metrics['cca_loss']
                 total_loss = phase2_metrics['total_loss']
                 phase2_status = "active" if epoch >= self.config.phase1_warmup_epochs else "warmup"
 
-                print(f"epoch {epoch+1:3d}, loss_df-A={df_a_loss:.6f}, loss_df-B={df_b_loss:.6f}, "
-                      f"rec_loss={rec_loss:.6f}, cca_loss={cca_loss:.6f}, total_loss={total_loss:.6f} ({phase2_status})")
+                print(f"epoch {epoch+1:3d}, "
+                      f"df-A(S1p={df_a_s1_pred:.4f},r={df_a_s1_reg:.4f}), "
+                      f"df-A(S2p={df_a_s2_pred:.4f},r={df_a_s2_reg:.4f}), "
+                      f"df-B(S1p={df_b_s1_pred:.4f},r={df_b_s1_reg:.4f}), "
+                      f"df-B(S2p={df_b_s2_pred:.4f},r={df_b_s2_reg:.4f}), "
+                      f"rec={rec_loss:.4f}, cca={cca_loss:.4f}, total={total_loss:.4f} ({phase2_status})")
 
                 # モデル保存
                 if epoch % self.config.save_interval == 0:
                     self._save_checkpoint(epoch, TrainingPhase.PHASE2_E2E)
 
             except Exception as e:
+                import traceback
+                print(f"\n{'='*60}")
                 print(f"エポック {epoch} でエラー発生: {e}")
+                print(f"{'='*60}")
+                print("詳細なスタックトレース:")
+                traceback.print_exc()
+                print(f"{'='*60}\n")
                 continue
 
+        # 統合学習完了後: 最終作用素（V_A/V_B/U_A/u_B）を計算
+        print("最終作用素（V_A/V_B/U_A/u_B）計算中...")
+        self._compute_final_operators(Y_train)
+
+        self.phase1_complete = True
         print(f"統合学習完了 ({self.config.epochs}エポック)")
         return self.training_history
 
@@ -1381,6 +1547,27 @@ class TwoStageTrainer:
         統合学習におけるPhase-2を1エポック分実行
         既存のtrain_phase2と同じデバイス管理・エラーハンドリングパターンを適用
         """
+        # joint_all モード: 毎エポック作用素を再計算（epoch >= 1）
+        validation_losses = None
+        if self.config.update_strategy == "joint_all" and epoch >= 1:
+            # phi_theta/psi_omega が前エポックで更新されているため、作用素を再計算
+            self._compute_operators_for_joint_all(Y_train)
+
+        # joint_all モード: 作用素計算後に検証用損失を計算（全エポック、表示用）
+        if self.config.update_strategy == "joint_all":
+            # M_features と X_states を取得（Phase-2で使用するのと同じデータ）
+            M_features = self.encoder(Y_train)
+            if isinstance(self.realization, StochasticRealizationWithEncoder):
+                self.realization.fit(Y_train, self.encoder)
+                X_states = self.realization.estimate_states(Y_train)
+            else:
+                m_scalar = M_features.mean(dim=1)
+                self.realization.fit(m_scalar.unsqueeze(1))
+                X_states = self.realization.filter(m_scalar.unsqueeze(1))
+
+            # 検証用損失計算（勾配なし、表示用）
+            validation_losses = self._compute_validation_losses_for_joint_all(M_features, X_states)
+
         # デバイス整合性を確保（既存実装パターン）
         Y_train = self._ensure_device(Y_train)
         self.encoder = self.encoder.to(self.device)
@@ -1418,22 +1605,43 @@ class TwoStageTrainer:
             self.logger.log_phase2(epoch, loss_total.item(), rec_loss.item(),
                                   cca_loss.item(), lr_dict)
 
-            return {
+            result = {
                 'epoch': epoch,
                 'total_loss': loss_total.item(),
                 'rec_loss': rec_loss.item(),
                 'cca_loss': cca_loss.item()
             }
 
+            # joint_all モード: 検証用損失を追加
+            if validation_losses is not None:
+                result.update(validation_losses)
+
+            return result
+
         except RealizationError as e:
             print(f"エポック {epoch} Phase-2スキップ (数値実現失敗): {e}")
             # 既存パターンに合わせたエラー処理
-            return {
+            result = {
                 'epoch': epoch,
                 'total_loss': 0.0,
                 'rec_loss': 0.0,
                 'cca_loss': 0.0
             }
+
+            # joint_all モード: エラー時も検証損失を0で返す
+            if self.config.update_strategy == "joint_all":
+                result.update({
+                    'df_a_stage1_pred': 0.0,
+                    'df_a_stage1_reg': 0.0,
+                    'df_a_stage2_pred': 0.0,
+                    'df_a_stage2_reg': 0.0,
+                    'df_b_stage1_pred': 0.0,
+                    'df_b_stage1_reg': 0.0,
+                    'df_b_stage2_pred': 0.0,
+                    'df_b_stage2_reg': 0.0
+                })
+
+            return result
 
     def _lightweight_operator_update(self, Y_train: torch.Tensor):
         """
@@ -1458,6 +1666,172 @@ class TwoStageTrainer:
 
         except Exception as e:
             print(f"軽量作用素更新でエラー: {e}")
+
+    def _compute_operators_for_joint_all(self, Y_train: torch.Tensor):
+        """
+        joint_all モード用: 作用素の動的再計算
+
+        設計意図:
+        - phi_theta/psi_omega が Phase-2 で更新されるため、毎エポック作用素を再計算
+        - _compute_final_operators() と同じロジックだが、毎エポック呼ばれる
+        - 定式化準拠: V_A/U_A は phi_theta から Ridge 推定で導出
+
+        Args:
+            Y_train: 観測データ
+        """
+        with torch.no_grad():
+            # デバイス状態確保
+            self.encoder = self.encoder.to(self.device)
+            self.decoder = self.decoder.to(self.device)
+            if hasattr(self.df_state, 'phi_theta'):
+                self.df_state.phi_theta = self.df_state.phi_theta.to(self.device)
+            if hasattr(self.df_obs, 'psi_omega'):
+                self.df_obs.psi_omega = self.df_obs.psi_omega.to(self.device)
+
+            # データ準備
+            M_features, X_states = self._prepare_data(Y_train)
+
+            # DF-A 作用素再計算
+            Phi_full = self.df_state.phi_theta(X_states)  # (T, d_A)
+            Phi_minus = Phi_full[:-1]  # (T-1, d_A)
+            Phi_plus = Phi_full[1:]    # (T-1, d_A)
+            X_plus = X_states[1:]      # (T-1, r)
+
+            # V_A, U_A 計算（定式化準拠: Ridge 推定）
+            if hasattr(self.df_state, 'cf_config') and self.df_state.cf_config:
+                self.df_state._fit_with_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=False)
+            else:
+                self.df_state._fit_without_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=False)
+
+            # DF-B 作用素再計算
+            if hasattr(self, 'df_obs') and self.df_obs is not None:
+                # DF-A による 1 ステップ予測
+                X_pred = (self.df_state.U_A.T @ (self.df_state.V_A @ Phi_minus.T)).T  # (T-1, r)
+                Phi_pred = self.df_state.phi_theta(X_pred)  # (T-1, d_A)
+
+                # realization の時間短縮を考慮
+                if isinstance(self.realization, StochasticRealizationWithEncoder):
+                    h = getattr(self.realization, 'window_length', 5)
+                else:
+                    h = self.realization.h
+                T_states = X_states.shape[0]
+
+                # 多変量特徴量の正しい範囲
+                M_curr = M_features[h:h+T_states]  # (T_states, m)
+                Psi_curr = self.df_obs.psi_omega(M_curr)  # (T_states, d_B)
+
+                # データサイズ調整
+                min_size = min(Phi_pred.shape[0], Psi_curr.shape[0], M_curr.shape[0])
+                Phi_pred = Phi_pred[:min_size]
+                Psi_curr = Psi_curr[:min_size]
+                m_curr = M_curr[:min_size]
+
+                # V_B, u_B 計算
+                if hasattr(self.df_obs, 'cf_config') and self.df_obs.cf_config:
+                    self.df_obs._fit_with_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=False)
+                else:
+                    self.df_obs._fit_without_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=False)
+
+    def _compute_validation_losses_for_joint_all(
+        self,
+        M_features: torch.Tensor,
+        X_states: torch.Tensor
+    ) -> Dict[str, float]:
+        """
+        joint_allモード用の検証損失計算（勾配計算なし、表示用）
+
+        目的:
+        - joint_allモードでは学習に組み込まないが、表示用に損失を計算
+        - 元のモードと同じ形式で予測損失と正則化損失を分離して返す
+
+        設計:
+        - Stage-1損失: 常に0.0（Phase-1スキップのため）
+        - Stage-2損失: 実際の予測損失と正則化損失を計算
+
+        Args:
+            M_features: 多変量特徴量 (T, m)
+            X_states: 状態データ (T, r)
+
+        Returns:
+            Dict with keys:
+                - df_a_stage1_pred, df_a_stage1_reg: 常に0.0
+                - df_a_stage2_pred, df_a_stage2_reg: DF-A Stage-2の予測損失と正則化損失
+                - df_b_stage1_pred, df_b_stage1_reg: 常に0.0
+                - df_b_stage2_pred, df_b_stage2_reg: DF-B Stage-2の予測損失と正則化損失
+        """
+        with torch.no_grad():
+            # Stage-1損失: Phase-1スキップのため0.0
+            losses = {
+                'df_a_stage1_pred': 0.0,
+                'df_a_stage1_reg': 0.0,
+                'df_b_stage1_pred': 0.0,
+                'df_b_stage1_reg': 0.0
+            }
+
+            # DF-A Stage-2損失計算
+            # 定式化(42a): L_Stage-2 = ||X^+ - U_A^T H||²_F / T + λ_B ||U_A||²_F
+            Phi_full = self.df_state.phi_theta(X_states)  # (T, d_A)
+            Phi_minus = Phi_full[:-1]  # (T-1, d_A)
+            X_plus = X_states[1:]      # (T-1, r)
+
+            # H = V_A @ Phi^-
+            H = self.df_state.V_A @ Phi_minus.T  # (r, T-1)
+
+            # 予測誤差: ||X^+ - U_A^T H||²_F / T
+            X_pred = (self.df_state.U_A.T @ H).T  # (T-1, r)
+            prediction_error = torch.norm(X_plus - X_pred, p='fro') ** 2
+            T_samples = X_plus.shape[0]
+            df_a_stage2_pred = (prediction_error / T_samples).item()
+
+            # 正則化項: λ_B ||U_A||²_F
+            df_a_stage2_reg = (self.df_state.lambda_B * torch.norm(self.df_state.U_A, p='fro') ** 2).item()
+
+            losses['df_a_stage2_pred'] = df_a_stage2_pred
+            losses['df_a_stage2_reg'] = df_a_stage2_reg
+
+            # DF-B Stage-2損失計算
+            if hasattr(self, 'df_obs') and self.df_obs is not None:
+                # DF-Aによる1ステップ予測
+                X_pred = (self.df_state.U_A.T @ H).T  # (T-1, r)
+                Phi_pred = self.df_state.phi_theta(X_pred)  # (T-1, d_A)
+
+                # realization の時間範囲調整
+                if isinstance(self.realization, StochasticRealizationWithEncoder):
+                    h = getattr(self.realization, 'window_length', 5)
+                else:
+                    h = self.realization.h
+                T_states = X_states.shape[0]
+
+                # 多変量特徴量の正しい範囲
+                M_curr = M_features[h:h+T_states]  # (T_states, m)
+                Psi_curr = self.df_obs.psi_omega(M_curr)  # (T_states, d_B)
+
+                # データサイズ調整
+                min_size = min(Phi_pred.shape[0], Psi_curr.shape[0], M_curr.shape[0])
+                Phi_pred = Phi_pred[:min_size]
+                Psi_curr = Psi_curr[:min_size]
+                m_curr = M_curr[:min_size]
+
+                # 定式化(42b): L_Stage-2 = ||M - U_B^T H_B||²_F / T + λ_dB ||U_B||²_F
+                # ここで H_B = V_B @ Phi_pred.T: (d_B, T)
+                H_B = self.df_obs.V_B @ Phi_pred.T  # (d_B, T) = (25, 1010)
+                m_pred = (self.df_obs.U_B.T @ H_B).T  # (m, T) → (T, m) = (1010, 50)
+
+                # 予測誤差: ||m - m_pred||²_F / T
+                prediction_error_b = torch.norm(m_curr - m_pred, p='fro') ** 2
+                T_samples_b = m_curr.shape[0]
+                df_b_stage2_pred = (prediction_error_b / T_samples_b).item()
+
+                # 正則化項: λ_dB ||U_B||²_F
+                df_b_stage2_reg = (self.df_obs.lambda_dB * torch.norm(self.df_obs.U_B, p='fro') ** 2).item()
+
+                losses['df_b_stage2_pred'] = df_b_stage2_pred
+                losses['df_b_stage2_reg'] = df_b_stage2_reg
+            else:
+                losses['df_b_stage2_pred'] = 0.0
+                losses['df_b_stage2_reg'] = 0.0
+
+            return losses
 
     def _initialize_phase2_optimizer(self):
         """
@@ -1487,15 +1861,25 @@ class TwoStageTrainer:
 
             # DF層パラメータの扱い（update_strategy設定による）
             if self.config.update_strategy == "all":
-                # 例外的にDF層も更新する場合（実験的オプション）
+                # 例外的にDF層も更新する場合（実験的オプション、Phase-1は実行）
                 param_groups.extend([
                     {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
                     {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi}
                 ])
-                print("Phase-2でDF層も更新します（update_strategy='all'）")
+                print("Phase-2でDF層も更新します（update_strategy='all', 段階学習+Phase-2 DF更新）")
+            elif self.config.update_strategy == "joint_all":
+                # 全パラメータ同時学習（Ablation Studyベースライン）
+                # phi_theta/psi_omega を Phase-2 で学習、作用素は毎エポック再計算
+                param_groups.extend([
+                    {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
+                    {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi}
+                ])
+                print("全パラメータ同時学習モード（update_strategy='joint_all'）")
+                print("  - 学習対象: encoder + decoder + phi_theta + psi_omega")
+                print("  - 作用素: 毎エポック phi_theta/psi_omega から再計算")
             else:
                 # 標準設計：encoder/decoderのみ更新
-                print("Phase-2はencoder/decoderのみ更新（設計通り）")
+                print("Phase-2はencoder/decoderのみ更新（設計通り、段階学習）")
 
             self.optimizers['e2e'] = torch.optim.Adam(param_groups)
 
@@ -2169,8 +2553,13 @@ class TwoStageTrainer:
     
     def _save_final_model(self):
         """最終モデル保存"""
-        complete_config = self._build_complete_config()
-        
+        try:
+            # 訓練設定から完全な設定を構築（ハードコードデフォルトなし）
+            complete_config = self._build_complete_config_from_training_config()
+        except KeyError as e:
+            print(f"❌ モデル保存エラー: {e}")
+            raise
+
         model_state = {
             'encoder': self.encoder.state_dict(),
             'decoder': self.decoder.state_dict(),
@@ -2180,43 +2569,55 @@ class TwoStageTrainer:
             'training_config': self.config.__dict__,
             'config': complete_config  # 推論時に使用される完全な設定
         }
-        
-        save_path = self.output_dir / 'final_model.pth'
-        torch.save(model_state, save_path)
-        
-        print(f"最終モデル保存: {save_path}")
-    
-    def _build_complete_config(self) -> Dict[str, Any]:
-        """学習時の完全な設定を構築（推論時に使用）"""
-        complete_config = {
-            'model': {
-                'encoder': {
-                    'input_dim': getattr(self.encoder, 'input_dim', 6),
-                    'channels': getattr(self.encoder, 'channels', 64),
-                    'layers': getattr(self.encoder, 'layers', 8),
-                    'kernel_size': getattr(self.encoder, 'kernel_size', 3),
-                    'activation': getattr(self.encoder, 'activation', 'GELU'),
-                    'dropout': getattr(self.encoder, 'dropout', 0.1)
-                },
-                'decoder': {
-                    'output_dim': getattr(self.decoder, 'output_dim', 6),
-                    'window': getattr(self.decoder, 'window', 12),
-                    'tau': getattr(self.decoder, 'tau', 1),
-                    'hidden': getattr(self.decoder, 'hidden', 64),
-                    'ma_kernel': getattr(self.decoder, 'ma_kernel', 24),
-                    'gru_hidden': getattr(self.decoder, 'gru_hidden', 32),
-                    'activation': getattr(self.decoder, 'activation', 'GELU'),
-                    'dropout': getattr(self.decoder, 'dropout', 0.1)
-                }
-            },
-            'ssm': {
-                'realization': self.realization.__dict__,
-                'df_state': self._extract_df_state_config(),
-                'df_observation': self._extract_df_obs_config()
-            }
-        }
 
-        return complete_config
+        # models/サブディレクトリに保存（run_full_experiment.pyと統一）
+        models_dir = self.output_dir / 'models'
+        models_dir.mkdir(parents=True, exist_ok=True)
+        save_path = models_dir / 'final_model.pth'
+        torch.save(model_state, save_path)
+
+        print(f"✅ 最終モデル保存: {save_path}")
+        print(f"   Encoder type: '{complete_config['model']['encoder'].get('type')}'")
+        print(f"   Checkpoint構造: フラット形式（checkpoint['df_state']）")
+        print(f"   完全な設定情報が保存されました")
+    
+    def _build_complete_config_from_training_config(self) -> Dict[str, Any]:
+        """
+        学習時の設定から完全な設定を構築
+
+        目的:
+        - 推論時に必要な全情報をcheckpointに保存
+        - ハードコードデフォルトを排除し、不足情報は明示的エラー
+
+        Returns:
+            完全な設定辞書
+
+        Raises:
+            KeyError: 必須情報が取得できない場合
+        """
+        # yaml_configが保存されている場合（_init_from_config経由）、それを使用
+        if hasattr(self, 'yaml_config') and self.yaml_config is not None:
+            # yaml_configには既に完全な設定が含まれている
+            encoder_type = self.yaml_config.get('model', {}).get('encoder', {}).get('type')
+            if not encoder_type:
+                raise KeyError(
+                    "❌ yaml_config['model']['encoder']['type']が見つかりません。\n"
+                    "訓練設定ファイル(YAML)のmodel.encoder.typeを確認してください。"
+                )
+
+            # YAMLから取得した設定をそのまま返す
+            return {
+                'model': self.yaml_config.get('model', {}),
+                'ssm': self.yaml_config.get('ssm', {})
+            }
+
+        # yaml_configがない場合（従来の個別引数初期化）、エラー
+        raise KeyError(
+            "❌ 完全な設定の構築に失敗しました。\n\n"
+            "原因: yaml_configが保存されていません。\n"
+            "対処: TwoStageTrainerをconfig引数付きで初期化してください。\n"
+            "例: TwoStageTrainer(config=config_dict, device=device, output_dir=output_dir)"
+        )
     
     def _extract_df_state_config(self) -> Dict[str, Any]:
         """実際のDFStateLayerから設定を抽出"""
@@ -2271,11 +2672,15 @@ class TwoStageTrainer:
     
     def get_training_summary(self) -> Dict[str, Any]:
         """学習サマリ取得"""
+        # 統合学習と分離学習で異なる属性を使用
+        phase1_epochs = getattr(self.config, 'phase1_epochs', self.config.epochs)
+        phase2_epochs = getattr(self.config, 'phase2_epochs', 0)
+
         summary = {
             'training_complete': self.phase1_complete,
             'total_epochs': {
-                'phase1': self.config.phase1_epochs,
-                'phase2': self.config.phase2_epochs if self.phase1_complete else 0
+                'phase1': phase1_epochs,
+                'phase2': phase2_epochs if self.phase1_complete else 0
             },
             'final_losses': {},
             'model_info': {

@@ -592,6 +592,8 @@ class DFObservationLayer(nn.Module):
 
                 return {
                     'stage1_loss': loss_stage1.item(),
+                    'stage1_pred_loss': prediction_loss.item(),
+                    'stage1_reg_loss': regularization_loss.item(),
                     'n_blocks': 0,
                     'mode': 'no_crossfitting'
                 }
@@ -673,6 +675,8 @@ class DFObservationLayer(nn.Module):
 
             return {
                 'stage1_loss': loss_k.item(),
+                'stage1_pred_loss': prediction_loss_k.item(),
+                'stage1_reg_loss': regularization_loss_k.item(),
                 'current_block': k,
                 'n_blocks': cf_manager.n_blocks
             }
@@ -755,7 +759,13 @@ class DFObservationLayer(nn.Module):
                 optimizer_psi.step()
 
                 self._stage2_cache['U_B'] = U_B.detach()
-                return {'stage2_loss': loss_stage2.item(), 'n_blocks': 0, 'mode': 'no_crossfitting'}
+                return {
+                    'stage2_loss': loss_stage2.item(),
+                    'stage2_pred_loss': prediction_loss.item(),
+                    'stage2_reg_loss': regularization_loss.item(),
+                    'n_blocks': 0,
+                    'mode': 'no_crossfitting'
+                }
 
             # クロスフィッティング実行
             from .cross_fitting import CrossFittingManager
@@ -806,6 +816,8 @@ class DFObservationLayer(nn.Module):
 
             return {
                 'stage2_loss': loss_k.item(),
+                'stage2_pred_loss': pred_loss_k.item(),
+                'stage2_reg_loss': reg_loss_k.item(),
                 'current_block': k,
                 'n_blocks': cf_manager.n_blocks
             }

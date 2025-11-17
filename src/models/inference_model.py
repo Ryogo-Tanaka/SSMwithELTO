@@ -200,7 +200,7 @@ class InferenceModel:
             
         try:
             # モデルファイルから設定も読み込み
-            checkpoint = torch.load(self.model_path, map_location=self.device)
+            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
             
             if 'config' in checkpoint:
                 # 学習時の設定で次元情報を更新
@@ -525,8 +525,8 @@ def load_inference_model(model_dir):
     model_dir = Path(model_dir)
     
     # Load parameters
-    params = torch.load(model_dir / 'inference_params.pth', map_location='cpu')
-    encoder_state = torch.load(model_dir / 'encoder.pth', map_location='cpu')
+    params = torch.load(model_dir / 'inference_params.pth', map_location='cpu', weights_only=False)
+    encoder_state = torch.load(model_dir / 'encoder.pth', map_location='cpu', weights_only=False)
     
     with open(model_dir / 'deployment_config.yaml', 'r') as f:
         config = yaml.safe_load(f)

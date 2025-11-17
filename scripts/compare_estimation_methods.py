@@ -76,9 +76,10 @@ class EstimationMethodComparator:
             # 2. 決定的推論用にトレーナーも読み込み（決定的実現用）
             print("  📈 決定的推論用トレーナー読み込み...")
 
-            # パラメータから構造を検出して初期化（設定ファイル不要）
+            # 訓練時の設定ファイルを使用してモデル構造を正しく復元
             self.deterministic_trainer = TwoStageTrainer.from_trained_model(
                 str(self.model_path),
+                config_path=str(self.config_path),  # 追加: YAML設定を渡す
                 device=self.device,
                 output_dir=str(self.output_dir / 'temp')
             )

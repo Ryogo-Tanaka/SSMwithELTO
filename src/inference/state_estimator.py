@@ -108,7 +108,7 @@ class StateEstimator:
 
         try:
             # モデル状態読み込み
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
 
             # checkpoint['config']から学習時設定を取得
             training_config = checkpoint.get('config', {})
@@ -119,8 +119,19 @@ class StateEstimator:
             # 次元情報を更新
             self._update_config_from_checkpoint(training_config)
 
-            # 各コンポーネントの状態辞書取得（checkpointから直接）
-            state_dict = checkpoint
+            # 各コンポーネントの状態辞書取得（新旧両形式対応）
+            # 新形式: checkpoint['df_state'] (フラット構造) - 推奨
+            # 旧形式: checkpoint['model_state_dict']['df_state'] (ネスト構造) - 後方互換性
+            if 'df_state' in checkpoint:
+                # 新形式（フラット）
+                state_dict = checkpoint
+                print("📂 Checkpoint構造: フラット形式（推奨）")
+            elif 'model_state_dict' in checkpoint:
+                # 旧形式（ネスト）
+                state_dict = checkpoint['model_state_dict']
+                print("📂 Checkpoint構造: model_state_dict形式（旧形式）")
+            else:
+                raise KeyError("Checkpoint structure not recognized (neither flat nor nested)")
 
             # DF-A コンポーネント
             if 'df_state' in state_dict:
@@ -177,7 +188,12 @@ class StateEstimator:
                 self.config['model']['df_obs'] = {}
             df_obs_cfg = training_config['ssm']['df_observation']
             self.config['model']['df_obs'].update({
-                'obs_feature_dim': df_obs_cfg.get('obs_feature_dim')
+                'obs_feature_dim': df_obs_cfg.get('obs_feature_dim'),
+                'multivariate_feature_dim': df_obs_cfg.get('multivariate_feature_dim'),
+                'lambda_B': df_obs_cfg.get('lambda_B'),
+                'lambda_dB': df_obs_cfg.get('lambda_dB'),
+                'obs_net': df_obs_cfg.get('obs_net'),
+                'cross_fitting': df_obs_cfg.get('cross_fitting')
             })
 
     def _flatten_nested_state_dict(self, nested_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,12 +233,13 @@ class StateEstimator:
     def _load_df_obs_component(self, df_obs_dict: Dict[str, Any]):
         """DF-B コンポーネント読み込み"""
         from ..ssm.df_observation_layer import DFObservationLayer
-        
+
         obs_config = self.config.get('model', {}).get('df_obs', {})
-        
+
         self.df_obs_layer = DFObservationLayer(
             df_state_layer=self.df_state_layer,  # DF-A参照
-            obs_feature_dim=obs_config.get('obs_feature_dim', 8),
+            obs_feature_dim=obs_config.get('obs_feature_dim', 16),
+            multivariate_feature_dim=obs_config.get('multivariate_feature_dim', 8),
             lambda_B=obs_config.get('lambda_B', 1e-3),
             lambda_dB=obs_config.get('lambda_dB', 1e-3),
             obs_net_config=obs_config.get('obs_net'),
@@ -267,7 +284,13 @@ class StateEstimator:
         print(f"✅ Loaded {encoder_type}Encoder successfully")
 
     def _detect_encoder_type(self, encoder_dict: Dict[str, Any]) -> str:
-        """state_dictからエンコーダタイプを自動検出"""
+        """
+        state_dictからエンコーダタイプを自動検出
+
+        対応エンコーダ:
+        - 'rkn': rknEncoder (画像用CNN)
+        - 'time_invariant': time_invariantEncoder (1D系列用MLP)
+        """
         keys = set(encoder_dict.keys())
 
         # rknEncoder の特徴的なキー
@@ -278,19 +301,38 @@ class StateEstimator:
         if any('core_net' in k for k in keys):
             return 'time_invariant'
 
-        # tcnEncoder の特徴的なキー
-        if any('temporal' in k for k in keys):
-            return 'tcn'
+        # ========================================
+        # 【拡張ポイント】新しいencoder typeを追加する場合
+        # ========================================
+        # 例: Transformerエンコーダを追加する場合
+        # if any('attention' in k for k in keys):
+        #     return 'transformer'
+        #
+        # 例: 別のエンコーダを追加する場合
+        # if any('your_unique_key' in k for k in keys):
+        #     return 'your_new_encoder'
+        # ========================================
 
-        # デフォルト
-        return 'time_invariant'
+        # 検出失敗時はエラーを発生（デフォルト値は使用しない）
+        raise ValueError(
+            f"エンコーダタイプを自動検出できません。\n"
+            f"state_dict keys sample: {list(keys)[:10]}\n"
+            f"対応パターン: 'conv'(rkn), 'core_net'(time_invariant)\n"
+            f"新しいencoder typeを追加する場合は、上記の【拡張ポイント】を参照してください。"
+        )
 
     def _build_encoder_config_from_state_dict(
         self,
         encoder_dict: Dict[str, Any],
         encoder_type: str
     ) -> Dict[str, Any]:
-        """state_dictからエンコーダ設定を復元"""
+        """
+        state_dictからエンコーダ設定を復元
+
+        対応エンコーダ:
+        - 'rkn': rknEncoder (画像用CNN)
+        - 'time_invariant': time_invariantEncoder (1D系列用MLP)
+        """
 
         if encoder_type == 'rkn':
             # rknEncoder の設定を推定
@@ -330,15 +372,18 @@ class StateEstimator:
             else:
                 hidden = 200  # デフォルト
 
+            # checkpoint から取得した encoder 設定を使用
+            encoder_cfg = self.config.get('model', {}).get('encoder', {})
+
             return {
                 'input_resolution': input_resolution,
                 'feature_dim': feature_dim,
                 'hidden': hidden,
                 'conv_channels': conv_channels if conv_channels else [32, 64],
-                'activation': 'relu',
-                'normalize_input': False,
-                'normalize_output': True,
-                'track_running_stats': True
+                'activation': encoder_cfg.get('activation', 'relu'),
+                'normalize_input': encoder_cfg.get('normalize_input', False),
+                'normalize_output': encoder_cfg.get('normalize_output', False),
+                'track_running_stats': encoder_cfg.get('track_running_stats', True)
             }
 
         elif encoder_type == 'time_invariant':
@@ -355,8 +400,35 @@ class StateEstimator:
                 'track_running_stats': True
             }
 
+        # ========================================
+        # 【拡張ポイント】新しいencoder typeを追加する場合
+        # ========================================
+        # elif encoder_type == 'transformer':
+        #     # Transformerエンコーダの設定を復元
+        #     # state_dictから設定パラメータを推定
+        #     # 例: attention層の数、ヘッド数などを推定
+        #     return {
+        #         'input_dim': ...,
+        #         'feature_dim': ...,
+        #         'n_heads': ...,
+        #         'n_layers': ...,
+        #         ...
+        #     }
+        #
+        # elif encoder_type == 'your_new_encoder':
+        #     # 新しいエンコーダの設定を復元
+        #     # state_dictの形状から必要なパラメータを推定
+        #     return {
+        #         ...
+        #     }
+        # ========================================
+
         else:
-            raise ValueError(f"Unknown encoder type: {encoder_type}")
+            raise ValueError(
+                f"未対応のencoder type: '{encoder_type}'\n"
+                f"現在対応しているのは 'rkn' と 'time_invariant' のみです。\n"
+                f"新しいencoder typeを追加する場合は、上記の【拡張ポイント】を参照してください。"
+            )
 
     def _detect_time_invariant_output_dim(self, encoder_dict: Dict[str, Any]) -> int:
         """time_invariantエンコーダーの出力次元を検出"""

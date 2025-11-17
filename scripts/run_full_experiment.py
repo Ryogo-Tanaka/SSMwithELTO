@@ -417,10 +417,9 @@ class FullExperimentPipeline:
         print("実験終了処理")
         print("="*5)
         
-        # 最終モデル保存
-        model_path = self.output_dir / 'models' / 'final_model.pth'
-        trainer._save_inference_ready_model(str(model_path))
-        print(f"最終モデル保存: {model_path}")
+        # 最終モデル保存（完全なconfig付き、フラット構造）
+        trainer._save_final_model()
+        # print文は _save_final_model() 内で実行される
         
         # 実験設定保存（YAML + TXT形式）
         config_path = self.output_dir / 'logs' / 'experiment_config.yaml'

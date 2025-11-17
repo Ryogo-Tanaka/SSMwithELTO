@@ -67,6 +67,9 @@ class FilteringPerformanceEvaluator:
                 "複数ドキュメントYAMLファイルからの自動選択は未実装です。"
             )
 
+        # checkpoint['config']から真実の情報を取得してマージ（SSOT確立）
+        self._merge_checkpoint_config()
+
         # 分析器の初期化
         self.filtering_analyzer = FilteringAnalyzer(str(self.output_dir), self.device)
         self.uncertainty_evaluator = UncertaintyEvaluator(str(self.output_dir))
@@ -74,7 +77,101 @@ class FilteringPerformanceEvaluator:
         # モデル読み込み
         self.inference_model = None
         self._load_inference_model()
-        
+
+    def _merge_checkpoint_config(self):
+        """
+        Config優先、checkpoint fallbackでマージ
+
+        優先順位:
+          1. コマンドライン引数で指定されたYAML config (self.config)
+          2. checkpoint['config']の保存情報
+
+        目的:
+        - 訓練時のYAML configを優先的に使用（完全な情報源）
+        - checkpointには訓練時に保存された最小限の情報のみ含まれる
+        - configにない情報のみcheckpointから補完
+        """
+        import torch
+
+        print(f"📂 ConfigとCheckpointをマージ中（Config優先）...")
+
+        try:
+            checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
+            checkpoint_config = checkpoint.get('config', {})
+
+            if not checkpoint_config:
+                raise ValueError(
+                    f"checkpoint['config']が存在しません。\n"
+                    f"モデルファイルを確認してください: {self.model_path}"
+                )
+
+            # モデル構造情報のマージ
+            if 'model' not in self.config:
+                self.config['model'] = {}
+
+            # encoder情報のマージ (config優先、checkpoint fallback)
+            if 'encoder' in self.config.get('model', {}):
+                # YAMLにencoder情報がある場合、それを基本とする
+                base_encoder = self.config['model']['encoder'].copy()
+                checkpoint_encoder = checkpoint_config.get('model', {}).get('encoder', {})
+
+                # YAMLにない情報のみcheckpointから補完
+                for key, value in checkpoint_encoder.items():
+                    if key not in base_encoder:
+                        base_encoder[key] = value
+                        print(f"  ↳ encoder.{key}: checkpointから補完")
+
+                self.config['model']['encoder'] = base_encoder
+                encoder_type = self.config['model']['encoder'].get('type')
+                print(f"✅ Encoder type: '{encoder_type}' (from config)")
+            elif 'encoder' in checkpoint_config.get('model', {}):
+                # YAMLにencoder情報がない場合のみcheckpointを使用
+                self.config['model']['encoder'] = checkpoint_config['model']['encoder'].copy()
+                encoder_type = self.config['model']['encoder'].get('type')
+                print(f"⚠️  Encoder type: '{encoder_type}' (from checkpoint only - config missing)")
+            else:
+                raise ValueError(
+                    "Encoder情報がYAML configにもcheckpointにも見つかりません。\n"
+                    "設定ファイルを確認してください。"
+                )
+
+            # decoder情報のマージ (同様の方式)
+            if 'decoder' in self.config.get('model', {}):
+                base_decoder = self.config['model']['decoder'].copy()
+                checkpoint_decoder = checkpoint_config.get('model', {}).get('decoder', {})
+
+                for key, value in checkpoint_decoder.items():
+                    if key not in base_decoder:
+                        base_decoder[key] = value
+
+                self.config['model']['decoder'] = base_decoder
+                print(f"✅ Decoder config: from config")
+            elif 'decoder' in checkpoint_config.get('model', {}):
+                self.config['model']['decoder'] = checkpoint_config['model']['decoder'].copy()
+                print(f"⚠️  Decoder config: from checkpoint only")
+
+            # SSM設定のマージ (config優先)
+            if 'ssm' not in self.config:
+                self.config['ssm'] = {}
+
+            if 'ssm' in checkpoint_config:
+                for key in ['realization', 'df_state', 'df_observation']:
+                    if key in checkpoint_config['ssm']:
+                        if key not in self.config['ssm']:
+                            # configにない場合のみcheckpointから取得
+                            self.config['ssm'][key] = checkpoint_config['ssm'][key].copy()
+                            print(f"  ↳ ssm.{key}: checkpointから補完")
+                        else:
+                            # configにある場合、checkpointの情報で不足分を補完
+                            for subkey, subvalue in checkpoint_config['ssm'][key].items():
+                                if subkey not in self.config['ssm'][key]:
+                                    self.config['ssm'][key][subkey] = subvalue
+
+            print(f"✅ Config優先マージ完了")
+
+        except Exception as e:
+            raise RuntimeError(f"ConfigとCheckpointのマージに失敗: {e}")
+
     def _load_inference_model(self):
         """推論モデルの読み込み"""
         try:
@@ -165,14 +262,23 @@ class FilteringPerformanceEvaluator:
         print(f"\n📂 データ読み込み中...")
 
         try:
-            # エンコーダタイプを取得
-            encoder_type = self.config.get('model', {}).get('encoder', {}).get('type', 'time_invariant')
+            # エンコーダタイプを取得（checkpoint由来、_merge_checkpoint_config()で設定済み）
+            encoder_type = self.config.get('model', {}).get('encoder', {}).get('type')
+
+            if encoder_type is None:
+                raise ValueError(
+                    "Encoder typeが取得できません。\n"
+                    "checkpoint['config']['model']['encoder']['type']を確認してください。"
+                )
+
             print(f"📝 エンコーダタイプ: {encoder_type}")
 
-            # データローダーを使用
+            # エンコーダタイプに応じたデータローダー選択
             if encoder_type == 'rkn':
-                # 画像データ用: load_experimental_data_with_architecture を使用
+                # 画像データ用（4D: T, H, W, C）
                 from src.utils.data_loader import load_experimental_data_with_architecture
+                import numpy as np
+
                 dataset = load_experimental_data_with_architecture(
                     data_path=data_path,
                     config=self.config,
@@ -182,12 +288,49 @@ class FilteringPerformanceEvaluator:
                 # Datasetから全データを取得
                 if hasattr(dataset, 'data'):
                     observations = dataset.data
+
+                    # numpy配列の場合はtorchに変換（DataLoader経由でない直接アクセス用）
+                    if isinstance(observations, np.ndarray):
+                        observations = torch.from_numpy(observations).float()
+                        print(f"📊 numpy→torch変換完了: {observations.shape}, dtype={observations.dtype}")
+                    elif isinstance(observations, torch.Tensor):
+                        # 既にtorchの場合はそのまま
+                        print(f"📊 torch.Tensor検出: {observations.shape}, dtype={observations.dtype}")
+                    else:
+                        raise TypeError(
+                            f"未対応のデータ型: {type(observations)}\n"
+                            f"期待される型: numpy.ndarray または torch.Tensor"
+                        )
                 else:
                     raise RuntimeError("Dataset does not have 'data' attribute")
                 data_dict = {data_split: observations}
-            else:
-                # 1D系列データ用: load_experimental_data を使用
+
+            elif encoder_type == 'time_invariant':
+                # 1D系列データ用（2D: T, n）
+                from src.utils.data_loader import load_experimental_data
                 data_dict = load_experimental_data(data_path)
+
+            # ========================================
+            # 【拡張ポイント】新しいencoder typeを追加する場合
+            # ========================================
+            # elif encoder_type == 'transformer':
+            #     # Transformerエンコーダ用（データ形状に応じて選択）
+            #     # 例: 1D系列の場合
+            #     from src.utils.data_loader import load_experimental_data
+            #     data_dict = load_experimental_data(data_path)
+            #
+            # elif encoder_type == 'your_new_encoder':
+            #     # 新しいエンコーダ用のデータローダー
+            #     # データ形状に応じて適切なローダーを選択
+            #     pass
+            # ========================================
+
+            else:
+                raise ValueError(
+                    f"未対応のencoder type: '{encoder_type}'\n"
+                    f"現在対応しているのは 'rkn' と 'time_invariant' のみです。\n"
+                    f"新しいencoder typeを追加する場合は、上記の【拡張ポイント】を参照してください。"
+                )
             
             # 指定された分割を取得
             if data_split == 'test' and 'test' in data_dict:

@@ -274,16 +274,36 @@ class TrainedModelSpectrumAnalysis:
                 V_A = model.get_transfer_operator()
             elif isinstance(model, dict):
                 # checkpointファイルから直接抽出
+                # 複数のキー構造パターンに対応
+                df_state_dict = None
+
+                # パターン1: checkpoint['model_state_dict']['df_state']（古い形式の可能性）
                 if 'model_state_dict' in model and 'df_state' in model['model_state_dict']:
                     df_state_dict = model['model_state_dict']['df_state']
-                    if 'V_A' in df_state_dict:
-                        V_A = df_state_dict['V_A']
-                    else:
-                        raise ValueError("保存されたモデルにV_A行列が見つかりません")
-                elif 'df_state' in model and 'V_A' in model['df_state']:
-                    V_A = model['df_state']['V_A']
+                    print(f"📂 V_A抽出: checkpoint['model_state_dict']['df_state']から取得")
+                # パターン2: checkpoint['df_state']（現在の標準形式）
+                elif 'df_state' in model:
+                    df_state_dict = model['df_state']
+                    print(f"📂 V_A抽出: checkpoint['df_state']から取得")
                 else:
-                    raise ValueError("モデル辞書からV_A行列を抽出できませんでした")
+                    raise ValueError(
+                        f"checkpoint構造が不正です。df_state辞書が見つかりません。\n"
+                        f"期待されるキーパターン:\n"
+                        f"  - checkpoint['model_state_dict']['df_state']\n"
+                        f"  - checkpoint['df_state']\n"
+                        f"実際のcheckpointのトップレベルキー: {list(model.keys())}"
+                    )
+
+                # V_A行列の抽出
+                if 'V_A' in df_state_dict:
+                    V_A = df_state_dict['V_A']
+                    print(f"✅ V_A行列取得成功: shape={V_A.shape}")
+                else:
+                    raise ValueError(
+                        f"df_state辞書にV_A行列が見つかりません。\n"
+                        f"df_stateのキー: {list(df_state_dict.keys())}\n"
+                        f"ヒント: df_state.get_inference_state_dict()でV_Aが保存されているか確認してください"
+                    )
             else:
                 raise ValueError("モデルからV_A行列を抽出できませんでした。モデル構造を確認してください。")
 
@@ -304,7 +324,7 @@ class TrainedModelSpectrumAnalysis:
         """
         try:
             # モデル読み込み
-            checkpoint = torch.load(model_path, map_location='cpu')
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
             # V_A直接保存の場合
             if 'V_A' in checkpoint:
