@@ -99,8 +99,8 @@ class DFObservationLayer(nn.Module):
     def __init__(
         self,
         df_state_layer,  # DFStateLayerインスタンス（必須）
-        obs_feature_dim: int = 16,
-        multivariate_feature_dim: int = 8,  # 多変量特徴量次元 m
+        obs_feature_dim: int = 16,  # 旧デフォルト
+        multivariate_feature_dim: int = 8,  # 旧デフォルト
         lambda_B: float = 1e-3,
         lambda_dB: float = 1e-3,
         obs_net_config: Optional[Dict[str, Any]] = None,

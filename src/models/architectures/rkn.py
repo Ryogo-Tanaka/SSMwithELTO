@@ -40,7 +40,8 @@ class rknEncoder(nn.Module):
         input_resolution: Tuple[int, int, int] = (48, 48, 1),
         feature_dim: int = 100,
         hidden: int = 200,
-        conv_channels: Tuple[int, int] = (32, 64),
+        conv_channels: Tuple[int, int] = (32, 64),  # 旧設定
+        conv_strides: Tuple[int, int] = (1, 1),  # 論文Table 6: (2, 2)
         activation: str = "relu",
         normalize_input: bool = False,  # 画像用は通常False
         normalize_output: bool = False,
@@ -55,6 +56,7 @@ class rknEncoder(nn.Module):
             feature_dim: 潜在特徴次元数（100次元固定推奨）
             hidden: FC層の隠れ次元数
             conv_channels: CNN層のチャネル数 (conv1_ch, conv2_ch)
+            conv_strides: CNN層のストライド (stride1, stride2) — 論文: (2, 2)
             activation: 活性化関数名
             normalize_input: 入力正規化（画像では通常False）
             normalize_output: 出力正規化
@@ -74,19 +76,24 @@ class rknEncoder(nn.Module):
         self.eps = eps
 
         H, W, C = input_resolution
+        s1, s2 = conv_strides
 
         # 活性化関数（time_invariant準拠）
         self.activation = getattr(nn, activation)() if hasattr(nn, activation) else nn.ReLU()
 
-        # CNN層構築（RKN_ARCHITECTURE.md仕様）
-        self.conv1 = nn.Conv2d(C, conv_channels[0], kernel_size=5, padding=2)  # same padding
+        # CNN層構築（論文Table 6準拠: stride対応）
+        self.conv1 = nn.Conv2d(C, conv_channels[0], kernel_size=5, stride=s1, padding=2)
         self.pool1 = nn.MaxPool2d(2)
 
-        self.conv2 = nn.Conv2d(conv_channels[0], conv_channels[1], kernel_size=3, padding=1)  # same padding
+        self.conv2 = nn.Conv2d(conv_channels[0], conv_channels[1], kernel_size=3, stride=s2, padding=1)
         self.pool2 = nn.MaxPool2d(2)
 
-        # 畳み込み後のサイズ計算: (H/4, W/4)
-        conv_h, conv_w = H // 4, W // 4
+        # 畳み込み後のサイズ計算 (stride対応)
+        # Conv1(stride=s1, k=5, p=2) → Pool(2) → Conv2(stride=s2, k=3, p=1) → Pool(2)
+        conv_h = ((H + 2*2 - 5) // s1 + 1) // 2  # Conv1 + Pool1
+        conv_h = ((conv_h + 2*1 - 3) // s2 + 1) // 2  # Conv2 + Pool2
+        conv_w = ((W + 2*2 - 5) // s1 + 1) // 2
+        conv_w = ((conv_w + 2*1 - 3) // s2 + 1) // 2
         conv_output_size = conv_h * conv_w * conv_channels[1]
 
         # FC層（RKN_ARCHITECTURE.md仕様）
@@ -310,8 +317,8 @@ class rknDecoder(nn.Module):
         feature_dim: int = 100,
         grid: Optional[Tuple[int, int, int]] = None,
         hidden: int = 200,
-        upsample_mode: str = "nearest",
-        conv_channels: Tuple[int, int, int] = (64, 32, 1),
+        upsample_mode: str = "nearest",  # "nearest"=旧, "conv_transpose"=論文Table 6
+        conv_channels: Tuple[int, ...] = (64, 32, 1),
         activation: str = "relu",
         output_activation: str = "sigmoid",  # 画像用は sigmoid
         **kwargs
@@ -321,9 +328,9 @@ class rknDecoder(nn.Module):
             input_resolution: 出力画像解像度 (H, W, C)
             feature_dim: 入力潜在特徴次元数
             grid: 中間グリッドサイズ (H', W', C') - None時は自動設定
-            hidden: FC層の隠れ次元数
-            upsample_mode: アップサンプリング方法 ("nearest", "bilinear")
-            conv_channels: 逆畳み込み層のチャネル数 (ch1, ch2, output_ch)
+            hidden: FC層の隠れ次元数 (conv_transpose時は未使用)
+            upsample_mode: "nearest"/"bilinear"=Upsample+Conv, "conv_transpose"=TransposedConv(論文)
+            conv_channels: チャネル数 — conv_transpose時は(16,12,1), 旧時は(64,32,1)
             activation: 活性化関数名
             output_activation: 出力活性化関数名
         """
@@ -348,24 +355,43 @@ class rknDecoder(nn.Module):
         else:
             self.output_activation = nn.Sigmoid()  # デフォルト
 
-        # グリッドサイズ自動設定（RKN_ARCHITECTURE.md仕様）
+        # グリッドサイズ自動設定
         if grid is None:
-            grid = (H // 4, W // 4, conv_channels[0])  # (12, 12, 64) for (48,48,1)
+            if upsample_mode == "conv_transpose":
+                grid = (3, 3, 16)  # 論文Table 6: 3×3×16=144
+            else:
+                grid = (H // 4, W // 4, conv_channels[0])  # 旧: (12, 12, 64)
         self.grid = grid
 
         grid_h, grid_w, grid_c = grid
         grid_size = grid_h * grid_w * grid_c
 
-        # FC層: 潜在→グリッド（RKN_ARCHITECTURE.md仕様）
-        self.fc1 = nn.Linear(feature_dim, hidden)
-        self.fc2 = nn.Linear(hidden, grid_size)
+        if upsample_mode == "conv_transpose":
+            # 論文Table 6準拠: FC1層 + ConvTranspose2d
+            self.fc1 = nn.Linear(feature_dim, grid_size)
 
-        # Upsample + Conv層（RKN_ARCHITECTURE.md仕様）
-        self.upsample1 = nn.Upsample(scale_factor=2, mode=upsample_mode)
-        self.conv1 = nn.Conv2d(conv_channels[0], conv_channels[1], kernel_size=3, padding=1)
+            # ConvTranspose2d: 3×3→12×12
+            self.deconv1 = nn.ConvTranspose2d(
+                grid_c, conv_channels[0], kernel_size=5, stride=4,
+                padding=1, output_padding=1
+            )
+            # ConvTranspose2d: 12×12→48×48
+            self.deconv2 = nn.ConvTranspose2d(
+                conv_channels[0], conv_channels[1], kernel_size=3, stride=4,
+                padding=0, output_padding=1
+            )
+            # 1×1 Conv: チャネル削減→出力
+            self.final_conv = nn.Conv2d(conv_channels[1], C, kernel_size=1)
+        else:
+            # 旧実装: FC2層 + Upsample+Conv
+            self.fc1 = nn.Linear(feature_dim, hidden)
+            self.fc2 = nn.Linear(hidden, grid_size)
 
-        self.upsample2 = nn.Upsample(scale_factor=2, mode=upsample_mode)
-        self.conv2 = nn.Conv2d(conv_channels[1], conv_channels[2], kernel_size=5, padding=2)
+            self.upsample1 = nn.Upsample(scale_factor=2, mode=upsample_mode)
+            self.conv1 = nn.Conv2d(conv_channels[0], conv_channels[1], kernel_size=3, padding=1)
+
+            self.upsample2 = nn.Upsample(scale_factor=2, mode=upsample_mode)
+            self.conv2 = nn.Conv2d(conv_channels[1], conv_channels[2] if len(conv_channels) > 2 else C, kernel_size=5, padding=2)
 
         # 重み初期化（time_invariant準拠）
         self._initialize_weights()
@@ -426,20 +452,24 @@ class rknDecoder(nn.Module):
         # 時間軸に沿った独立処理（時不変性保証）
         z_flat = z.view(B * T, feature_dim)  # (B*T, feature_dim)
 
-        # FC処理（RKN_ARCHITECTURE.md仕様）
-        x = self.activation(self.fc1(z_flat))       # (B*T, hidden)
-        x = self.activation(self.fc2(x))            # (B*T, grid_size)
-
-        # Reshape to grid
         grid_h, grid_w, grid_c = self.grid
-        x = x.view(-1, grid_c, grid_h, grid_w)      # (B*T, grid_c, grid_h, grid_w)
 
-        # Upsample + Conv処理（RKN_ARCHITECTURE.md仕様）
-        x = self.upsample1(x)                       # (B*T, grid_c, 2*grid_h, 2*grid_w)
-        x = self.activation(self.conv1(x))          # (B*T, conv_ch[1], 2*grid_h, 2*grid_w)
-
-        x = self.upsample2(x)                       # (B*T, conv_ch[1], 4*grid_h, 4*grid_w)
-        x = self.output_activation(self.conv2(x))   # (B*T, conv_ch[2], H, W) ∈ [0,1]
+        if self.upsample_mode == "conv_transpose":
+            # 論文Table 6準拠: FC1層 + ConvTranspose2d
+            x = self.activation(self.fc1(z_flat))        # (B*T, grid_size=144)
+            x = x.view(-1, grid_c, grid_h, grid_w)       # (B*T, 16, 3, 3)
+            x = self.activation(self.deconv1(x))          # (B*T, 16, 12, 12)
+            x = self.activation(self.deconv2(x))          # (B*T, 12, 48, 48)
+            x = self.output_activation(self.final_conv(x))  # (B*T, 1, 48, 48)
+        else:
+            # 旧実装: FC2層 + Upsample+Conv
+            x = self.activation(self.fc1(z_flat))        # (B*T, hidden)
+            x = self.activation(self.fc2(x))             # (B*T, grid_size)
+            x = x.view(-1, grid_c, grid_h, grid_w)       # (B*T, grid_c, grid_h, grid_w)
+            x = self.upsample1(x)                         # (B*T, grid_c, 2*grid_h, 2*grid_w)
+            x = self.activation(self.conv1(x))            # (B*T, conv_ch[1], 2*grid_h, 2*grid_w)
+            x = self.upsample2(x)                         # (B*T, conv_ch[1], 4*grid_h, 4*grid_w)
+            x = self.output_activation(self.conv2(x))     # (B*T, C, H, W) ∈ [0,1]
 
         # (B*T, C, H, W) → (B*T, H, W, C)
         x = x.permute(0, 2, 3, 1)
@@ -477,7 +507,7 @@ class rkn_targetDecoder(nn.Module):
         state_dim: int = 8,  # quad制御状態: 8次元
         hidden: int = 50,
         activation: str = "relu",
-        output_activation: str = "linear",  # 出力活性化関数
+        output_activation: str = "linear",  # 旧デフォルト
         **kwargs
     ):
         """

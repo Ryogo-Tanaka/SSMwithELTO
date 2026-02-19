@@ -63,8 +63,8 @@ class StochasticRealizationWithEncoder(nn.Module):
         self,
         encoder: nn.Module,
         encoder_output_dim: int,  # 設定ファイルから明示指定
-        past_horizon: int = 10,   # 旧: window_length → 互換性のため変更
-        rank: int = 8,            # 旧: num_components → 互換性のため変更
+        past_horizon: int = 10,   # 旧デフォルト
+        rank: int = 8,            # 旧デフォルト
         ridge_param: float = 1e-3,
         jitter: float = 1e-8,     # 旧: min_eigenvalue → 互換性のため変更
         m: int = 500,             # ラグ共分散推定サンプル数
@@ -112,7 +112,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         self.rank = self.num_components  # rank相当（低ランク近似の次数）
 
         # 計算フロー最適化: 中間結果のキャッシュ
-        self._cached_feature_matrices: Optional[Dict[str, torch.Tensor]] = None  # Φ_X, Φ_Y
+        self._cached_feature_matrices: Optional[Dict[str, torch.Tensor]] = None  # Feat_X, Feat_Y
         self._cached_covariance_blocks: Optional[Dict[str, torch.Tensor]] = None  # G, H, A
         self._cached_whitening_matrices: Optional[Dict[str, torch.Tensor]] = None  # G_inv_sqrt, H_inv_sqrt
         self._last_input_shape: Optional[Tuple[int, int]] = None  # (T, n) for cache validation
@@ -240,19 +240,19 @@ class StochasticRealizationWithEncoder(nn.Module):
            p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-ℓ)^T)^T ∈ R^{d·ℓ}
            f(t) = (y(t)^T, y(t+1)^T, ..., y(t+ℓ-1)^T)^T ∈ R^{d·ℓ}
         3. 特徴量マッピング φ_m 構築:
-           過去特徴量: Φ_X[i] = φ_m(p(t))
-           未来特徴量: Φ_Y[i] = φ_m(f(t))
+           過去特徴量: Feat_X[i] = φ_m(p(t))
+           未来特徴量: Feat_Y[i] = φ_m(f(t))
 
         Args:
             Y: 観測時系列 (T, n)
             use_cache: キャッシュを使用するか
 
         Returns:
-            Φ_X: 過去特徴量行列 (m, N)
-            Φ_Y: 未来特徴量行列 (m, N)
+            Feat_X: 過去特徴量行列 (m, N)
+            Feat_Y: 未来特徴量行列 (m, N)
         """
-        # キャッシュ機能: 一時的に無効化（安全性のため）
-        # 将来的にデータハッシュベースのキャッシュに変更予定
+        # キャッシュ無効化: _lightweight_operator_updateとPhase-2のfit()が同一エポック内で
+        # 複数回呼ばれ、computation graphの管理が複雑になるため安全に無効化
         use_cache = False
 
         # 入力形状の記録（キャッシュ機構維持のため）
@@ -262,7 +262,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         if (use_cache and
             self._cached_feature_matrices is not None and
             self._last_input_shape == input_shape):
-            return self._cached_feature_matrices['Φ_X'], self._cached_feature_matrices['Φ_Y']
+            return self._cached_feature_matrices['Feat_X'], self._cached_feature_matrices['Feat_Y']
 
         # Step 1: 全時点でエンコーダー適用（バッチ処理対応）
         # u_η(y_t) → m_t ∈ R^m (定式化 Section 3.1)
@@ -296,8 +296,8 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         # Step 2: 特徴量マッピング φ_m の構築
         # 定式化 Section 3.3: 同一成分のグループ化 → MLP変換
-        Φ_X_list = []
-        Φ_Y_list = []
+        Feat_X_list = []
+        Feat_Y_list = []
 
         for i in range(N):
             t = i + L  # 実際の時点（Lから開始）
@@ -311,21 +311,21 @@ class StochasticRealizationWithEncoder(nn.Module):
             future_features = M[t:t+L]  # (L, m)
 
             # φ_m 変換: 成分別グループ化 → スカラー出力
-            φ_past = self._apply_feature_mapping(past_features)  # (m,)
-            φ_future = self._apply_feature_mapping(future_features)  # (m,)
+            feat_past = self._apply_feature_mapping(past_features)  # (m,)
+            feat_future = self._apply_feature_mapping(future_features)  # (m,)
 
-            Φ_X_list.append(φ_past)
-            Φ_Y_list.append(φ_future)
+            Feat_X_list.append(feat_past)
+            Feat_Y_list.append(feat_future)
 
-        Φ_X = torch.stack(Φ_X_list, dim=1)  # (m, N)
-        Φ_Y = torch.stack(Φ_Y_list, dim=1)  # (m, N)
+        Feat_X = torch.stack(Feat_X_list, dim=1)  # (m, N)
+        Feat_Y = torch.stack(Feat_Y_list, dim=1)  # (m, N)
 
-        # キャッシュ保存
+        # キャッシュ保存 (勾配グラフ保持のためcloneしない)
         if use_cache:
-            self._cached_feature_matrices = {'Φ_X': Φ_X.clone(), 'Φ_Y': Φ_Y.clone()}
+            self._cached_feature_matrices = {'Feat_X': Feat_X, 'Feat_Y': Feat_Y}
             self._last_input_shape = input_shape
 
-        return Φ_X, Φ_Y
+        return Feat_X, Feat_Y
 
     def _apply_feature_mapping(self, features: torch.Tensor) -> torch.Tensor:
         """
@@ -347,41 +347,41 @@ class StochasticRealizationWithEncoder(nn.Module):
                 m: feature_dim (エンコーダー出力次元)
 
         Returns:
-            φ_output: (m,) マッピング結果
+            feat_output: (m,) マッピング結果
         """
-        ℓ, m = features.shape
+        L_win, m = features.shape
 
         if self.feature_mapping_type == "averaging":
             # 従来の時間平均実装 (Theory equation 345)
             # φ̃_m^(i) ≈ (1/ℓ) Σ_{j=1}^ℓ φ_u^(i)(y(t-j))
-            φ_output = torch.mean(features, dim=0)  # (m,)
+            feat_output = torch.mean(features, dim=0)  # (m,)
 
         elif self.feature_mapping_type in ["linear", "mlp"]:
             # 成分別変換実装 (Theory equation 333)
-            φ_components = []
+            feat_components = []
 
             for i in range(m):
                 # Step 1: 成分iのグループ化
                 # φ_u^(i)(p(t)) = [φ_u^(i)(y(t-1)), ..., φ_u^(i)(y(t-ℓ))]^T ∈ ℝˡ
-                φ_u_i = features[:, i]  # (ℓ,)
+                feat_u_i = features[:, i]  # (ℓ,)
 
                 # Step 2: 成分別変換適用
                 # φ̃_m^(i)(p(t)) = Transform_i(φ_u^(i)(p(t))) ∈ ℝ
-                φ_tilde_i = self.component_transforms[i](φ_u_i)  # (1,)
-                φ_components.append(φ_tilde_i.squeeze())
+                feat_tilde_i = self.component_transforms[i](feat_u_i)  # (1,)
+                feat_components.append(feat_tilde_i.squeeze())
 
             # Step 3: 最終ベクトル構成
-            φ_output = torch.stack(φ_components)  # (m,)
+            feat_output = torch.stack(feat_components)  # (m,)
 
         else:
             raise ValueError(f"Unknown feature_mapping_type: {self.feature_mapping_type}")
 
-        return φ_output
+        return feat_output
 
     def _compute_covariance_blocks(
         self,
-        Φ_X: torch.Tensor,
-        Φ_Y: torch.Tensor
+        Feat_X: torch.Tensor,
+        Feat_Y: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         定式化対応: サンプル共分散ブロック計算
@@ -389,37 +389,37 @@ class StochasticRealizationWithEncoder(nn.Module):
         定式化 Section 3.4:
         - 中心化特徴量行列（サンプル平均減算）
         - サンプル共分散ブロック:
-          G = (1/N) Φ_X Φ_X^T ∈ R^{m×m} (過去の分散)
-          H = (1/N) Φ_Y Φ_Y^T ∈ R^{m×m} (未来の分散)
-          A = (1/N) Φ_Y Φ_X^T ∈ R^{m×m} (過去-未来の共分散)
+          G = (1/N) Feat_X Feat_X^T ∈ R^{m×m} (過去の分散)
+          H = (1/N) Feat_Y Feat_Y^T ∈ R^{m×m} (未来の分散)
+          A = (1/N) Feat_Y Feat_X^T ∈ R^{m×m} (過去-未来の共分散)
 
         Args:
-            Φ_X: 過去特徴量行列 (m, N)
-            Φ_Y: 未来特徴量行列 (m, N)
+            Feat_X: 過去特徴量行列 (m, N)
+            Feat_Y: 未来特徴量行列 (m, N)
 
         Returns:
             G: 過去分散行列 (m, m)
             H: 未来分散行列 (m, m)
             A: 交差共分散行列 (m, m)
         """
-        m, N = Φ_X.shape
+        m, N = Feat_X.shape
 
         # 中心化（サンプル平均減算）
-        Φ_X_mean = torch.mean(Φ_X, dim=1, keepdim=True)  # (m, 1)
-        Φ_Y_mean = torch.mean(Φ_Y, dim=1, keepdim=True)  # (m, 1)
+        Feat_X_mean = torch.mean(Feat_X, dim=1, keepdim=True)  # (m, 1)
+        Feat_Y_mean = torch.mean(Feat_Y, dim=1, keepdim=True)  # (m, 1)
 
-        Φ_X_centered = Φ_X - Φ_X_mean  # (m, N)
-        Φ_Y_centered = Φ_Y - Φ_Y_mean  # (m, N)
+        Feat_X_centered = Feat_X - Feat_X_mean  # (m, N)
+        Feat_Y_centered = Feat_Y - Feat_Y_mean  # (m, N)
 
         # サンプル共分散ブロック
-        G = (Φ_X_centered @ Φ_X_centered.T) / N  # (m, m)
-        H = (Φ_Y_centered @ Φ_Y_centered.T) / N  # (m, m)
-        A = (Φ_Y_centered @ Φ_X_centered.T) / N  # (m, m)
+        G = (Feat_X_centered @ Feat_X_centered.T) / N  # (m, m)
+        H = (Feat_Y_centered @ Feat_Y_centered.T) / N  # (m, m)
+        A = (Feat_Y_centered @ Feat_X_centered.T) / N  # (m, m)
 
         # 統計情報保存（デバッグ用）
         self._feature_statistics = {
-            'past_mean': Φ_X_mean.squeeze(),
-            'future_mean': Φ_Y_mean.squeeze(),
+            'past_mean': Feat_X_mean.squeeze(),
+            'future_mean': Feat_Y_mean.squeeze(),
             'num_samples': N
         }
 
@@ -434,46 +434,46 @@ class StochasticRealizationWithEncoder(nn.Module):
         定式化対応: Ridge正則化による数値安定化
 
         定式化 Section 3.4:
-        Ridge正則化: G_λ = G + λI_m, H_λ = H + λI_m, λ > 0
+        Ridge正則化: G_reg = G + λI_m, H_reg = H + λI_m, λ > 0
 
         Args:
             G: 過去分散行列 (m, m)
             H: 未来分散行列 (m, m)
 
         Returns:
-            G_λ: 正則化過去分散行列 (m, m)
-            H_λ: 正則化未来分散行列 (m, m)
+            G_reg: 正則化過去分散行列 (m, m)
+            H_reg: 正則化未来分散行列 (m, m)
         """
         m = G.size(0)
         I_m = torch.eye(m, device=G.device, dtype=G.dtype)
 
-        G_λ = G + self.ridge_param * I_m
-        H_λ = H + self.ridge_param * I_m
+        G_reg = G + self.ridge_param * I_m
+        H_reg = H + self.ridge_param * I_m
 
-        return G_λ, H_λ
+        return G_reg, H_reg
 
     def _compute_whitening_matrices(
         self,
-        G_λ: torch.Tensor,
-        H_λ: torch.Tensor
+        G_reg: torch.Tensor,
+        H_reg: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         定式化対応: 白色化行列の安定計算
 
         定式化 Section 3.4:
-        白色化行列計算: G_λ^{-1/2}, H_λ^{-1/2} の安定的計算（固有値分解使用）
+        白色化行列計算: G_reg^{-1/2}, H_reg^{-1/2} の安定的計算（固有値分解使用）
 
         数値安定化:
         - 最小固有値クリッピング
         - 条件数管理
 
         Args:
-            G_λ: 正則化過去分散行列 (m, m)
-            H_λ: 正則化未来分散行列 (m, m)
+            G_reg: 正則化過去分散行列 (m, m)
+            H_reg: 正則化未来分散行列 (m, m)
 
         Returns:
-            G_inv_sqrt: G_λ^{-1/2} (m, m)
-            H_inv_sqrt: H_λ^{-1/2} (m, m)
+            G_inv_sqrt: G_reg^{-1/2} (m, m)
+            H_inv_sqrt: H_reg^{-1/2} (m, m)
         """
         def stable_matrix_inv_sqrt(A: torch.Tensor, min_eigval: float = 1e-8) -> torch.Tensor:
             """数値安定的な A^{-1/2} 計算"""
@@ -492,8 +492,8 @@ class StochasticRealizationWithEncoder(nn.Module):
 
             return A_inv_sqrt
 
-        G_inv_sqrt = stable_matrix_inv_sqrt(G_λ)
-        H_inv_sqrt = stable_matrix_inv_sqrt(H_λ)
+        G_inv_sqrt = stable_matrix_inv_sqrt(G_reg)
+        H_inv_sqrt = stable_matrix_inv_sqrt(H_reg)
 
         # 白色化行列保存（デバッグ用）
         self._whitening_matrices = {
@@ -513,16 +513,16 @@ class StochasticRealizationWithEncoder(nn.Module):
         定式化対応: SVDによる正準相関分析
 
         定式化 Section 3.5:
-        1. 白色化された交差ブロック: Ã := H_λ^{-1/2} A G_λ^{-1/2}
-        2. SVD分解: Ã = U Σ V^T
+        1. 白色化された交差ブロック: A_tilde := H_reg^{-1/2} A G_reg^{-1/2}
+        2. SVD分解: A_tilde = U Σ V^T
         3. 正準方向の逆変換:
-           a_i = G_λ^{-1/2} v_i ∈ R^m
-           b_i = H_λ^{-1/2} u_i ∈ R^m
+           a_i = G_reg^{-1/2} v_i ∈ R^m
+           b_i = H_reg^{-1/2} u_i ∈ R^m
 
         Args:
             A: 交差共分散行列 (m, m)
-            G_inv_sqrt: G_λ^{-1/2} (m, m)
-            H_inv_sqrt: H_λ^{-1/2} (m, m)
+            G_inv_sqrt: G_reg^{-1/2} (m, m)
+            H_inv_sqrt: H_reg^{-1/2} (m, m)
 
         Returns:
             U: 左特異ベクトル (m, m)
@@ -530,12 +530,12 @@ class StochasticRealizationWithEncoder(nn.Module):
             V^T: 右特異ベクトル転置 (m, m)
         """
         # 白色化された交差ブロック
-        Ã = H_inv_sqrt @ A @ G_inv_sqrt  # (m, m)
+        A_tilde = H_inv_sqrt @ A @ G_inv_sqrt  # (m, m)
 
         # SVD分解
-        U, Σ, Vt = torch.linalg.svd(Ã, full_matrices=False)
+        U, S_vals, Vt = torch.linalg.svd(A_tilde, full_matrices=False)
 
-        return U, Σ, Vt
+        return U, S_vals, Vt
 
     def _extract_canonical_directions(
         self,
@@ -549,14 +549,14 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         定式化 Section 3.5:
         正準方向の逆変換:
-        a_i = G_λ^{-1/2} v_i ∈ R^m (過去空間での正準方向)
-        b_i = H_λ^{-1/2} u_i ∈ R^m (未来空間での正準方向)
+        a_i = G_reg^{-1/2} v_i ∈ R^m (過去空間での正準方向)
+        b_i = H_reg^{-1/2} u_i ∈ R^m (未来空間での正準方向)
 
         Args:
             U: 左特異ベクトル (m, m)
             Vt: 右特異ベクトル転置 (m, m)
-            G_inv_sqrt: G_λ^{-1/2} (m, m)
-            H_inv_sqrt: H_λ^{-1/2} (m, m)
+            G_inv_sqrt: G_reg^{-1/2} (m, m)
+            H_inv_sqrt: H_reg^{-1/2} (m, m)
 
         Returns:
             canonical_dirs_past: 過去正準方向 a_i (m, r)
@@ -594,20 +594,25 @@ class StochasticRealizationWithEncoder(nn.Module):
         Y = Y.to(self.device)
         self.encoder = self.encoder.to(self.device)
 
+        # キャッシュクリア: 前エポックのgraph freed tensorsを参照しないようにする
+        # fit()→estimate_states()間のみキャッシュ有効
+        self._cached_feature_matrices = None
+        self._last_input_shape = None
+
         # Step 1: 時不変エンコーダーを用いた特徴量行列構築
-        Φ_X, Φ_Y = self._build_feature_matrices(Y)
+        Feat_X, Feat_Y = self._build_feature_matrices(Y)
 
         # Step 2: サンプル共分散ブロック計算
-        G, H, A = self._compute_covariance_blocks(Φ_X, Φ_Y)
+        G, H, A = self._compute_covariance_blocks(Feat_X, Feat_Y)
 
         # Step 3: Ridge正則化
-        G_λ, H_λ = self._apply_ridge_regularization(G, H)
+        G_reg, H_reg = self._apply_ridge_regularization(G, H)
 
         # Step 4: 白色化行列計算
-        G_inv_sqrt, H_inv_sqrt = self._compute_whitening_matrices(G_λ, H_λ)
+        G_inv_sqrt, H_inv_sqrt = self._compute_whitening_matrices(G_reg, H_reg)
 
         # Step 5: 正準相関分析（SVD）
-        U, Σ, Vt = self._solve_canonical_correlation(A, G_inv_sqrt, H_inv_sqrt)
+        U, S_vals, Vt = self._solve_canonical_correlation(A, G_inv_sqrt, H_inv_sqrt)
 
         # Step 6: 正準方向抽出
         canonical_dirs_past, canonical_dirs_future = self._extract_canonical_directions(
@@ -617,7 +622,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         # 学習結果保存
         self.canonical_directions_past = canonical_dirs_past
         self.canonical_directions_future = canonical_dirs_future
-        self.canonical_correlations = Σ[:min(self.num_components, len(Σ))]
+        self.canonical_correlations = S_vals[:min(self.num_components, len(S_vals))]
 
         # 既存実装との整合性: B行列の構築 (B = Σ^{1/2} a^T 形式)
         # 既存filter()メソッドとの互換性確保のため
@@ -651,15 +656,14 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         # キャッシュされた特徴量行列を再利用（fit()で計算済み）
         if self._cached_feature_matrices is not None:
-            Φ_X = self._cached_feature_matrices['Φ_X']  # 過去ブロック特徴量
-            Φ_Y = self._cached_feature_matrices['Φ_Y']  # 未来ブロック特徴量 (未使用)
+            Phi_X = self._cached_feature_matrices['Feat_X']  # 過去ブロック特徴量
         else:
             # キャッシュがない場合のみ再計算
-            Φ_X, Φ_Y = self._build_feature_matrices(Y)
+            Phi_X, _ = self._build_feature_matrices(Y)
 
         # 定式化準拠の状態変数計算
-        # Step 1: 過去プロセス正準変量 z_p(t) = [a_1^T φ_m(p(t)), ..., a_r^T φ_m(p(t))]^T
-        z_p = self.canonical_directions_past.T @ Φ_X  # (r, N)
+        # Step 1: 過去プロセス正準変量 z_p(t) = [a_1^T phi_m(p(t)), ..., a_r^T phi_m(p(t))]^T
+        z_p = self.canonical_directions_past.T @ Phi_X  # (r, N)
 
         # Step 2: 正準相関係数による重み付け x(t) = Σ^{1/2} z_p(t)
         sqrt_canonical_corrs = torch.sqrt(self.canonical_correlations)  # Σ^{1/2} ∈ R^r

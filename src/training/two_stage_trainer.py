@@ -858,24 +858,20 @@ class TwoStageTrainer:
             lr=self.config.lr_psi
         )
         
-        # Phase-2用の統合最適化器
-        if self.config.update_strategy == "all":
-            # 全パラメータ更新
-            phase2_params = list(self.encoder.parameters()) + \
-                           list(self.decoder.parameters()) + \
-                           list(self.df_state.phi_theta.parameters()) + \
-                           list(self.df_obs.psi_omega.parameters())
-        else:
-            # エンコーダ・デコーダのみ更新
-            phase2_params = list(self.encoder.parameters()) + \
-                           list(self.decoder.parameters())
-        
-        self.optimizers['e2e'] = torch.optim.Adam([
-            {'params': self.encoder.parameters(), 'lr': self.config.lr_encoder},
-            {'params': self.decoder.parameters(), 'lr': self.config.lr_decoder},
-            {'params': self.df_state.phi_theta.parameters(), 'lr': self.config.lr_phi},
-            {'params': self.df_obs.psi_omega.parameters(), 'lr': self.config.lr_psi}
-        ])
+        # Phase-2用の統合最適化器 (update_strategyに基づくパラメータ選択)
+        param_groups = [
+            {'params': list(self.encoder.parameters()), 'lr': self.config.lr_encoder},
+            {'params': list(self.decoder.parameters()), 'lr': self.config.lr_decoder},
+        ]
+
+        if self.config.update_strategy in ("all", "joint_all"):
+            param_groups.extend([
+                {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
+                {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi},
+            ])
+
+        self.optimizers['e2e'] = torch.optim.Adam(param_groups)
+        print(f"Phase-2 optimizer: {len(param_groups)} param groups (update_strategy={self.config.update_strategy})")
         
         print("最適化器初期化完了")
     
@@ -1577,6 +1573,12 @@ class TwoStageTrainer:
         self.encoder.train()  # 学習モード有効化
         self.decoder.train()  # 学習モード有効化
 
+        # v4: Phase 2ではDF層を推論モードに設定（dropout無効化）
+        if hasattr(self, 'df_state') and self.df_state is not None:
+            self.df_state.eval()
+        if hasattr(self, 'df_obs') and self.df_obs is not None:
+            self.df_obs.eval()
+
         # Phase-2用オプティマイザが未初期化の場合は初期化
         if 'e2e' not in self.optimizers:
             self._initialize_phase2_optimizer()
@@ -1596,11 +1598,29 @@ class TwoStageTrainer:
             # 逆伝播（既存パターン通り）
             opt_e2e.zero_grad()
             loss_total.backward()
+
+            # 勾配フロー診断: 最初のactive epochでencoder/decoder勾配normを出力
+            if epoch == self.config.phase1_warmup_epochs and not hasattr(self, '_grad_diag_done'):
+                enc_grad_norm = sum(
+                    p.grad.norm().item() for p in self.encoder.parameters()
+                    if p.grad is not None
+                )
+                dec_grad_norm = sum(
+                    p.grad.norm().item() for p in self.decoder.parameters()
+                    if p.grad is not None
+                )
+                enc_has_grad = any(p.grad is not None for p in self.encoder.parameters())
+                print(f"[GradDiag] epoch={epoch}: encoder_grad_norm={enc_grad_norm:.6f}, "
+                      f"decoder_grad_norm={dec_grad_norm:.6f}, encoder_has_grad={enc_has_grad}")
+                print(f"[GradDiag] e2e optimizer param_groups: {len(opt_e2e.param_groups)}")
+                self._grad_diag_done = True
+
             opt_e2e.step()
 
-            # ログ記録（既存パターン通り）
+            # ログ記録（param_groups数に応じて動的にキー生成）
+            group_names = ['encoder', 'decoder', 'phi', 'psi'][:len(opt_e2e.param_groups)]
             lr_dict = {f'lr_{name}': group['lr'] for name, group in
-                      zip(['encoder', 'decoder', 'phi', 'psi'], opt_e2e.param_groups)}
+                      zip(group_names, opt_e2e.param_groups)}
 
             self.logger.log_phase2(epoch, loss_total.item(), rec_loss.item(),
                                   cca_loss.item(), lr_dict)
@@ -1660,9 +1680,10 @@ class TwoStageTrainer:
                 self.df_obs.psi_omega = self.df_obs.psi_omega.to(self.device)
 
             # 軽量確率実現更新（フル_compute_final_operatorsは重いので簡略版）
-            if hasattr(self.realization, 'fit') and isinstance(self.realization, StochasticRealizationWithEncoder):
-                # エンコーダー状態が更新されている場合のみ確率実現を更新
-                self.realization.fit(Y_train, self.encoder)
+            # v4: torch.no_grad()で計算グラフ生成を抑制（不要なメモリ消費・キャッシュ問題を防止）
+            with torch.no_grad():
+                if hasattr(self.realization, 'fit') and isinstance(self.realization, StochasticRealizationWithEncoder):
+                    self.realization.fit(Y_train, self.encoder)
 
         except Exception as e:
             print(f"軽量作用素更新でエラー: {e}")
@@ -1916,20 +1937,17 @@ class TwoStageTrainer:
             # 定式化準拠: 短時系列はサポートしない
             raise RuntimeError(f"時系列長({T})が短すぎます: T <= 2*h({2*h})。定式化準拠のためエラー。")
 
-        # Step 1: エンコード y_t → m_t（多変量特徴量対応）
-        M_features = self.encoder(Y_train)  # (T, d) or (T, H, W, C) → (T, m)
-
-        if M_features.dim() == 1:
-            M_features = M_features.unsqueeze(1)  # (T,) → (T, 1)
-
-        # Step 2: 確率的実現 M_t → x_t（多変量対応）
+        # Step 1-2: 確率的実現（encoder → feature matrices → CCA → states）
         try:
             if isinstance(self.realization, StochasticRealizationWithEncoder):
-                # StochasticRealizationWithEncoderの場合：多変量特徴量を直接処理
+                # StochasticRealizationWithEncoderの場合：内部でencoderを呼ぶため外側は不要
                 self.realization.fit(Y_train, self.encoder)
                 X_states = self.realization.estimate_states(Y_train)
             else:
-                # 従来Realizationの場合：スカラー化
+                # 従来Realizationの場合：外側でencoder→スカラー化
+                M_features = self.encoder(Y_train)  # (T, d) or (T, H, W, C) → (T, m)
+                if M_features.dim() == 1:
+                    M_features = M_features.unsqueeze(1)  # (T,) → (T, 1)
                 m_scalar = M_features.mean(dim=1)  # (T, m) → (T,)
                 self.realization.fit(m_scalar.unsqueeze(1))
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
@@ -1938,8 +1956,8 @@ class TwoStageTrainer:
             # RealizationErrorを上位に再投げして完全エポックスキップを実行
             raise RealizationError(f"Phase2 realization failed: {e}") from e
 
-        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}
-        X_hat_states = self.df_state.predict_sequence(X_states)  # (T_pred, r)
+        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}（勾配を保持してend-to-end学習）
+        X_hat_states = self.df_state.predict_sequence(X_states, training=True)  # (T_pred, r)
         T_pred = X_hat_states.size(0)
 
         # Step 4: DF-B予測 x̂_{t|t-1} → m̂_{t|t-1}（多変量対応）
@@ -2008,8 +2026,8 @@ class TwoStageTrainer:
             print(f"Phase2 Target RealizationError発生: {e}")
             raise RealizationError(f"Phase2 target realization failed: {e}") from e
 
-        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}
-        X_hat_states = self.df_state.predict_sequence(X_states)
+        # Step 3: DF-A予測 x_{t-1} → x̂_{t|t-1}（勾配を保持してend-to-end学習）
+        X_hat_states = self.df_state.predict_sequence(X_states, training=True)
         T_pred = X_hat_states.size(0)
 
         # Step 4: DF-B予測 x̂_{t|t-1} → m̂_{t|t-1}

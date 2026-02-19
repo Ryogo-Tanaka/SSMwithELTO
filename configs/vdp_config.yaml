@@ -1,0 +1,117 @@
+# ====================================================================
+# VDP Oscillator Mode Decomposition Config (Paper Table 8)
+# Encoder: MLP 30->64->64->50 (tanh)
+# Decoder: MLP 50->64->64->30 (linear output)
+# Realization: r=9, past_horizon=20, m=50
+# DF-A: feature_dim=30 (dA=30), lambda_A=0.01
+# DF-B: obs_feature_dim=30 (dB=30), multivariate_feature_dim=50
+# Training: 25 epochs (5 warmup + 20 end-to-end), batch_size=100
+# ====================================================================
+
+experiment:
+  mode: "reconstruction"
+
+data:
+  train_ratio: 0.85
+  val_ratio: 0.15
+  test_ratio: 0.0
+  normalization: "none"
+  batch_size: 100
+
+model:
+  encoder:
+    type: "time_invariant"
+    input_dim: 30             # Hankel window size
+    output_dim: 50            # Paper Table 8: m=50
+    architecture: "mlp"
+    hidden_dims: [64, 64]     # Paper Table 8: 2 hidden layers of 64
+    activation: "Tanh"        # Paper Table 8: tanh
+    dropout: 0.0
+    normalize_input: false
+    normalize_output: false
+    track_running_stats: false
+
+  decoder:
+    type: "time_invariant"
+    input_dim: 50             # Must match encoder output_dim
+    output_dim: 30            # Must match encoder input_dim (Hankel window)
+    architecture: "mlp"
+    hidden_dims: [64, 64]     # Paper Table 8: 2 hidden layers of 64
+    activation: "Tanh"        # Internal activation (output is linear)
+    dropout: 0.0
+
+training:
+  epochs: 25                  # 5 warmup + 20 end-to-end
+  T1_iterations: 1
+  T2_iterations: 1
+  phase1_warmup_epochs: 5     # Paper Table 8: Stage-1 = 5
+
+  experiment_mode: "reconstruction"
+  target_loss_weight: 0.0
+  reconstruction_loss_weight: 1.0
+
+  lr_phi: 1e-3
+  lr_psi: 1e-3
+  lr_encoder: 1e-3            # Adam default
+  lr_decoder: 1e-3            # Adam default
+  lambda_cca: 0.0001
+  weight_decay: 1e-6
+  update_strategy: "encoder_decoder_only"
+
+ssm:
+  realization:
+    past_horizon: 20          # Paper Table 8: l=20
+    rank: 9                   # Paper Table 8: r=9
+    encoder_output_dim: 50    # Paper Table 8: m=50
+    ridge_param: 1e-3
+    jitter: 1e-6
+    m: 50                     # Paper Table 8: m=50
+
+    feature_mapping:
+      type: "mlp"
+      hidden_dims: [32]
+      activation: "relu"
+
+  df_state:
+    feature_dim: 30           # Paper Table 8: dA=30
+    lambda_A: 1e-2            # Paper Table 8: lambda_A=0.01
+    lambda_B: 1e-3
+    feature_net:
+      hidden_sizes: [128, 64]
+      activation: "ReLU"
+      dropout: 0.1
+    cross_fitting:
+      n_blocks: 5
+      min_block_size: 100
+
+  df_observation:
+    obs_feature_dim: 30       # Paper Table 8: dB=30
+    multivariate_feature_dim: 50  # Paper Table 8: m=50
+    lambda_B: 1e-3
+    lambda_dB: 1e-3
+    obs_net:
+      hidden_sizes: [64, 32]
+      activation: "ReLU"
+      dropout: 0.1
+    cross_fitting:
+      n_blocks: 5
+      min_block_size: 100
+
+computation:
+  device: "auto"
+  num_workers: 4
+  pin_memory: true
+
+output:
+  save_model: true
+  save_history: true
+  create_plots: false
+  save_reconstructions: false
+
+logging:
+  level: "INFO"
+  console_output: true
+  file_output: true
+
+evaluation:
+  use_new_realization: true

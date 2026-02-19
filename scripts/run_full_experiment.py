@@ -20,6 +20,7 @@ python scripts/run_full_experiment.py \
 """
 
 import argparse
+import random
 import sys
 import yaml
 import json
@@ -30,6 +31,15 @@ from typing import Dict, Any, Optional
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+
+
+def set_random_seed(seed: int):
+    """Set random seed for reproducibility across all libraries."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"Random seed set: {seed}")
 
 # プロジェクトルートパス設定
 SCRIPT_DIR = Path(__file__).parent
@@ -111,21 +121,89 @@ class FullExperimentPipeline:
         # データ読み込み設定
         data_config = self.config.get('data', {})
 
-        # 統一データローダーによる読み込み（アーキテクチャ対応）
-        print(f"データ読み込み: {data_path}")
-        datasets = load_experimental_data_with_architecture(
-            data_path=data_path,
-            config=self.config,  # 全体設定を渡してアーキテクチャ判定
-            split="all",
-            return_dataloaders=False
-        )
+        # 論文データプロトコル: train_obs全体→学習, test_obs→評価 (標準ローダーをスキップ)
+        paper_protocol = data_config.get('paper_data_protocol', False)
+        datasets = {}
 
-        # 後方互換性のためTensor辞書形式に変換
-        data_dict = {split: dataset.get_full_data() for split, dataset in datasets.items()}
-        data_dict['metadata'] = datasets['train'].metadata
+        if paper_protocol:
+            print("=== Paper Data Protocol ===")
+            print(f"  データ読み込み: {data_path}")
+            print("  train_obs全体→学習, test_obs→評価 (論文準拠)")
+            raw = np.load(data_path)
 
-        # ターゲットデータをdata_dictに追加（包括的対応）
-        for split, dataset in datasets.items():
+            # Handle both 5D (1,T,H,W,C) clean data and 4D (T,H,W,C) noisy data
+            train_obs_raw = raw['train_obs']
+            if train_obs_raw.ndim == 5 and train_obs_raw.shape[0] == 1:
+                train_obs = train_obs_raw[0].astype(np.float32) / 255.0
+            else:
+                train_obs = train_obs_raw.astype(np.float32) / 255.0
+
+            test_obs_raw = raw['test_obs']
+            if test_obs_raw.ndim == 5 and test_obs_raw.shape[0] == 1:
+                test_obs = test_obs_raw[0].astype(np.float32) / 255.0
+            else:
+                test_obs = test_obs_raw.astype(np.float32) / 255.0
+
+            train_tensor = torch.from_numpy(train_obs).float()
+            test_tensor = torch.from_numpy(test_obs).float()
+
+            # val: train末尾の一部をモニタリング用に使用
+            val_size = min(300, len(train_tensor) // 5)
+
+            # メタデータ作成
+            T_train = train_obs.shape[0]
+            metadata = DataMetadata(
+                original_shape=train_obs.shape,
+                feature_names=[f"pixel_{i}" for i in range(train_obs.shape[-1])],
+                time_index=None,
+                sampling_rate=None,
+                missing_ratio=0.0,
+                data_source=str(data_path),
+                normalization_method="unit_scale",
+                train_indices=(0, T_train),
+                val_indices=(T_train - val_size, T_train),
+                test_indices=(0, test_obs.shape[0]),
+                has_target_data='train_targets' in raw,
+                target_shape=tuple(raw['train_targets'].shape) if 'train_targets' in raw else None
+            )
+
+            data_dict = {
+                'train': train_tensor,
+                'val': train_tensor[-val_size:],
+                'test': test_tensor,
+                'metadata': metadata
+            }
+
+            # ターゲットデータもロード
+            if 'train_targets' in raw:
+                train_tgt_raw = raw['train_targets']
+                train_targets = train_tgt_raw[0] if (train_tgt_raw.ndim >= 2 and train_tgt_raw.shape[0] == 1) else train_tgt_raw
+                test_tgt_raw = raw['test_targets']
+                test_targets = test_tgt_raw[0] if (test_tgt_raw.ndim >= 2 and test_tgt_raw.shape[0] == 1) else test_tgt_raw
+                data_dict['train_targets'] = torch.from_numpy(train_targets).float()
+                data_dict['test_targets'] = torch.from_numpy(test_targets).float()
+                print(f"  Train targets: {data_dict['train_targets'].shape}")
+                print(f"  Test targets: {data_dict['test_targets'].shape}")
+
+            print(f"  Train: {data_dict['train'].shape}")
+            print(f"  Val (monitoring): {data_dict['val'].shape}")
+            print(f"  Test (test_obs): {data_dict['test'].shape}")
+        else:
+            # 標準データローダーによる読み込み（アーキテクチャ対応）
+            print(f"データ読み込み: {data_path}")
+            datasets = load_experimental_data_with_architecture(
+                data_path=data_path,
+                config=self.config,
+                split="all",
+                return_dataloaders=False
+            )
+
+            # 後方互換性のためTensor辞書形式に変換
+            data_dict = {split: dataset.get_full_data() for split, dataset in datasets.items()}
+            data_dict['metadata'] = datasets['train'].metadata
+
+        # ターゲットデータをdata_dictに追加（包括的対応 — paper_protocol時はスキップ）
+        for split, dataset in (datasets.items() if not paper_protocol else []):
             if hasattr(dataset, 'target_data') and dataset.target_data is not None:
                 # データセットが検出したターゲットデータを保存
                 split_size = data_dict[split].shape[0]
@@ -979,6 +1057,11 @@ class FullExperimentPipeline:
             trainer.decoder.eval()
         if hasattr(trainer, 'target_decoder') and trainer.target_decoder is not None:
             trainer.target_decoder.eval()
+        # CRITICAL FIX: Set DF layers to evaluation mode
+        if hasattr(trainer, 'df_state') and trainer.df_state is not None:
+            trainer.df_state.eval()
+        if hasattr(trainer, 'df_obs') and trainer.df_obs is not None:
+            trainer.df_obs.eval()
 
         with torch.no_grad():
             try:
@@ -1332,6 +1415,11 @@ class FullExperimentPipeline:
                 # 既存の再構成プロセスを活用
                 trainer.encoder.eval()
                 trainer.decoder.eval()
+                # CRITICAL FIX: Set DF layers to evaluation mode
+                if hasattr(trainer, 'df_state') and trainer.df_state is not None:
+                    trainer.df_state.eval()
+                if hasattr(trainer, 'df_obs') and trainer.df_obs is not None:
+                    trainer.df_obs.eval()
 
                 # 既存の_forward_and_loss_phase2_reconstruction()プロセスを部分実行
                 reconstructed_data = self._perform_reconstruction_with_existing_process(test_data, trainer)
@@ -1345,6 +1433,11 @@ class FullExperimentPipeline:
                 with torch.no_grad():
                     trainer.encoder.eval()
                     trainer.decoder.eval()
+                    # CRITICAL FIX: Set DF layers to evaluation mode
+                    if hasattr(trainer, 'df_state') and trainer.df_state is not None:
+                        trainer.df_state.eval()
+                    if hasattr(trainer, 'df_obs') and trainer.df_obs is not None:
+                        trainer.df_obs.eval()
                     loss_total, loss_rec, loss_cca = trainer._forward_and_loss_phase2_reconstruction(test_data)
 
                     # 既存プロセスから再構成データを抽出（部分的に再実行）
@@ -1446,6 +1539,10 @@ def parse_args():
         help='計算デバイス (auto選択時はNone)'
     )
     parser.add_argument(
+        '--seed', type=int, default=None,
+        help='Random seed for reproducibility'
+    )
+    parser.add_argument(
         '--use-kalman', action='store_true',
         help='Kalmanフィルタリング有効化'
     )
@@ -1480,7 +1577,11 @@ def main():
     
     print("実験開始")
     print("="*5)
-    
+
+    # Set random seed for reproducibility
+    if args.seed is not None:
+        set_random_seed(args.seed)
+
     # 設定読み込み
     config = load_experiment_config(args.config)
     

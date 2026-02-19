@@ -120,6 +120,14 @@ class UniversalTimeSeriesDataset(Dataset):
         # メタデータ作成
         self._create_metadata(raw_data, split_data, feature_names)
 
+    def _squeeze_leading_batch_dim(self, data: np.ndarray) -> np.ndarray:
+        """先頭のバッチ次元が1の場合に削除: (1,T,...) → (T,...)"""
+        if data.ndim >= 2 and data.shape[0] == 1:
+            squeezed = np.squeeze(data, axis=0)
+            print(f"  バッチ次元削除: {data.shape} → {squeezed.shape}")
+            return squeezed
+        return data
+
     def _detect_target_data(self, data: dict) -> Dict[str, Any]:
         """ターゲットデータの自動検出（quad_linkデータ対応・キャッシュ対応）"""
         # クラスレベルキャッシュで重複処理を防ぐ
@@ -153,35 +161,25 @@ class UniversalTimeSeriesDataset(Dataset):
 
         for key in target_keys_train:
             if key in data:
-                candidate = data[key]
-                # (1, T, d) → (T, d) へのreshape対応
-                if candidate.ndim == 3 and candidate.shape[0] == 1:
-                    target_train = candidate.reshape(candidate.shape[1], candidate.shape[2])
-                elif candidate.ndim == 2:
-                    target_train = candidate
+                target_train = self._squeeze_leading_batch_dim(data[key])
                 print(f"訓練ターゲットデータ検出: '{key}' → shape={target_train.shape}")
                 break
 
         for key in target_keys_test:
             if key in data:
-                candidate = data[key]
-                # (1, T, d) → (T, d) へのreshape対応
-                if candidate.ndim == 3 and candidate.shape[0] == 1:
-                    target_test = candidate.reshape(candidate.shape[1], candidate.shape[2])
-                elif candidate.ndim == 2:
-                    target_test = candidate
+                target_test = self._squeeze_leading_batch_dim(data[key])
                 print(f"テストターゲットデータ検出: '{key}' → shape={target_test.shape}")
                 break
 
         for key in input_keys_train:
             if key in data:
-                input_train = data[key]
+                input_train = self._squeeze_leading_batch_dim(data[key])
                 print(f"訓練入力データ検出: '{key}' → shape={input_train.shape}")
                 break
 
         for key in input_keys_test:
             if key in data:
-                input_test = data[key]
+                input_test = self._squeeze_leading_batch_dim(data[key])
                 print(f"テスト入力データ検出: '{key}' → shape={input_test.shape}")
                 break
 
@@ -454,10 +452,18 @@ class UniversalTimeSeriesDataset(Dataset):
         train_end = int(train_ratio * T)
         val_end = int((train_ratio + val_ratio) * T)
         
+        # ゼロ長テンソル回避: val/testが空の場合は最低1サンプルを確保
+        val_data = data[train_end:val_end]
+        test_data = data[val_end:]
+        if val_data.shape[0] == 0:
+            val_data = data[max(0, train_end-1):train_end]
+        if test_data.shape[0] == 0:
+            test_data = data[-1:]
+
         splits = {
             "train": data[:train_end],
-            "val": data[train_end:val_end],
-            "test": data[val_end:]
+            "val": val_data,
+            "test": test_data
         }
         
         # 分割インデックス記録
@@ -866,7 +872,8 @@ def load_experimental_data_with_architecture(
         #   - モデル用: image_shape, target_shape (モデル構築時に参照)
         dataset_params = {k: v for k, v in data_config.items()
                          if k not in ['batch_size', 'num_workers', 'pin_memory',
-                                     'image_shape', 'target_shape']}
+                                     'image_shape', 'target_shape',
+                                     'paper_data_protocol']}
 
         if split == "all":
             # 全分割を返す
@@ -921,7 +928,8 @@ def load_experimental_data_with_architecture(
         # データセット・DataLoader・モデル パラメータ分離（時系列データ用も同様の処理）
         dataset_params = {k: v for k, v in data_config.items()
                          if k not in ['batch_size', 'num_workers', 'pin_memory',
-                                     'image_shape', 'target_shape']}
+                                     'image_shape', 'target_shape',
+                                     'paper_data_protocol']}
 
         if split == "all":
             datasets = {}

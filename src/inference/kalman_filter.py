@@ -471,16 +471,23 @@ class OperatorBasedKalmanFilter:
         cov_matrix = (cov_matrix + cov_matrix.T) / 2
         
         # 固有値分解
+        d = cov_matrix.size(0)
+        eye = torch.eye(d, device=self.device)
         try:
             eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
-        except:
-            # 失敗時はjitter追加で対応
-            cov_matrix += self.jitter * torch.eye(cov_matrix.size(0), device=self.device)
-            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
-            
+        except Exception:
+            # jitter追加でリトライ
+            cov_matrix = cov_matrix + self.jitter * eye
+            try:
+                eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
+            except Exception:
+                # eigh完全失敗時: 対角成分のみ使用してフォールバック
+                diag_vals = torch.clamp(torch.diag(cov_matrix), min=self.min_eigenvalue)
+                return torch.diag(diag_vals)
+
         # 負の固有値をクリップ
         eigenvalues = torch.clamp(eigenvalues, min=self.min_eigenvalue)
-        
+
         # 再構成
         cov_matrix = eigenvectors @ torch.diag(eigenvalues) @ eigenvectors.T
         

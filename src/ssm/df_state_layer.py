@@ -99,7 +99,7 @@ class DFStateLayer(nn.Module):
         self,
         state_dim: int,
         feature_dim: int,
-        lambda_A: float = 1e-3,
+        lambda_A: float = 1e-3,  # 旧デフォルト
         lambda_B: float = 1e-3,
         feature_net_config: Optional[Dict[str, Any]] = None,
         cross_fitting_config: Optional[Dict[str, Any]] = None
@@ -1115,45 +1115,54 @@ class DFStateLayer(nn.Module):
             return (U_A.T @ phi_pred.T).T
     
     def predict_sequence(
-        self, 
-        X_states: torch.Tensor, 
-        return_features: bool = False
+        self,
+        X_states: torch.Tensor,
+        return_features: bool = False,
+        training: bool = False
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
-        系列予測: 各時刻でのone-step-ahead予測（推論専用モード）
-        
+        系列予測: 各時刻でのone-step-ahead予測
+
         Args:
             X_states: 状態系列 (T, r)
             return_features: 特徴量も返すかどうか
-            
+            training: Trueの場合、勾配を保持（Phase 2 end-to-end学習用）
+
         Returns:
             torch.Tensor: 予測系列 (T-1, r)
             Optional[torch.Tensor]: 特徴量系列 (T-1, d_A)
         """
         if not self._is_fitted and 'V_A' not in self._stage1_cache:
             raise RuntimeError("学習が完了していません")
-        
+
         T = X_states.size(0)
         predictions = []
         features = []
-        
-        # 推論専用モードで実行（勾配グラフを切断）
-        with torch.no_grad():
+
+        def _predict_loop():
             for t in range(T - 1):
                 x_pred = self.predict_one_step(X_states[t])
                 predictions.append(x_pred)
-                
+
                 if return_features:
                     phi_prev = self.phi_theta(X_states[t])
                     phi_pred = self.apply_transfer_operator(phi_prev)
                     features.append(phi_pred)
-        
+
+        if training:
+            # Phase 2学習時: 勾配を保持してencoder→DF-A→decoder経路を通す
+            _predict_loop()
+        else:
+            # 推論時: torch.no_gradでメモリ節約
+            with torch.no_grad():
+                _predict_loop()
+
         pred_tensor = torch.stack(predictions)
-        
+
         if return_features:
             feat_tensor = torch.stack(features)
             return pred_tensor, feat_tensor
-        
+
         return pred_tensor
     
     def get_transfer_operator(self) -> torch.Tensor:

@@ -475,7 +475,7 @@ class TargetPredictionMetrics:
         Args:
             y_true: 真値テンソル (T, d)
             y_pred: 予測値テンソル (T, d)
-            metrics: 計算する指標のリスト ['rmse', 'mae', 'r2', 'r2_per_dim']
+            metrics: 計算する指標のリスト ['mse', 'rmse', 'mae', 'r2', 'r2_per_dim']
             verbose: ターミナル出力するかどうか
 
         Returns:
@@ -498,6 +498,7 @@ class TargetPredictionMetrics:
 
         # 利用可能な評価指標定義
         available_metrics = {
+            'mse': lambda: F.mse_loss(y_pred, y_true).item(),
             'rmse': lambda: torch.sqrt(F.mse_loss(y_pred, y_true)).item(),
             'mae': lambda: F.l1_loss(y_pred, y_true).item(),
             'r2': lambda: self._compute_r2_score(y_true, y_pred),
