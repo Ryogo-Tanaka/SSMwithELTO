@@ -1,4 +1,4 @@
-# src/models/architectures/tcn.py (修正版 - エンコーダ部分のみ)
+# src/models/architectures/tcn.py (encoder only)
 
 import math
 from typing import Optional, Tuple, List, Dict, Any
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 
 # --------------------------
-# Low-level building blocks (変更なし)
+# Low-level building blocks
 # --------------------------
 class _CausalConv1dZeroMean(nn.Module):
     """
@@ -50,7 +50,7 @@ class _CausalConv1dZeroMean(nn.Module):
 
 class _ResidualTCNBlock(nn.Module):
     """
-    [Causal dilated conv (ΣW=0)] -> Act -> (Dropout) -> LayerNorm -> Residual
+    [Causal dilated conv (sum W=0)] -> Act -> (Dropout) -> LayerNorm -> Residual
     """
     def __init__(self, channels: int, kernel_size: int, dilation: int,
                  activation: str = "GELU", dropout: float = 0.0):
@@ -75,12 +75,12 @@ class _ResidualTCNBlock(nn.Module):
     # ---- one-step update for stateful inference ----
     @torch.no_grad()
     def step_infer(self,
-                   h_prev_t: torch.Tensor,        # [B, C] : h^{(ℓ-1)}_t  (current time, for residual)
-                   buf_prev: torch.Tensor,        # [B, C, R_prev] : ring buffer of h^{(ℓ-1)}
+                   h_prev_t: torch.Tensor,        # [B, C] : h^{(l-1)}_t  (current time, for residual)
+                   buf_prev: torch.Tensor,        # [B, C, R_prev] : ring buffer of h^{(l-1)}
                    ptr_prev: int                  # write pointer of buf_prev (points to next write index)
                    ) -> torch.Tensor:
         """
-        Compute one-step output h^{(ℓ)}_t using only the previous-layer ring buffer.
+        Compute one-step output h^{(l)}_t using only the previous-layer ring buffer.
         This runs under no_grad by default; remove decorator if you need grad.
         """
         B, C, R_prev = buf_prev.shape
@@ -111,39 +111,39 @@ class _ResidualTCNBlock(nn.Module):
 
 
 # --------------------------
-# Encoder - **修正版**
+# Encoder
 # --------------------------
 class tcnEncoder(nn.Module):
     """
-    **修正版**: 提案手法対応 Residual-TCN encoder
-    
-    **主な変更点**:
-    1. output_dim=1 をデフォルトに（スカラー特徴量生成）
-    2. 中心化処理の追加（弱定常性向上）
-    3. 出力の一貫性チェック
-    4. **新機能**: type パラメータの処理追加
-    
-    変換フロー:
+    Residual-TCN encoder for the proposed method.
+
+    Features:
+    1. output_dim=1 by default (scalar feature generation)
+    2. Centering for improved weak stationarity
+    3. Output shape consistency check
+    4. Factory pattern support via 'type' parameter
+
+    Transform flow:
       (B, T, d) --permute--> (B, d, T)
         --1x1 Conv(d->C)--> (B, C, T)
         --[Residual TCN x L]--> (B, C, T)
         --1x1 Conv(C->p)--> (B, p, T) --permute--> (B, T, p)
-        --center--> (B, T, p) [中心化]
-    
+        --center--> (B, T, p) [centering]
+
     Args:
-      type:        エンコーダタイプ（"tcn"等、ファクトリーパターン対応）
-      input_dim:   d (観測次元)
-      output_dim:  p=1 (スカラー特徴量、デフォルト)
-      channels:    C (隠れ次元)
-      layers:      L (残差ブロック数)
-      kernel_size: K (FIRフィルタ長)
-      activation:  活性化関数
-      dropout:     ドロップアウト率
-      center_output: 出力を中心化するか（弱定常性向上）
+      type:        Encoder type (for factory pattern, e.g. "tcn")
+      input_dim:   d (observation dimension)
+      output_dim:  p=1 (scalar feature, default)
+      channels:    C (hidden dimension)
+      layers:      L (number of residual blocks)
+      kernel_size: K (FIR filter length)
+      activation:  Activation function name
+      dropout:     Dropout rate
+      center_output: Whether to center output (improves weak stationarity)
     """
     def __init__(self,
                  input_dim: int,
-                 type: Optional[str] = None,  # **追加**: ファクトリーパターン対応
+                 type: Optional[str] = None,  # factory pattern support
                  output_dim: int = 1,
                  channels: int = 64,
                  layers: int = 6,
@@ -151,14 +151,14 @@ class tcnEncoder(nn.Module):
                  activation: str = "GELU",
                  dropout: float = 0.0,
                  center_output: bool = True,
-                 **kwargs):  # **追加**: 未知のパラメータを受け取る
+                 **kwargs):  # accept unknown parameters
         super().__init__()
-        
-        # **新機能**: type パラメータの検証
+
+        # validate type parameter
         if type is not None and type != "tcn":
-            raise ValueError(f"tcnEncoder は type='tcn' のみサポート。指定値: {type}")
-        
-        self.encoder_type = type or "tcn"  # **追加**: タイプ情報保存
+            raise ValueError(f"tcnEncoder only supports type='tcn'. Got: {type}")
+
+        self.encoder_type = type or "tcn"
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.channels = channels
@@ -180,7 +180,7 @@ class tcnEncoder(nn.Module):
         self.tcn = nn.Sequential(*blocks)
         self.out_proj = nn.Conv1d(channels, output_dim, kernel_size=1)
 
-        # **修正**: スカラー出力の場合は小さな初期値
+        # small initial values for scalar output
         if output_dim == 1:
             nn.init.xavier_uniform_(self.out_proj.weight, gain=0.01)
         else:
@@ -192,49 +192,47 @@ class tcnEncoder(nn.Module):
     # ---------- stateless forward (batch) ----------
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         """
-        **修正版**: 中心化処理付き前向き計算
-        
+        Forward pass with centering.
+
         Args:
-            y: [B, T, d] 観測系列
+            y: [B, T, d] observation sequence
         Returns:
-            u: [B, T, p] 特徴量系列（デフォルトでp=1のスカラー）
+            u: [B, T, p] feature sequence (scalar p=1 by default)
         """
-        # 入力検証
+        # input validation
         if y.dim() != 3:
-            raise ValueError(f"入力は3次元 [B, T, d] であるべき: got {y.shape}")
-        
+            raise ValueError(f"Input must be 3D [B, T, d]: got {y.shape}")
+
         B, T, d = y.shape
         if d != self.input_dim:
-            raise ValueError(f"入力次元不一致: expected {self.input_dim}, got {d}")
-        
+            raise ValueError(f"Input dim mismatch: expected {self.input_dim}, got {d}")
+
         x = y.transpose(1, 2)        # [B, d, T]
         h = self.in_proj(x)          # [B, C, T]
         h = self.tcn(h)              # [B, C, T]
         u = self.out_proj(h)         # [B, p, T]
         u = u.transpose(1, 2)        # [B, T, p]
-        
-        # **新機能**: 中心化処理（弱定常性向上）
+
+        # centering (improves weak stationarity)
         if self.center_output:
             u_mean = u.mean(dim=1, keepdim=True)  # [B, 1, p]
             u = u - u_mean
-        
-        # **修正**: スカラー出力の場合は形状確認
+
+        # shape check for scalar output
         if self.output_dim == 1:
-            assert u.size(2) == 1, f"スカラー出力のはずが {u.size(2)} 次元"
-            # 必要に応じて squeeze: [B, T, 1] -> [B, T]
-            # ただし、一貫性のため [B, T, 1] を維持
-        
+            assert u.size(2) == 1, f"Expected scalar output but got dim {u.size(2)}"
+            # keep [B, T, 1] for consistency
+
         return u
-    
-    # **新機能**: スカラー特徴量生成の便利メソッド
+
     def encode_to_scalar(self, y: torch.Tensor) -> torch.Tensor:
         """
-        観測系列をスカラー特徴量系列に変換
-        
+        Convert observation sequence to scalar feature sequence.
+
         Args:
-            y: [B, T, d] または [T, d]
+            y: [B, T, d] or [T, d]
         Returns:
-            m: [B, T] または [T] (スカラー特徴量)
+            m: [B, T] or [T] (scalar features)
         """
         if y.dim() == 2:
             # [T, d] -> [1, T, d]
@@ -242,13 +240,13 @@ class tcnEncoder(nn.Module):
             single_batch = True
         else:
             single_batch = False
-        
+
         u = self.forward(y)  # [B, T, 1]
         m = u.squeeze(-1)    # [B, T]
-        
+
         if single_batch:
             m = m.squeeze(0)  # [T]
-        
+
         return m
 
     # ---------- helpers ----------
@@ -267,9 +265,9 @@ class tcnEncoder(nn.Module):
         """
         Initialize ring buffers for stateful one-step inference.
         Returns a dict with:
-          - 'bufs': list of length L; bufs[ℓ] is [B, C, R_ℓ] storing h^{(ℓ)} history
+          - 'bufs': list of length L; bufs[l] is [B, C, R_l] storing h^{(l)} history
           - 'ptrs': list of length L; current write positions (int)
-        Note: layer ℓ uses buffer of previous layer (ℓ-1).
+        Note: layer l uses buffer of previous layer (l-1).
         """
         if device is None:
             device = next(self.parameters()).device
@@ -323,9 +321,9 @@ class tcnEncoder(nn.Module):
             # previous-layer buffer index = ell-1
             buf_prev = bufs[ell - 1]
             ptr_prev = ptrs[ell - 1]
-            # compute current layer output h^{(ℓ)}_t
+            # compute current layer output h^{(l)}_t
             h_cur = block.step_infer(h_prev_t=h_prev, buf_prev=buf_prev, ptr_prev=ptr_prev)
-            # push h^{(ℓ)}_t into its own buffer (unless this is the top layer)
+            # push h^{(l)}_t into its own buffer (unless this is the top layer)
             if ell < self.layers:
                 buf_this = bufs[ell]
                 ptr_this = ptrs[ell]
@@ -335,26 +333,26 @@ class tcnEncoder(nn.Module):
 
         # 3) final 1x1 conv to project to p
         u_t = self.out_proj(h_prev.unsqueeze(-1)).squeeze(-1)   # [B, p]
-        
-        # **新機能**: 逐次中心化（簡略化版）
+
+        # approximate centering using batch mean
         if self.center_output:
-            # 注意: 完全な中心化には過去の平均が必要
-            # ここでは簡略化してバッチ内平均で近似
+            # Note: exact centering requires past history mean;
+            # here we approximate with batch mean
             u_mean = u_t.mean(dim=0, keepdim=True)  # [1, p]
             u_t = u_t - u_mean
-        
+
         # state mutated in-place (bufs/ptrs updated)
         return u_t, state
 
 
 # --------------------------
-# Decoder (変更なし、既存のまま)
+# Decoder
 # --------------------------
 def _takens_window(u: torch.Tensor, window: int, tau: int) -> torch.Tensor:
     """
     Make Takens-style delay embedding (left-zero-padded).
       u: [B, T, 1]  ->  Z: [B, T, window]
-      Z[t] = [u_t, u_{t-τ}, ..., u_{t-(window-1)τ}]
+      Z[t] = [u_t, u_{t-tau}, ..., u_{t-(window-1)*tau}]
     """
     B, T, P = u.shape
     assert P == 1, "Decoder expects scalar feature series u: [B,T,1]."
@@ -385,10 +383,10 @@ class tcnDecoder(nn.Module):
         Merge: H = H_S + H_T
         Output: y_hat = Linear(d_h -> n)  # [B, T, n]
     Args:
-      type:        デコーダタイプ（"tcn"等、ファクトリーパターン対応）
+      type:        Decoder type (for factory pattern, e.g. "tcn")
       output_dim:  n   (dimension of reconstructed observation)
       window:      l   (Takens window length)
-      tau:         τ   (delay step)
+      tau:         delay step
       hidden:      d_h (merged hidden size before final linear)
       ma_kernel:   K_ma (moving-average window for trend cue)
       gru_hidden:  hidden size of the GRU in trend path
@@ -397,7 +395,7 @@ class tcnDecoder(nn.Module):
     """
     def __init__(self,
                  output_dim: int,
-                 type: Optional[str] = None,  # **追加**: ファクトリーパターン対応
+                 type: Optional[str] = None,  # factory pattern support
                  window: int = 8,
                  tau: int = 1,
                  hidden: int = 64,
@@ -405,14 +403,14 @@ class tcnDecoder(nn.Module):
                  gru_hidden: int = 64,
                  activation: str = "GELU",
                  dropout: float = 0.0,
-                 **kwargs):  # **追加**: 未知のパラメータを受け取る
+                 **kwargs):  # accept unknown parameters
         super().__init__()
-        
-        # **新機能**: type パラメータの検証
+
+        # validate type parameter
         if type is not None and type != "tcn":
-            raise ValueError(f"tcnDecoder は type='tcn' のみサポート。指定値: {type}")
-        
-        self.decoder_type = type or "tcn"  # **追加**: タイプ情報保存
+            raise ValueError(f"tcnDecoder only supports type='tcn'. Got: {type}")
+
+        self.decoder_type = type or "tcn"
         self.output_dim = output_dim
         self.window = window
         self.tau = tau

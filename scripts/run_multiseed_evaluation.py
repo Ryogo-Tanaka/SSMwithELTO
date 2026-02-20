@@ -207,7 +207,7 @@ def run_training(config, data_file, output_dir, device, seed=None, timeout=14400
     """Run training via subprocess."""
     cmd = [
         sys.executable,
-        str(PROJECT_ROOT / "scripts" / "run_full_experiment.py"),
+        str(PROJECT_ROOT / "scripts" / "run_quadlink_experiment.py"),
         "--config", config,
         "--data", data_file,
         "--output", str(output_dir),

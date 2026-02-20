@@ -1,40 +1,40 @@
 # src/models/architectures/time_invariant.py
 
 """
-時不変性保証付きエンコーダー・デコーダーアーキテクチャ
+Time-invariant encoder/decoder architecture.
 
-【設定ファイル使用例】
+Config example:
 ```yaml
 model:
   encoder:
-    type: "time_invariant"           # 必須: このアーキテクチャを選択
-    input_dim: 7                     # 必須: 観測次元 n
-    output_dim: 16                   # 必須: 特徴量次元 m
-    architecture: "mlp"              # 推奨: "mlp" | "resnet"
-    hidden_dims: [64, 32]            # オプション: 隠れ層次元リスト
-    activation: "GELU"               # オプション: "GELU" | "ReLU" | "Tanh"
-    dropout: 0.1                     # オプション: ドロップアウト率
-    normalize_input: true            # オプション: 入力正規化
-    normalize_output: true           # オプション: 出力正規化
-    track_running_stats: true        # オプション: 統計量追跡
-    momentum: 0.1                    # オプション: BatchNorm慣性
-    eps: 1e-5                        # オプション: 数値安定化
+    type: "time_invariant"
+    input_dim: 7                     # observation dim n
+    output_dim: 16                   # feature dim m
+    architecture: "mlp"              # "mlp" | "resnet"
+    hidden_dims: [64, 32]
+    activation: "GELU"
+    dropout: 0.1
+    normalize_input: true
+    normalize_output: true
+    track_running_stats: true
+    momentum: 0.1
+    eps: 1e-5
 
   decoder:
-    type: "time_invariant"           # 必須: このアーキテクチャを選択
-    input_dim: 16                    # 必須: 特徴量次元 m（エンコーダーと一致）
-    output_dim: 7                    # 必須: 観測次元 n（元の観測と一致）
-    architecture: "mlp"              # 推奨: "mlp" | "resnet"
-    hidden_dims: [32, 64]            # オプション: 隠れ層次元リスト
-    activation: "GELU"               # オプション: 活性化関数
-    dropout: 0.1                     # オプション: ドロップアウト率
+    type: "time_invariant"
+    input_dim: 16                    # feature dim m (matches encoder)
+    output_dim: 7                    # observation dim n
+    architecture: "mlp"
+    hidden_dims: [32, 64]
+    activation: "GELU"
+    dropout: 0.1
 ```
 
-【重要な設定パラメータ】
-- input_dim/output_dim: 必須、次元整合性の確保
-- normalize_input/output: 時不変性・弱定常性のために推奨
-- track_running_stats: 推論時統計量一貫性のために推奨
-- architecture: "mlp"が標準、"resnet"は複雑なデータ用
+Key parameters:
+- input_dim/output_dim: Required for dimensional consistency
+- normalize_input/output: Recommended for time-invariance and weak stationarity
+- track_running_stats: Recommended for inference consistency
+- architecture: "mlp" is standard; "resnet" for complex data
 """
 
 import math
@@ -46,18 +46,18 @@ import torch.nn.functional as F
 
 class time_invariantEncoder(nn.Module):
     """
-    時不変性保証付きエンコーダー u_η: R^n → R^m
+    Time-invariant encoder u_eta: R^n -> R^m
 
-    定式化要求：
-    - 時不変性：全時点で同一パラメータ η を共有
-    - 弱定常性：E[u_η(y_t)] = const（時間に依存しない平均）
-    - 次元圧縮：観測 y_t ∈ R^n を特徴量 m_t ∈ R^m に変換
+    Requirements:
+    - Time invariance: shared parameters eta across all time steps
+    - Weak stationarity: E[u_eta(y_t)] = const
+    - Dimensionality reduction: observation y_t in R^n -> features m_t in R^m
 
-    実装特徴：
-    1. 入力正規化：y_t → (y_t - μ_y) / σ_y
-    2. 時不変変換：m_t = u_η(normalized_y_t)
-    3. 出力正規化：m_t → (m_t - μ_m) / σ_m
-    4. 統計量管理：推論時の一貫性保証
+    Pipeline:
+    1. Input normalization: y_t -> (y_t - mu_y) / sigma_y
+    2. Time-invariant transform: m_t = u_eta(normalized_y_t)
+    3. Output normalization: m_t -> (m_t - mu_m) / sigma_m
+    4. Statistics management for inference consistency
     """
 
     def __init__(
@@ -77,17 +77,17 @@ class time_invariantEncoder(nn.Module):
     ):
         """
         Args:
-            input_dim: 入力次元 n
-            output_dim: 出力次元 m
-            architecture: 内部アーキテクチャ（"mlp", "resnet"）
-            hidden_dims: 隠れ層次元リスト
-            activation: 活性化関数
-            dropout: ドロップアウト率
-            normalize_input: 入力正規化を行うか
-            normalize_output: 出力正規化を行うか
-            track_running_stats: 統計量を追跡するか
-            momentum: 統計量更新の慣性
-            eps: 数値安定化パラメータ
+            input_dim: Input dimension n
+            output_dim: Output dimension m
+            architecture: Internal architecture ("mlp", "resnet")
+            hidden_dims: Hidden layer dimensions
+            activation: Activation function
+            dropout: Dropout rate
+            normalize_input: Whether to normalize input
+            normalize_output: Whether to normalize output
+            track_running_stats: Whether to track statistics
+            momentum: Statistics update momentum
+            eps: Numerical stability parameter
         """
         super().__init__()
 
@@ -100,7 +100,6 @@ class time_invariantEncoder(nn.Module):
         self.momentum = momentum
         self.eps = eps
 
-        # デフォルト隠れ層設定（出力次元に応じた自動設定）
         if hidden_dims is None:
             if output_dim <= 4:
                 hidden_dims = [64, 32]
@@ -109,14 +108,11 @@ class time_invariantEncoder(nn.Module):
             else:
                 hidden_dims = [256, 128, 64]
 
-        # 活性化関数
         self.activation = getattr(nn, activation)() if hasattr(nn, activation) else nn.GELU()
 
-        # 入力正規化層
         if self.normalize_input:
             self.input_norm = nn.BatchNorm1d(input_dim, momentum=momentum, eps=eps)
 
-        # コアネットワーク
         if architecture == "mlp":
             self.core_net = self._build_mlp(input_dim, output_dim, hidden_dims, dropout)
         elif architecture == "resnet":
@@ -124,11 +120,9 @@ class time_invariantEncoder(nn.Module):
         else:
             raise ValueError(f"Unknown architecture: {architecture}. Supported: ['mlp', 'resnet']")
 
-        # 出力正規化層
         if self.normalize_output:
             self.output_norm = nn.BatchNorm1d(output_dim, momentum=momentum, eps=eps)
 
-        # 統計量（推論時の一貫性用）
         if track_running_stats:
             self.register_buffer('input_mean', torch.zeros(input_dim))
             self.register_buffer('input_var', torch.ones(input_dim))
@@ -136,11 +130,10 @@ class time_invariantEncoder(nn.Module):
             self.register_buffer('output_var', torch.ones(output_dim))
             self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
-        # 初期化
         self._initialize_weights()
 
     def _build_mlp(self, input_dim: int, output_dim: int, hidden_dims: List[int], dropout: float) -> nn.Module:
-        """標準MLPアーキテクチャ"""
+        """Standard MLP architecture."""
         layers = []
         prev_dim = input_dim
 
@@ -152,142 +145,120 @@ class time_invariantEncoder(nn.Module):
             ])
             prev_dim = hidden_dim
 
-        # 出力層
         layers.append(nn.Linear(prev_dim, output_dim))
-
         return nn.Sequential(*layers)
 
     def _build_resnet(self, input_dim: int, output_dim: int, hidden_dims: List[int], dropout: float) -> nn.Module:
-        """ResNet風アーキテクチャ（残差接続付き）"""
+        """ResNet-style architecture with residual connections."""
         layers = []
         prev_dim = input_dim
 
-        # 入力射影
         if len(hidden_dims) > 0:
             first_hidden = hidden_dims[0]
             layers.append(nn.Linear(input_dim, first_hidden))
             prev_dim = first_hidden
 
-        # 残差ブロック
         for i, hidden_dim in enumerate(hidden_dims):
-            if i > 0:  # 最初のブロックはスキップ（すでに射影済み）
+            if i > 0:
                 layers.append(ResidualBlock(prev_dim, hidden_dim, self.activation, dropout))
                 prev_dim = hidden_dim
 
-        # 出力層
         layers.append(nn.Linear(prev_dim, output_dim))
-
         return nn.Sequential(*layers)
 
     def _initialize_weights(self):
-        """重み初期化"""
+        """Weight initialization."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # Xavier初期化（活性化関数に応じた調整）
                 if isinstance(self.activation, (nn.ReLU, nn.LeakyReLU)):
                     nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
                 else:
                     nn.init.xavier_normal_(module.weight)
-
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         """
-        時不変性保証付き前向き計算
+        Time-invariant forward pass.
 
         Args:
-            y: [B, T, n] または [B, n] または [T, n]
+            y: [B, T, n] or [B, n] or [T, n]
 
         Returns:
-            m: [B, T, m] または [B, m] または [T, m]
+            m: [B, T, m] or [B, m] or [T, m]
         """
         original_shape = y.shape
-        is_single_step = len(original_shape) == 1  # [n]
-        is_no_batch = len(original_shape) == 2 and y.size(0) != 1  # [T, n]
+        is_single_step = len(original_shape) == 1
+        is_no_batch = len(original_shape) == 2 and y.size(0) != 1
 
-        # 形状統一化: [B, T, n]
+        # Unify to [B, T, n]
         if is_single_step:
-            y = y.unsqueeze(0).unsqueeze(0)  # [1, 1, n]
+            y = y.unsqueeze(0).unsqueeze(0)
         elif is_no_batch:
-            y = y.unsqueeze(0)  # [1, T, n]
+            y = y.unsqueeze(0)
         elif len(original_shape) == 2:
-            y = y.unsqueeze(1)  # [B, 1, n]
+            y = y.unsqueeze(1)
 
         B, T, n = y.shape
 
         if n != self.input_dim:
-            raise ValueError(f"入力次元不一致: expected {self.input_dim}, got {n}")
+            raise ValueError(f"Input dim mismatch: expected {self.input_dim}, got {n}")
 
-        # 時間軸に沿った独立処理（時不変性保証）
-        y_flat = y.view(-1, n)  # [B*T, n]
+        # Process each time step independently (time invariance)
+        y_flat = y.view(-1, n)
 
-        # 入力正規化
         if self.normalize_input:
             if self.training:
                 y_flat = self.input_norm(y_flat)
             else:
-                # 推論時は保存された統計量を使用
                 if self.track_running_stats:
-                    # GPU/CPUデバイス整合性を確保
                     input_mean = self.input_mean.to(y_flat.device)
                     input_var = self.input_var.to(y_flat.device)
                     y_flat = (y_flat - input_mean) / torch.sqrt(input_var + self.eps)
                 else:
                     y_flat = self.input_norm(y_flat)
 
-        # コア変換（GPUデバイス整合性を確保）
         if hasattr(self.core_net, 'to'):
             self.core_net = self.core_net.to(y_flat.device)
-        m_flat = self.core_net(y_flat)  # [B*T, m]
+        m_flat = self.core_net(y_flat)
 
-        # 出力正規化
         if self.normalize_output:
             if self.training:
                 m_flat = self.output_norm(m_flat)
             else:
-                # 推論時は保存された統計量を使用
                 if self.track_running_stats:
-                    # GPU/CPUデバイス整合性を確保
                     output_mean = self.output_mean.to(m_flat.device)
                     output_var = self.output_var.to(m_flat.device)
                     m_flat = (m_flat - output_mean) / torch.sqrt(output_var + self.eps)
                 else:
                     m_flat = self.output_norm(m_flat)
 
-        # 形状復元
         m = m_flat.view(B, T, self.output_dim)
 
-        # 統計量更新（学習時のみ）
         if self.training and self.track_running_stats:
             self._update_statistics(y_flat, m_flat)
 
-        # 元の形状に復元
+        # Restore original shape
         if is_single_step:
-            return m.squeeze(0).squeeze(0)  # [m]
+            return m.squeeze(0).squeeze(0)
         elif is_no_batch:
-            return m.squeeze(0)  # [T, m]
+            return m.squeeze(0)
         elif len(original_shape) == 2:
-            return m.squeeze(1)  # [B, m]
+            return m.squeeze(1)
         else:
-            return m  # [B, T, m]
+            return m
 
     def _update_statistics(self, y_flat: torch.Tensor, m_flat: torch.Tensor):
-        """統計量の指数移動平均更新"""
+        """Exponential moving average update of statistics."""
         with torch.no_grad():
-            # 入力統計量
             input_mean_batch = y_flat.mean(dim=0)
             input_var_batch = y_flat.var(dim=0, unbiased=False)
-
-            # 出力統計量
             output_mean_batch = m_flat.mean(dim=0)
             output_var_batch = m_flat.var(dim=0, unbiased=False)
 
-            # 指数移動平均更新
             n = self.num_batches_tracked.item()
             momentum = self.momentum if n > 0 else 1.0
 
-            # GPU/CPUデバイス整合性を確保した統計量更新
             input_mean_batch = input_mean_batch.to(self.input_mean.device)
             input_var_batch = input_var_batch.to(self.input_var.device)
             output_mean_batch = output_mean_batch.to(self.output_mean.device)
@@ -301,7 +272,7 @@ class time_invariantEncoder(nn.Module):
             self.num_batches_tracked += 1
 
     def get_statistics(self) -> Dict[str, torch.Tensor]:
-        """正規化統計量の取得"""
+        """Get normalization statistics."""
         if not self.track_running_stats:
             return {}
 
@@ -314,7 +285,7 @@ class time_invariantEncoder(nn.Module):
         }
 
     def load_statistics(self, stats: Dict[str, torch.Tensor]):
-        """統計量の読み込み"""
+        """Load normalization statistics."""
         if not self.track_running_stats:
             return
 
@@ -323,36 +294,21 @@ class time_invariantEncoder(nn.Module):
                 getattr(self, key).copy_(value)
 
     def verify_time_invariance(self, y1: torch.Tensor, y2: torch.Tensor, tol: float = 1e-6) -> bool:
-        """
-        時不変性の検証
-
-        Args:
-            y1, y2: 同じ値の観測（異なる時刻）
-            tol: 許容誤差
-
-        Returns:
-            bool: 時不変性が保証されているか
-        """
+        """Verify time invariance: same input at different times -> same output."""
         with torch.no_grad():
             self.eval()
             m1 = self.forward(y1)
             m2 = self.forward(y2)
-
             max_diff = torch.max(torch.abs(m1 - m2)).item()
             return max_diff < tol
 
 
 class time_invariantDecoder(nn.Module):
     """
-    簡素化デコーダー g_α: R^m → R^n
+    Decoder g_alpha: R^m -> R^n
 
-    定式化変更：
-    - 旧：スカラー m_t → 遅延埋め込み → 2パス処理
-    - 新：多変量 m_t ∈ R^m → 直接的DNN → y_t ∈ R^n
-
-    数学的根拠：
-    多変量特徴量 m_t ∈ R^m は瞬時の情報を十分含むため、
-    時間遅延情報の明示的埋め込みは不要
+    Multivariate feature m_t in R^m contains sufficient instantaneous information,
+    so explicit time-delay embedding is not needed.
     """
 
     def __init__(
@@ -367,12 +323,12 @@ class time_invariantDecoder(nn.Module):
     ):
         """
         Args:
-            input_dim: 入力特徴量次元 m
-            output_dim: 出力観測次元 n
-            architecture: アーキテクチャタイプ（"mlp", "resnet"）
-            hidden_dims: 隠れ層次元リスト
-            activation: 活性化関数
-            dropout: ドロップアウト率
+            input_dim: Input feature dimension m
+            output_dim: Output observation dimension n
+            architecture: Architecture type ("mlp", "resnet")
+            hidden_dims: Hidden layer dimensions
+            activation: Activation function
+            dropout: Dropout rate
         """
         super().__init__()
 
@@ -380,9 +336,7 @@ class time_invariantDecoder(nn.Module):
         self.output_dim = output_dim
         self.architecture = architecture
 
-        # デフォルト隠れ層設定（逆圧縮なので大きめ）
         if hidden_dims is None:
-            # エンコーダーの逆順序で設定
             if input_dim <= 4:
                 hidden_dims = [32, 64]
             elif input_dim <= 16:
@@ -390,10 +344,8 @@ class time_invariantDecoder(nn.Module):
             else:
                 hidden_dims = [64, 128, 256]
 
-        # 活性化関数
         self.activation = getattr(nn, activation)() if hasattr(nn, activation) else nn.GELU()
 
-        # ネットワーク構築
         if architecture == "mlp":
             self.net = self._build_mlp(input_dim, output_dim, hidden_dims, dropout)
         elif architecture == "resnet":
@@ -401,11 +353,10 @@ class time_invariantDecoder(nn.Module):
         else:
             raise ValueError(f"Unknown architecture: {architecture}. Supported: ['mlp', 'resnet']")
 
-        # 初期化
         self._initialize_weights()
 
     def _build_mlp(self, input_dim: int, output_dim: int, hidden_dims: List[int], dropout: float) -> nn.Module:
-        """標準MLPアーキテクチャ"""
+        """Standard MLP architecture."""
         layers = []
         prev_dim = input_dim
 
@@ -417,94 +368,85 @@ class time_invariantDecoder(nn.Module):
             ])
             prev_dim = hidden_dim
 
-        # 出力層（活性化なし）
         layers.append(nn.Linear(prev_dim, output_dim))
-
         return nn.Sequential(*layers)
 
     def _build_resnet(self, input_dim: int, output_dim: int, hidden_dims: List[int], dropout: float) -> nn.Module:
-        """ResNet風アーキテクチャ"""
+        """ResNet-style architecture."""
         layers = []
         prev_dim = input_dim
 
-        # 入力射影
         if len(hidden_dims) > 0:
             first_hidden = hidden_dims[0]
             layers.append(nn.Linear(input_dim, first_hidden))
             prev_dim = first_hidden
 
-        # 残差ブロック
         for i, hidden_dim in enumerate(hidden_dims):
             if i > 0:
                 layers.append(ResidualBlock(prev_dim, hidden_dim, self.activation, dropout))
                 prev_dim = hidden_dim
 
-        # 出力層
         layers.append(nn.Linear(prev_dim, output_dim))
-
         return nn.Sequential(*layers)
 
     def _initialize_weights(self):
-        """重み初期化"""
+        """Weight initialization."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 if isinstance(self.activation, (nn.ReLU, nn.LeakyReLU)):
                     nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
                 else:
                     nn.init.xavier_normal_(module.weight)
-
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
     def forward(self, m: torch.Tensor) -> torch.Tensor:
         """
-        多変量特徴量からの観測再構成
+        Reconstruct observations from multivariate features.
 
         Args:
-            m: [B, T, m] または [B, m] または [T, m] 特徴量
+            m: [B, T, m] or [B, m] or [T, m] features
 
         Returns:
-            y: [B, T, n] または [B, n] または [T, n] 再構成観測
+            y: [B, T, n] or [B, n] or [T, n] reconstructed observations
         """
         original_shape = m.shape
-        is_single_step = len(original_shape) == 1  # [m]
-        is_no_batch = len(original_shape) == 2 and m.size(0) != 1  # [T, m]
+        is_single_step = len(original_shape) == 1
+        is_no_batch = len(original_shape) == 2 and m.size(0) != 1
 
-        # 形状統一化: [B, T, m]
+        # Unify to [B, T, m]
         if is_single_step:
-            m = m.unsqueeze(0).unsqueeze(0)  # [1, 1, m]
+            m = m.unsqueeze(0).unsqueeze(0)
         elif is_no_batch:
-            m = m.unsqueeze(0)  # [1, T, m]
+            m = m.unsqueeze(0)
         elif len(original_shape) == 2:
-            m = m.unsqueeze(1)  # [B, 1, m]
+            m = m.unsqueeze(1)
 
         B, T, m_dim = m.shape
 
         if m_dim != self.input_dim:
-            raise ValueError(f"入力次元不一致: expected {self.input_dim}, got {m_dim}")
+            raise ValueError(f"Input dim mismatch: expected {self.input_dim}, got {m_dim}")
 
-        # 時間軸に沿った独立処理（GPUデバイス整合性を確保）
-        m_flat = m.view(-1, m_dim)  # [B*T, m]
+        m_flat = m.view(-1, m_dim)
         if hasattr(self.net, 'to'):
             self.net = self.net.to(m_flat.device)
-        y_flat = self.net(m_flat)   # [B*T, n]
+        y_flat = self.net(m_flat)
 
-        # 形状復元
         y = y_flat.view(B, T, self.output_dim)
 
-        # 元の形状に復元
+        # Restore original shape
         if is_single_step:
-            return y.squeeze(0).squeeze(0)  # [n]
+            return y.squeeze(0).squeeze(0)
         elif is_no_batch:
-            return y.squeeze(0)  # [T, n]
+            return y.squeeze(0)
         elif len(original_shape) == 2:
-            return y.squeeze(1)  # [B, n]
+            return y.squeeze(1)
         else:
-            return y  # [B, T, n]
+            return y
 
 
 class ResidualBlock(nn.Module):
-    """残差ブロック"""
+    """Residual block."""
 
     def __init__(self, input_dim: int, hidden_dim: int, activation: nn.Module, dropout: float):
         super().__init__()
@@ -513,12 +455,11 @@ class ResidualBlock(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             activation,
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            nn.Linear(hidden_dim, input_dim)  # 残差接続のため入力次元に戻す
+            nn.Linear(hidden_dim, input_dim)  # Back to input dim for residual
         )
 
-        # ショートカット接続（次元が異なる場合）
         if input_dim != hidden_dim:
-            self.shortcut = nn.Linear(input_dim, input_dim)  # 恒等写像維持
+            self.shortcut = nn.Linear(input_dim, input_dim)
         else:
             self.shortcut = nn.Identity()
 

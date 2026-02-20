@@ -1,9 +1,9 @@
 # src/inference/state_estimator.py
 """
-統合推論クラス: StateEstimator
+Integrated inference class: StateEstimator.
 
-学習済みDFIVモデルからKalman Filtering推論エンジンを構築。
-DF-A/DF-B コンポーネントとの統合、ノイズ推定、推論実行を管理。
+Constructs a Kalman filtering inference engine from trained DFIV models.
+Manages integration with DF-A/DF-B components, noise estimation, and inference.
 """
 
 import torch
@@ -27,36 +27,28 @@ from ..ssm.realization import Realization
 
 class StateEstimator:
     """
-    統合推論クラス
-    
-    学習済みDFIVモデル（DF-A + DF-B）から転送作用素を抽出し、
-    Algorithm 1による逐次状態推定を実行。
-    
-    機能:
-    - 学習済みモデル読み込み
-    - ノイズ共分散推定
-    - Kalman Filter初期化・実行
-    - バッチ・オンライン推論対応
+    Integrated inference class.
+
+    Extracts transfer operators from trained DFIV models (DF-A + DF-B) and
+    performs sequential state estimation via Algorithm 1.
     """
-    
+
     def __init__(self, config: Dict[str, Any]):
         """
-        設定ファイルから初期化
-        
+        Initialize from config dict.
+
         Args:
-            config: 推論設定辞書
+            config: Inference configuration dict
         """
         self.config = config
         self.device = torch.device(config.get('device', 'cpu'))
         
-        # コンポーネント
         self.df_state_layer = None      # DF-A
         self.df_obs_layer = None        # DF-B
-        self.encoder = None             # エンコーダ
-        self.realization = None         # 状態空間実現
-        self.kalman_filter = None       # Kalman Filter
-        
-        # 学習済みパラメータ
+        self.encoder = None
+        self.realization = None
+        self.kalman_filter = None
+
         self.V_A: Optional[torch.Tensor] = None
         self.V_B: Optional[torch.Tensor] = None
         self.U_A: Optional[torch.Tensor] = None
@@ -64,7 +56,6 @@ class StateEstimator:
         self.Q: Optional[torch.Tensor] = None
         self.R: Optional[Union[torch.Tensor, float]] = None
         
-        # 状態
         self.is_initialized = False
         self.calibration_data: Optional[torch.Tensor] = None
 
@@ -75,18 +66,15 @@ class StateEstimator:
         config_path: Union[str, Path]
     ) -> 'StateEstimator':
         """
-        学習済みモデルから初期化
-        
-        V_A, V_B, φ_θ, ψ_ω, エンコーダを読み込み
-        
+        Initialize from trained model.
+
         Args:
-            model_path: 学習済みモデルパス
-            config_path: 設定ファイルパス
-            
+            model_path: Path to trained model
+            config_path: Path to config file
+
         Returns:
-            StateEstimator: 初期化済みインスタンス
+            Initialized StateEstimator instance.
         """
-        # 設定読み込み
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
             
@@ -97,61 +85,49 @@ class StateEstimator:
 
     def load_components(self, model_path: Union[str, Path]):
         """
-        個別コンポーネントの読み込み
-
-        DF-A, DF-B, エンコーダから演算子を抽出
+        Load individual components (DF-A, DF-B, encoder) and extract operators.
 
         Args:
-            model_path: 学習済みモデルパス
+            model_path: Path to trained model
         """
         model_path = Path(model_path)
 
         try:
-            # モデル状態読み込み
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
 
-            # checkpoint['config']から学習時設定を取得
             training_config = checkpoint.get('config', {})
 
-            # エンコーダタイプを取得
             encoder_type = training_config.get('model', {}).get('encoder', {}).get('type')
 
-            # 次元情報を更新
             self._update_config_from_checkpoint(training_config)
 
-            # 各コンポーネントの状態辞書取得（新旧両形式対応）
-            # 新形式: checkpoint['df_state'] (フラット構造) - 推奨
-            # 旧形式: checkpoint['model_state_dict']['df_state'] (ネスト構造) - 後方互換性
+            # Component state dicts (both flat and nested formats supported)
             if 'df_state' in checkpoint:
-                # 新形式（フラット）
                 state_dict = checkpoint
-                print("📂 Checkpoint構造: フラット形式（推奨）")
             elif 'model_state_dict' in checkpoint:
-                # 旧形式（ネスト）
                 state_dict = checkpoint['model_state_dict']
-                print("📂 Checkpoint構造: model_state_dict形式（旧形式）")
             else:
                 raise KeyError("Checkpoint structure not recognized (neither flat nor nested)")
 
-            # DF-A コンポーネント
+            # DF-A component
             if 'df_state' in state_dict:
                 self._load_df_state_component(state_dict['df_state'])
             else:
                 raise KeyError("DF-A component not found in model")
 
-            # DF-B コンポーネント
+            # DF-B component
             if 'df_obs' in state_dict:
                 self._load_df_obs_component(state_dict['df_obs'])
             else:
                 raise KeyError("DF-B component not found in model")
 
-            # エンコーダ（タイプ情報付き）
+            # Encoder
             if 'encoder' in state_dict:
                 self._load_encoder_component(state_dict['encoder'], encoder_type=encoder_type)
             else:
                 raise KeyError("Encoder component not found in model")
 
-            # 転送作用素抽出
+            # Extract transfer operators
             self._extract_operators()
 
             print(f"Successfully loaded components from {model_path}")
@@ -160,19 +136,16 @@ class StateEstimator:
             raise RuntimeError(f"Failed to load model components: {e}")
 
     def _update_config_from_checkpoint(self, training_config: Dict[str, Any]):
-        """checkpointから設定を更新"""
+        """Update config from checkpoint training config."""
         if not training_config:
             return
 
-        # モデル設定を更新
         if 'model' not in self.config:
             self.config['model'] = {}
 
-        # エンコーダ設定
         if 'encoder' in training_config.get('model', {}):
             self.config['model']['encoder'] = training_config['model']['encoder']
 
-        # DF-A設定
         if 'ssm' in training_config and 'df_state' in training_config['ssm']:
             if 'df_state' not in self.config.get('model', {}):
                 self.config['model']['df_state'] = {}
@@ -182,7 +155,6 @@ class StateEstimator:
                 'state_dim': training_config['ssm']['realization'].get('rank')
             })
 
-        # DF-B設定
         if 'ssm' in training_config and 'df_observation' in training_config['ssm']:
             if 'df_obs' not in self.config.get('model', {}):
                 self.config['model']['df_obs'] = {}
@@ -197,23 +169,20 @@ class StateEstimator:
             })
 
     def _flatten_nested_state_dict(self, nested_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """ネストしたstate_dictを平坦化"""
+        """Flatten nested state_dict."""
         flattened = {}
         for key, value in nested_dict.items():
             if isinstance(value, dict) and hasattr(value, 'keys'):
-                # OrderedDict等の辞書形式の場合、キーを結合
                 for sub_key, sub_value in value.items():
                     flattened[f"{key}.{sub_key}"] = sub_value
             else:
-                # 通常の値はそのまま
                 flattened[key] = value
         return flattened
 
     def _load_df_state_component(self, df_state_dict: Dict[str, Any]):
-        """DF-A コンポーネント読み込み"""
+        """Load DF-A component."""
         from ..ssm.df_state_layer import DFStateLayer
         
-        # 設定から次元取得
         state_config = self.config.get('model', {}).get('df_state', {})
         
         self.df_state_layer = DFStateLayer(
@@ -225,19 +194,18 @@ class StateEstimator:
             cross_fitting_config=state_config.get('cross_fitting')
         ).to(self.device)
         
-        # ネストしたstate_dictを平坦化
         flattened_state_dict = self._flatten_nested_state_dict(df_state_dict)
         self.df_state_layer.load_state_dict(flattened_state_dict)
         self.df_state_layer.eval()
 
     def _load_df_obs_component(self, df_obs_dict: Dict[str, Any]):
-        """DF-B コンポーネント読み込み"""
+        """Load DF-B component."""
         from ..ssm.df_observation_layer import DFObservationLayer
 
         obs_config = self.config.get('model', {}).get('df_obs', {})
 
         self.df_obs_layer = DFObservationLayer(
-            df_state_layer=self.df_state_layer,  # DF-A参照
+            df_state_layer=self.df_state_layer,  # DF-A reference
             obs_feature_dim=obs_config.get('obs_feature_dim', 16),
             multivariate_feature_dim=obs_config.get('multivariate_feature_dim', 8),
             lambda_B=obs_config.get('lambda_B', 1e-3),
@@ -246,79 +214,57 @@ class StateEstimator:
             cross_fitting_config=obs_config.get('cross_fitting')
         ).to(self.device)
         
-        # ネストしたstate_dictを平坦化
         flattened_obs_dict = self._flatten_nested_state_dict(df_obs_dict)
-        # phi_thetaは既にdf_state_layerから共有参照されるため、strict=Falseで読み込み
+        # phi_theta is shared from df_state_layer, so use strict=False
         self.df_obs_layer.load_state_dict(flattened_obs_dict, strict=False)
         self.df_obs_layer.eval()
 
     def _load_encoder_component(self, encoder_dict: Dict[str, Any], encoder_type: str = None):
         """
-        動的エンコーダ読み込み
+        Dynamically load encoder.
 
         Args:
-            encoder_dict: エンコーダのstate_dict
-            encoder_type: エンコーダタイプ（'rkn', 'time_invariant', 'tcn'等）
-                          Noneの場合はstate_dictから自動検出
+            encoder_dict: Encoder state_dict
+            encoder_type: Encoder type ('cnn_image', 'time_invariant', etc.)
+                          Auto-detected from state_dict if None.
         """
-        # エンコーダタイプの決定
         if encoder_type is None:
             encoder_type = self._detect_encoder_type(encoder_dict)
 
-        # Factory Patternを使用
         from ..models.encoder import build_encoder
 
-        # エンコーダ設定の構築
         encoder_config = self._build_encoder_config_from_state_dict(
             encoder_dict, encoder_type
         )
         encoder_config['type'] = encoder_type
 
-        # エンコーダ作成
         self.encoder = build_encoder(encoder_config).to(self.device)
 
-        # state_dict読み込み
         self.encoder.load_state_dict(encoder_dict)
         self.encoder.eval()
 
-        print(f"✅ Loaded {encoder_type}Encoder successfully")
+        print(f"Loaded {encoder_type}Encoder successfully")
 
     def _detect_encoder_type(self, encoder_dict: Dict[str, Any]) -> str:
         """
-        state_dictからエンコーダタイプを自動検出
+        Auto-detect encoder type from state_dict keys.
 
-        対応エンコーダ:
-        - 'rkn': rknEncoder (画像用CNN)
-        - 'time_invariant': time_invariantEncoder (1D系列用MLP)
+        Supported: 'cnn_image' (CNN for images), 'time_invariant' (MLP for 1D).
         """
         keys = set(encoder_dict.keys())
 
-        # rknEncoder の特徴的なキー
+        # cnn_imageEncoder: has conv layers
         if any('conv' in k for k in keys):
-            return 'rkn'
+            return 'cnn_image'
 
-        # time_invariantEncoder の特徴的なキー
+        # time_invariantEncoder characteristic keys
         if any('core_net' in k for k in keys):
             return 'time_invariant'
 
-        # ========================================
-        # 【拡張ポイント】新しいencoder typeを追加する場合
-        # ========================================
-        # 例: Transformerエンコーダを追加する場合
-        # if any('attention' in k for k in keys):
-        #     return 'transformer'
-        #
-        # 例: 別のエンコーダを追加する場合
-        # if any('your_unique_key' in k for k in keys):
-        #     return 'your_new_encoder'
-        # ========================================
-
-        # 検出失敗時はエラーを発生（デフォルト値は使用しない）
         raise ValueError(
-            f"エンコーダタイプを自動検出できません。\n"
+            f"Cannot auto-detect encoder type.\n"
             f"state_dict keys sample: {list(keys)[:10]}\n"
-            f"対応パターン: 'conv'(rkn), 'core_net'(time_invariant)\n"
-            f"新しいencoder typeを追加する場合は、上記の【拡張ポイント】を参照してください。"
+            f"Known patterns: 'conv'(cnn_image), 'core_net'(time_invariant)"
         )
 
     def _build_encoder_config_from_state_dict(
@@ -327,52 +273,44 @@ class StateEstimator:
         encoder_type: str
     ) -> Dict[str, Any]:
         """
-        state_dictからエンコーダ設定を復元
+        Reconstruct encoder config from state_dict shapes.
 
-        対応エンコーダ:
-        - 'rkn': rknEncoder (画像用CNN)
-        - 'time_invariant': time_invariantEncoder (1D系列用MLP)
+        Supported: 'cnn_image', 'time_invariant'.
         """
 
-        if encoder_type == 'rkn':
-            # rknEncoder の設定を推定
-            # conv1.weight の形状から input_resolution を推定
+        if encoder_type == 'cnn_image':
+            # Estimate input_resolution from conv1.weight shape
             conv1_weight = encoder_dict.get('conv1.weight')
             if conv1_weight is not None:
-                C = conv1_weight.shape[1]  # 入力チャネル数
-                # H, W は実行時データから決定（または config から取得）
+                C = conv1_weight.shape[1]
                 config_from_checkpoint = self.config.get('model', {}).get('encoder', {})
                 input_resolution_from_cfg = config_from_checkpoint.get('input_resolution', [48, 48, 1])
                 if len(input_resolution_from_cfg) >= 2:
                     H, W = input_resolution_from_cfg[:2]
                 else:
-                    H, W = 48, 48  # デフォルト
+                    H, W = 48, 48
                 input_resolution = [H, W, C]
             else:
-                input_resolution = [48, 48, 1]  # デフォルト
+                input_resolution = [48, 48, 1]
 
-            # feature_dim を推定（fc_out.weight の形状から）
             fc_out_weight = encoder_dict.get('fc_out.weight')
             if fc_out_weight is not None:
                 feature_dim = fc_out_weight.shape[0]
             else:
-                feature_dim = 50  # デフォルト
+                feature_dim = 50
 
-            # conv_channels を推定
             conv_channels = []
             if 'conv1.weight' in encoder_dict:
                 conv_channels.append(encoder_dict['conv1.weight'].shape[0])
             if 'conv2.weight' in encoder_dict:
                 conv_channels.append(encoder_dict['conv2.weight'].shape[0])
 
-            # hidden を推定（fc1.weight の形状から）
             fc1_weight = encoder_dict.get('fc1.weight')
             if fc1_weight is not None:
                 hidden = fc1_weight.shape[0]
             else:
-                hidden = 200  # デフォルト
+                hidden = 200
 
-            # checkpoint から取得した encoder 設定を使用
             encoder_cfg = self.config.get('model', {}).get('encoder', {})
 
             return {
@@ -387,7 +325,6 @@ class StateEstimator:
             }
 
         elif encoder_type == 'time_invariant':
-            # 既存の _detect_time_invariant_output_dim() 等を使用
             input_dim = self.config.get('model', {}).get('encoder', {}).get('input_dim', 6)
             output_dim = self._detect_time_invariant_output_dim(encoder_dict)
 
@@ -400,57 +337,28 @@ class StateEstimator:
                 'track_running_stats': True
             }
 
-        # ========================================
-        # 【拡張ポイント】新しいencoder typeを追加する場合
-        # ========================================
-        # elif encoder_type == 'transformer':
-        #     # Transformerエンコーダの設定を復元
-        #     # state_dictから設定パラメータを推定
-        #     # 例: attention層の数、ヘッド数などを推定
-        #     return {
-        #         'input_dim': ...,
-        #         'feature_dim': ...,
-        #         'n_heads': ...,
-        #         'n_layers': ...,
-        #         ...
-        #     }
-        #
-        # elif encoder_type == 'your_new_encoder':
-        #     # 新しいエンコーダの設定を復元
-        #     # state_dictの形状から必要なパラメータを推定
-        #     return {
-        #         ...
-        #     }
-        # ========================================
-
         else:
             raise ValueError(
-                f"未対応のencoder type: '{encoder_type}'\n"
-                f"現在対応しているのは 'rkn' と 'time_invariant' のみです。\n"
-                f"新しいencoder typeを追加する場合は、上記の【拡張ポイント】を参照してください。"
+                f"Unsupported encoder type: '{encoder_type}'\n"
+                f"Currently supported: 'cnn_image' and 'time_invariant'."
             )
 
     def _detect_time_invariant_output_dim(self, encoder_dict: Dict[str, Any]) -> int:
-        """time_invariantエンコーダーの出力次元を検出"""
+        """Detect output dimension of time_invariant encoder."""
         if 'output_mean' in encoder_dict:
             return encoder_dict['output_mean'].shape[0]
-        # core_netの最終層から推定
+        # Infer from core_net final layer
         for key in encoder_dict.keys():
             if key.endswith('.bias') and 'core_net' in key:
                 return encoder_dict[key].shape[0]
-        return 8  # デフォルト
+        return 8
 
     def _extract_operators(self):
-        """
-        学習済みコンポーネントから転送作用素を抽出
-        
-        DF-A: V_A, U_A
-        DF-B: V_B, u_B
-        """
+        """Extract transfer operators from learned components (DF-A: V_A, U_A; DF-B: V_B, U_B)."""
         if not all([self.df_state_layer, self.df_obs_layer]):
             raise RuntimeError("DF components not loaded")
             
-        # DF-A から V_A, U_A 抽出
+        # Extract V_A, U_A from DF-A
         if hasattr(self.df_state_layer, 'V_A') and self.df_state_layer.V_A is not None:
             self.V_A = self.df_state_layer.V_A.clone().detach()
         else:
@@ -461,7 +369,7 @@ class StateEstimator:
         else:
             raise RuntimeError("U_A not found in DF-A component")
             
-        # DF-B から V_B, u_B 抽出
+        # Extract V_B, U_B from DF-B
         if hasattr(self.df_obs_layer, 'V_B') and self.df_obs_layer.V_B is not None:
             self.V_B = self.df_obs_layer.V_B.clone().detach()
         else:
@@ -484,17 +392,15 @@ class StateEstimator:
         method: str = "residual_based"
     ) -> Tuple[torch.Tensor, Union[torch.Tensor, float]]:
         """
-        キャリブレーション用データでQ, R推定
-        
-        式45-46の実装
-        
+        Estimate Q, R from calibration data (Eq. 45-46).
+
         Args:
-            calibration_data: キャリブレーション観測 (T_cal, n)
-            method: ノイズ推定法 ("residual_based")
-            
+            calibration_data: Calibration observations (T_cal, n)
+            method: Noise estimation method ("residual_based")
+
         Returns:
-            Q: 状態ノイズ共分散 (dA, dA)
-            R: 観測ノイズ分散
+            Q: State noise covariance (dA, dA)
+            R: Observation noise covariance
         """
         if method != "residual_based":
             raise ValueError(f"Unknown noise estimation method: {method}")
@@ -505,21 +411,20 @@ class StateEstimator:
         print(f"Estimating noise covariances from {T_cal} calibration samples...")
         
         with torch.no_grad():
-            # 1. エンコード: {y_t} → {m_t} (多変量特徴量対応)
+            # 1. Encode: {y_t} -> {m_t}
             m_series = self.encoder(calibration_data.unsqueeze(0)).squeeze(0)  # (T_cal, output_dim)
 
-            # 2. 状態空間実現: {m_t} → {x_t} (多変量入力対応)
+            # 2. State space realization: {m_t} -> {x_t}
             if self.realization is None:
-                # 設定からrealizationパラメータを取得
                 realization_config = self.config.get('ssm', {}).get('realization', {})
                 past_horizon = realization_config.get('past_horizon', 10)
 
-                # データ長に基づいてpast_horizonを自動調整
+                # Auto-adjust past_horizon based on data length
                 T_cal = m_series.size(0)
-                max_horizon = (T_cal - 1) // 2  # N >= 1を保証するための最大horizon
+                max_horizon = (T_cal - 1) // 2
                 if past_horizon > max_horizon:
                     past_horizon = max(1, max_horizon)
-                    print(f"past_horizon調整: {realization_config.get('past_horizon', 10)} → {past_horizon} (データ長: {T_cal})")
+                    print(f"past_horizon adjusted: {realization_config.get('past_horizon', 10)} -> {past_horizon} (data length: {T_cal})")
 
                 self.realization = Realization(
                     past_horizon=past_horizon,
@@ -528,28 +433,25 @@ class StateEstimator:
                     rank=realization_config.get('rank', 4),
                     reg_type=realization_config.get('reg_type', 'sum')
                 )
-                # 多変量特徴量 (T_cal, output_dim) をそのままfit
                 self.realization.fit(m_series)
 
-            # realizationで状態系列を生成: (N, rank) where N = T_cal - 2*h + 1
+            # Generate state sequence: (N, rank) where N = T_cal - 2*h + 1
             x_series = self.realization.filter(m_series)
 
-            # 時間対応を合わせるため、m_seriesも同じ範囲を使用
-            # realization.filter は時点 h から h+N-1 に対応
+            # Align m_series to the same time range as x_series
             h = self.realization.h
             m_series_aligned = m_series[h:h + x_series.size(0)]  # (N,)
 
-            # 3. 特徴写像適用: {x_t} → {φ_t}, {ψ_t}
-            # 状態系列x_tをφ_θに、対応する時間範囲のスカラー系列m_tをψ_ωに渡す
+            # 3. Apply feature mappings: {x_t} -> {phi_t}, {psi_t}
             phi_sequence = self._apply_state_feature_mapping(x_series)           # (N+1, dA)
             psi_sequence = self._apply_obs_feature_mapping(m_series_aligned)     # (N+1, dB)
             
-            # 3. 残差計算
+            # Compute residuals
             residuals_state, residuals_obs = compute_residuals_from_operators(
                 phi_sequence, psi_sequence, self.V_A, self.V_B
             )
             
-            # 4. 共分散推定
+            # Estimate covariances
             regularization = self.config.get('noise_estimation', {})
             Q, R = estimate_noise_covariances(
                 residuals_state, residuals_obs, regularization
@@ -569,24 +471,18 @@ class StateEstimator:
 
     def _apply_state_feature_mapping(self, x_series: torch.Tensor) -> torch.Tensor:
         """
-        状態特徴写像 φ_θ の適用
-
-        学習済みDF-A層のφ_θネットワークが必須。
+        Apply state feature mapping phi_theta using the learned DF-A layer.
 
         Args:
-            x_series: 状態系列 (N, rank) - realization.filter()の出力
+            x_series: State sequence (N, rank) from realization.filter()
 
         Returns:
-            torch.Tensor: 状態特徴系列 (N+1, dA)
-
-        Raises:
-            RuntimeError: DF-A層またはφ_θネットワークが存在しない場合
+            State feature sequence (N+1, dA).
         """
-        # DF-A層とφ_θネットワークの存在確認（必須）
         if self.df_state_layer is None or not hasattr(self.df_state_layer, 'phi_theta'):
             raise RuntimeError(
                 "DF-A layer with phi_theta network is required for state feature generation. "
-                "Cannot proceed without learned φ_θ(m_t) transformation."
+                "Cannot proceed without learned phi_theta(m_t) transformation."
             )
 
         N = x_series.size(0)
@@ -595,15 +491,12 @@ class StateEstimator:
             phi_sequence = []
             for t in range(N + 1):
                 if t < N:
-                    # 学習済みφ_θネットワークで状態特徴生成
-                    x_t_input = x_series[t]  # (rank,) - 状態ベクトル
+                    x_t_input = x_series[t]
                     phi_t = self.df_state_layer.phi_theta(x_t_input)  # (dA,)
                 else:
-                    # 最後の値を使用（予測時）
-                    x_t_input = x_series[-1]  # (rank,) - 状態ベクトル
-                    phi_t = self.df_state_layer.phi_theta(x_t_input)  # (dA,)
+                    x_t_input = x_series[-1]
+                    phi_t = self.df_state_layer.phi_theta(x_t_input)
 
-                # 出力を(dA,)形状に正規化
                 while phi_t.dim() > 1 and phi_t.size(0) == 1:
                     phi_t = phi_t.squeeze(0)
 
@@ -619,24 +512,18 @@ class StateEstimator:
 
     def _apply_obs_feature_mapping(self, m_series: torch.Tensor) -> torch.Tensor:
         """
-        観測特徴写像 ψ_ω の適用
-
-        学習済みDF-B層のψ_ωネットワークが必須。
+        Apply observation feature mapping psi_omega using the learned DF-B layer.
 
         Args:
-            m_series: スカラー特徴系列 (T,)
+            m_series: Feature series (T,)
 
         Returns:
-            torch.Tensor: 観測特徴系列 (T+1, dB)
-
-        Raises:
-            RuntimeError: DF-B層またはψ_ωネットワークが存在しない場合
+            Observation feature sequence (T+1, dB).
         """
-        # DF-B層とψ_ωネットワークの存在確認（必須）
         if self.df_obs_layer is None or not hasattr(self.df_obs_layer, 'psi_omega'):
             raise RuntimeError(
                 "DF-B layer with psi_omega network is required for observation feature generation. "
-                "Cannot proceed without learned ψ_ω(m_t) transformation."
+                "Cannot proceed without learned psi_omega(m_t) transformation."
             )
 
         T = m_series.size(0)
@@ -645,15 +532,12 @@ class StateEstimator:
             psi_sequence = []
             for t in range(T + 1):
                 if t < T:
-                    # 学習済みψ_ωネットワークで観測特徴生成
-                    m_t_input = m_series[t]  # (r,) - 正しい入力次元を保持
+                    m_t_input = m_series[t]
                     psi_t = self.df_obs_layer.psi_omega(m_t_input)  # (dB,)
                 else:
-                    # 最後の値を使用（予測時）
-                    m_t_input = m_series[-1]  # (r,) - 正しい入力次元を保持
+                    m_t_input = m_series[-1]
                     psi_t = self.df_obs_layer.psi_omega(m_t_input)  # (dB,)
 
-                # 出力を(dB,)形状に正規化
                 while psi_t.dim() > 1 and psi_t.size(0) == 1:
                     psi_t = psi_t.squeeze(0)
 
@@ -673,25 +557,23 @@ class StateEstimator:
         method: str = "data_driven"
     ):
         """
-        フィルタリング開始前の初期化
-        
-        KalmanFilterの作成、初期状態設定
-        
+        Initialize before filtering (create KalmanFilter, set initial state).
+
         Args:
-            initial_data: 初期化用データ (N0, n) or None
-            method: 初期化方法 ("data_driven" | "zero")
+            initial_data: Data for initialization (N0, n) or None
+            method: Initialization method ("data_driven" | "zero")
         """
         if not all([self.V_A is not None, self.V_B is not None, self.U_A is not None, self.U_B is not None]):
             raise RuntimeError("Operators not extracted. Call load_components() first.")
             
         if self.Q is None or self.R is None:
-            # デフォルトノイズ設定
+            # Default noise settings
             warnings.warn("Noise covariances not estimated. Using defaults.")
             dA = int(self.V_A.size(0))
             self.Q = 0.01 * torch.eye(dA, device=self.device)
             self.R = 0.1
             
-        # 入力検証
+        # Validate inputs
         validation = validate_kalman_inputs(
             self.V_A, self.V_B, self.U_A, self.U_B, self.Q, self.R
         )
@@ -703,7 +585,7 @@ class StateEstimator:
             for warning in validation["warnings"]:
                 warnings.warn(warning)
                 
-        # Kalman Filter作成（学習済みDF-B層を渡す）
+        # Create Kalman Filter (with learned DF-B layer)
         self.kalman_filter = OperatorBasedKalmanFilter(
             V_A=self.V_A,
             V_B=self.V_B,
@@ -712,21 +594,21 @@ class StateEstimator:
             Q=self.Q,
             R=self.R,
             encoder=self.encoder,
-            df_obs_layer=self.df_obs_layer,  # 学習済みψ_ω含む
+            df_obs_layer=self.df_obs_layer,  # includes trained psi_omega
             device=str(self.device)
         )
         
-        # 初期状態設定
+        # Set initial state
         if initial_data is not None:
             self.kalman_filter.initialize_state(initial_data, method)
         elif self.calibration_data is not None:
-            # キャリブレーションデータから初期化
+            # Initialize from calibration data
             n_init = min(10, self.calibration_data.size(0))
             self.kalman_filter.initialize_state(
                 self.calibration_data[:n_init], method
             )
         else:
-            # ゼロ初期化
+            # Zero initialization
             self.kalman_filter.initialize_state(
                 torch.zeros(1, self.encoder.input_dim, device=self.device), "zero"
             )
@@ -741,18 +623,16 @@ class StateEstimator:
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], 
                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
-        バッチフィルタリング（従来型）
-        
-        観測系列全体を一度に処理
-        
+        Batch filtering over entire observation sequence.
+
         Args:
-            observations: 観測系列 (T, n)
-            return_likelihood: 尤度も返すかどうか
-            
+            observations: Observation sequence (T, n)
+            return_likelihood: Whether to return likelihoods
+
         Returns:
-            X_means: 状態平均系列 (T, r)
-            X_covariances: 状態共分散系列 (T, r, r)
-            likelihoods: 観測尤度系列 (T,) [optional]
+            X_means: State mean sequence (T, r)
+            X_covariances: State covariance sequence (T, r, r)
+            likelihoods: Observation likelihood sequence (T,) [optional]
         """
         if not self.is_initialized:
             raise RuntimeError("Filter not initialized. Call initialize_filtering() first.")
@@ -761,17 +641,15 @@ class StateEstimator:
 
     def filter_online(self, observation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """
-        オンラインフィルタリング（逐次型）
-        
-        1観測ずつ処理、内部状態保持
-        
+        Online filtering (one observation at a time with internal state).
+
         Args:
-            observation: 現在観測 (n,)
-            
+            observation: Current observation (n,)
+
         Returns:
-            x_hat: 推定状態 (r,)
-            Sigma_x: 状態共分散 (r, r)  
-            likelihood: 観測尤度
+            x_hat: Estimated state (r,)
+            Sigma_x: State covariance (r, r)
+            likelihood: Observation likelihood
         """
         if not self.is_initialized:
             raise RuntimeError("Filter not initialized. Call initialize_filtering() first.")
@@ -779,20 +657,12 @@ class StateEstimator:
         return self.kalman_filter.filter_step(observation)
 
     def reset_state(self):
-        """
-        内部状態リセット（新しい系列開始時）
-        """
+        """Reset internal state (for new sequence)."""
         if self.kalman_filter is not None:
             self.kalman_filter.reset_state()
 
     def get_current_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        現在の状態推定値と信頼区間を取得
-        
-        Returns:
-            x_hat: 現在状態推定 (r,)
-            Sigma_x: 現在状態共分散 (r, r)
-        """
+        """Get current state estimate and covariance."""
         if not self.is_initialized:
             raise RuntimeError("Filter not initialized")
             
@@ -803,34 +673,29 @@ class StateEstimator:
         n_steps: int = 1
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        n期先予測
-        
-        現在状態から将来予測
-        
+        n-step-ahead prediction from current state.
+
         Args:
-            n_steps: 予測ステップ数
-            
+            n_steps: Number of prediction steps
+
         Returns:
-            x_pred: 予測状態 (n_steps, r)
-            Sigma_pred: 予測共分散 (n_steps, r, r)
+            x_pred: Predicted states (n_steps, r)
+            Sigma_pred: Predicted covariances (n_steps, r, r)
         """
         if not self.is_initialized:
             raise RuntimeError("Filter not initialized")
             
-        # 現在状態取得
         mu_current, Sigma_current = self.kalman_filter.mu, self.kalman_filter.Sigma
         
-        # 逐次予測
         predictions = []
         covariances = []
         
         mu, Sigma = mu_current.clone(), Sigma_current.clone()
         
         for step in range(n_steps):
-            # 時間更新のみ（観測なし）
+            # Time update only (no observation)
             mu, Sigma = self.kalman_filter.predict_step(mu, Sigma)
             
-            # 元状態空間での復元
             x_pred, Sigma_x_pred = self.kalman_filter._recover_original_state(mu, Sigma)
             
             predictions.append(x_pred)
@@ -839,12 +704,7 @@ class StateEstimator:
         return torch.stack(predictions), torch.stack(covariances)
 
     def get_filter_diagnostics(self) -> Dict[str, Any]:
-        """
-        フィルタ診断情報取得
-        
-        Returns:
-            Dict: 診断結果
-        """
+        """Get filter diagnostics."""
         if not self.is_initialized:
             return {"status": "not_initialized"}
             
@@ -874,12 +734,10 @@ class StateEstimator:
 
     def export_for_deployment(self, export_path: Union[str, Path]):
         """
-        デプロイ用ファイル出力
-        
-        推論のみ必要なコンポーネント抽出
-        
+        Export inference-only components for deployment.
+
         Args:
-            export_path: 出力パス
+            export_path: Output path
         """
         export_path = Path(export_path)
         export_path.mkdir(parents=True, exist_ok=True)
@@ -887,7 +745,6 @@ class StateEstimator:
         if not self.is_initialized:
             raise RuntimeError("Filter not initialized. Cannot export.")
             
-        # 推論用パラメータ
         inference_params = {
             "operators": {
                 "V_A": self.V_A.cpu(),
@@ -902,10 +759,8 @@ class StateEstimator:
             "config": self.config
         }
         
-        # エンコーダ状態
         encoder_state = self.encoder.state_dict()
         
-        # 保存
         torch.save(inference_params, export_path / "inference_params.pth")
         torch.save(encoder_state, export_path / "encoder.pth")
         

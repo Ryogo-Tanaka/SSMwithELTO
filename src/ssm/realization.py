@@ -15,140 +15,106 @@ class RealizationError(Exception):
 
 class StochasticRealizationWithEncoder(nn.Module):
     """
-    定式化準拠: Hilbert空間での関数的CCAに基づく確率的実現
+    Stochastic realization based on functional CCA in Hilbert space.
 
-    定式化対応:
-    - Hilbert空間特徴量プロセス: u_t = u_η(y_t) ∈ R^m (Section 3.1)
-    - 過去・未来部分空間: H^- := span{u_{t-1}, u_{t-2}, ...}, H^+ := span{u_t, u_{t+1}, ...}
-    - 関数的CCA制約最適化: max Cov(v^-, v^+) / (√Var(v^-) √Var(v^+))
-    - Galerkin投影による有限次元近似: ℓ長ウィンドウでの実装
+    Formulation (Section 3):
+    - Hilbert-space feature process: u_t = u_eta(y_t) in R^m (Section 3.1)
+    - Past/future subspaces: H^- := span{u_{t-1}, ...}, H^+ := span{u_t, ...}
+    - Functional CCA constrained optimization
+    - Galerkin projection for finite-dimensional approximation with window length l
 
-    実装特徴:
-    1. 時不変エンコーダー u_η との完全統合
-    2. 弱定常性に基づく共分散演算子の正確な計算
-    3. Ridge正則化とSVDによる数値安定化
-    4. 正準方向から状態変数への理論準拠変換
-
-    ==== 設定ファイル対応: 必要なパラメータ設定 ====
-    # configs/realization.yaml 例:
-    # ssm:
-    #   realization:
-    #     # 基本パラメータ
-    #     encoder_output_dim: 16          # エンコーダー出力次元 m
-    #     window_length: 10               # Galerkin近似ウィンドウ長 ℓ
-    #     num_components: 8               # 状態次元 r (上位正準方向数)
-    #     ridge_param: 1e-3               # Ridge正則化パラメータ λ
-    #
-    #     # 数値安定化設定
-    #     min_eigenvalue: 1e-8            # 最小固有値クリッピング
-    #     condition_threshold: 1e12       # 条件数閾値
-    #
-    #     # 特徴量マッピング設定
-    #     feature_mapping:
-    #       method: "component_averaging"  # "component_averaging" | "component_mlp"
-    #       mlp_hidden_dims: [32, 16]     # MLP使用時の隠れ層次元
-    #
-    #     # 状態変数計算設定
-    #     state_computation:
-    #       use_past_block: true          # 過去ブロック使用 (既存実装準拠)
-    #       apply_sqrt_weights: true      # Λ^{1/2} 重み付け適用
-    #       correlation_threshold: 0.1    # 正準相関選択閾値
-    #
-    #     # デバイス設定
-    #     device: "cpu"                   # "cpu" | "cuda"
-    ===================================================
+    Implementation:
+    1. Full integration with time-invariant encoder u_eta
+    2. Exact covariance operator computation under weak stationarity
+    3. Numerical stabilization via Ridge regularization and SVD
+    4. Theory-compliant transformation from canonical directions to state variables
     """
 
     def __init__(
         self,
         encoder: nn.Module,
-        encoder_output_dim: int,  # 設定ファイルから明示指定
-        past_horizon: int = 10,   # 旧デフォルト
-        rank: int = 8,            # 旧デフォルト
+        encoder_output_dim: int,
+        past_horizon: int = 10,
+        rank: int = 8,
         ridge_param: float = 1e-3,
-        jitter: float = 1e-8,     # 旧: min_eigenvalue → 互換性のため変更
-        m: int = 500,             # ラグ共分散推定サンプル数
+        jitter: float = 1e-8,
+        m: int = 500,
         device: str = 'cpu',
-        # ======== 新規追加: 特徴写像設定 ========
-        feature_mapping_type: str = "averaging",  # "averaging" | "linear" | "mlp"
-        feature_mapping_hidden_dims: Optional[List[int]] = None,  # MLPの隠れ層 (例: [32] or [64, 32])
-        feature_mapping_activation: str = "relu"  # "relu" | "tanh" | "gelu"
+        feature_mapping_type: str = "averaging",
+        feature_mapping_hidden_dims: Optional[List[int]] = None,
+        feature_mapping_activation: str = "relu"
     ):
         """
         Args:
-            encoder: 時不変エンコーダー u_η: R^n → R^m
-            past_horizon: Galerkin近似のウィンドウ長 ℓ (旧名: window_length)
-            rank: 状態次元 r（上位正準方向数）(旧名: num_components)
-            ridge_param: Ridge正則化パラメータ λ
-            jitter: 最小固有値クリッピング (旧名: min_eigenvalue)
-            m: ラグ共分散推定サンプル数
-            device: 計算デバイス
+            encoder: Time-invariant encoder u_eta: R^n -> R^m
+            past_horizon: Window length l for Galerkin approximation
+            rank: State dimension r (number of top canonical directions)
+            ridge_param: Ridge regularization parameter lambda
+            jitter: Minimum eigenvalue clipping for numerical stability
+            m: Number of samples for lag-covariance estimation
+            device: Computation device
         """
         super().__init__()
 
         self.encoder = encoder
-        self.window_length = int(past_horizon)  # ℓ (内部では元の変数名を使用)
-        self.num_components = int(rank)  # r (内部では元の変数名を使用)
-        self.ridge_param = float(ridge_param)  # λ
-        self.min_eigenvalue = float(jitter)  # 数値安定化 (内部では元の変数名を使用)
-        self.m = int(m)  # ラグ共分散推定サンプル数
+        self.window_length = int(past_horizon)  # l
+        self.num_components = int(rank)  # r
+        self.ridge_param = float(ridge_param)  # lambda
+        self.min_eigenvalue = float(jitter)  # numerical stabilization
+        self.m = int(m)  # lag-covariance estimation sample count
         self.device = device
 
-        # 定式化対応: エンコーダー出力次元 m の取得
-        # encoder_output_dimを優先し、フォールバックで自動検出
+        # Encoder output dimension m: prefer explicit encoder_output_dim, fallback to auto-detection
         if encoder_output_dim is not None:
             self.feature_dim = encoder_output_dim
         else:
             self.feature_dim = self._get_encoder_output_dim()
 
-        # 学習済みパラメータ（fit後に設定）
-        self.canonical_directions_past: Optional[torch.Tensor] = None  # a_i ∈ R^m
-        self.canonical_directions_future: Optional[torch.Tensor] = None  # b_i ∈ R^m
-        self.canonical_correlations: Optional[torch.Tensor] = None  # ρ_i
+        # Fitted parameters (set after fit())
+        self.canonical_directions_past: Optional[torch.Tensor] = None  # a_i in R^m
+        self.canonical_directions_future: Optional[torch.Tensor] = None  # b_i in R^m
+        self.canonical_correlations: Optional[torch.Tensor] = None  # rho_i
         self.is_fitted = False
 
-        # 互換性のため: 古いRealizationクラスとの互換性
-        self.h = self.window_length  # past_horizon相当
-        self.rank = self.num_components  # rank相当（低ランク近似の次数）
+        # Backward compatibility with legacy Realization class
+        self.h = self.window_length
+        self.rank = self.num_components
 
-        # 計算フロー最適化: 中間結果のキャッシュ
-        self._cached_feature_matrices: Optional[Dict[str, torch.Tensor]] = None  # Feat_X, Feat_Y
-        self._cached_covariance_blocks: Optional[Dict[str, torch.Tensor]] = None  # G, H, A
-        self._cached_whitening_matrices: Optional[Dict[str, torch.Tensor]] = None  # G_inv_sqrt, H_inv_sqrt
-        self._last_input_shape: Optional[Tuple[int, int]] = None  # (T, n) for cache validation
+        # Intermediate result cache for computation optimization
+        self._cached_feature_matrices: Optional[Dict[str, torch.Tensor]] = None
+        self._cached_covariance_blocks: Optional[Dict[str, torch.Tensor]] = None
+        self._cached_whitening_matrices: Optional[Dict[str, torch.Tensor]] = None
+        self._last_input_shape: Optional[Tuple[int, int]] = None
 
-        # デバッグ・統計用
+        # Statistics for debugging
         self._feature_statistics: Optional[Dict[str, torch.Tensor]] = None
 
-        # ======== 追加: 特徴写像変換の初期化 ========
+        # Feature mapping transform initialization
         self.feature_mapping_type = feature_mapping_type
 
         if feature_mapping_type == "averaging":
-            # 従来の時間平均（パラメータなし）
+            # Temporal averaging (no learnable parameters)
             self.component_transforms = None
 
         elif feature_mapping_type in ["linear", "mlp"]:
-            # 成分別変換: m個の独立したネットワーク
-            # 各ネットワークは ℓ → 1 の変換
+            # Per-component transforms: m independent networks, each l -> 1
 
             if feature_mapping_type == "linear":
-                # 線形層のみ（隠れ層なし）
                 hidden_dims = []
             else:
-                # MLP（隠れ層あり）
                 if feature_mapping_hidden_dims is None:
                     hidden_dims = [32]
                 else:
                     hidden_dims = feature_mapping_hidden_dims
 
-            # m個の成分別変換を構築
+            # Build m per-component transforms
             self.component_transforms = nn.ModuleList([
                 self._build_component_transform(
                     input_dim=self.window_length,  # ℓ
                     hidden_dims=hidden_dims,
                     activation=feature_mapping_activation
                 )
-                for _ in range(self.feature_dim)  # m個の成分
+                for _ in range(self.feature_dim)  # m components
             ])
         else:
             raise ValueError(
@@ -163,23 +129,18 @@ class StochasticRealizationWithEncoder(nn.Module):
         activation: str
     ) -> nn.Sequential:
         """
-        成分別変換ネットワーク構築: ℝˡ → ℝ
+        Build per-component transform network: R^l -> R.
 
         Theory Section 4.4.1, equation 333:
-        φ̃_m^(i)(p(t)) = MLP(φ_u^(i)(p(t))) ∈ ℝ
-
-        実装選択肢:
-        - hidden_dims = [] → 線形層のみ: Linear(ℓ, 1)
-        - hidden_dims = [h] → 浅いMLP: Linear(ℓ, h) → Act → Linear(h, 1)
-        - hidden_dims = [h1, h2] → 2層MLP: Linear(ℓ, h1) → Act → Linear(h1, h2) → Act → Linear(h2, 1)
+        phi_tilde_m^(i)(p(t)) = MLP(phi_u^(i)(p(t))) in R
 
         Args:
-            input_dim: 入力次元 ℓ (window_length)
-            hidden_dims: 隠れ層次元リスト（空リスト=線形層のみ）
-            activation: 活性化関数 ("relu", "tanh", "gelu")
+            input_dim: Input dimension l (window_length)
+            hidden_dims: Hidden layer dimensions (empty list = linear only)
+            activation: Activation function ("relu", "tanh", "gelu")
 
         Returns:
-            nn.Sequential: 変換ネットワーク
+            nn.Sequential: Transform network
         """
         activation_map = {
             "relu": nn.ReLU,
@@ -195,28 +156,28 @@ class StochasticRealizationWithEncoder(nn.Module):
         layers = []
         in_dim = input_dim
 
-        # 隠れ層の構築
+        # Build hidden layers
         for h_dim in hidden_dims:
             layers.append(nn.Linear(in_dim, h_dim))
             layers.append(act_fn())
             in_dim = h_dim
 
-        # 最終層: → ℝ (スカラー出力)
+        # Final layer: -> R (scalar output)
         layers.append(nn.Linear(in_dim, 1))
 
         return nn.Sequential(*layers)
 
     def _get_encoder_output_dim(self) -> int:
         """
-        定式化対応: エンコーダー出力次元 m の取得（設定ファイル対応）
+        Get encoder output dimension m.
 
-        実環境対応: ダミー入力を避け、設定パラメータで明示指定
+        Prefers explicit config parameter over dummy-input probing.
         """
-        # エンコーダーの属性から直接取得を試行
+        # Try direct attribute access on encoder
         if hasattr(self.encoder, 'output_dim'):
             return self.encoder.output_dim
 
-        # 実環境では設定ファイルで明示指定することを推奨
+        # Explicit specification via config is recommended
         raise ValueError(
             "Cannot determine encoder output dimension. "
             "Please specify 'encoder_output_dim' in config or "
@@ -230,87 +191,80 @@ class StochasticRealizationWithEncoder(nn.Module):
         use_cache: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        定式化対応: 時不変エンコーダーを用いた特徴量行列構築（キャッシュ対応）
+        Build feature matrices using time-invariant encoder (with optional caching).
 
-        計算フロー最適化: 同一データに対する再計算を避ける
-
-        定式化 Section 3.2-3.3:
-        1. エンコーダー適用: Y → M = [u_η(y_1), ..., u_η(y_T)]
-        2. 過去・未来ブロック定義（修正版）:
-           p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-ℓ)^T)^T ∈ R^{d·ℓ}
-           f(t) = (y(t)^T, y(t+1)^T, ..., y(t+ℓ-1)^T)^T ∈ R^{d·ℓ}
-        3. 特徴量マッピング φ_m 構築:
-           過去特徴量: Feat_X[i] = φ_m(p(t))
-           未来特徴量: Feat_Y[i] = φ_m(f(t))
+        Section 3.2-3.3:
+        1. Apply encoder: Y -> M = [u_eta(y_1), ..., u_eta(y_T)]
+        2. Past/future block construction:
+           p(t) = (y(t-1)^T, ..., y(t-l)^T)^T in R^{d*l}
+           f(t) = (y(t)^T, ..., y(t+l-1)^T)^T in R^{d*l}
+        3. Feature mapping phi_m:
+           Feat_X[i] = phi_m(p(t)), Feat_Y[i] = phi_m(f(t))
 
         Args:
-            Y: 観測時系列 (T, n)
-            use_cache: キャッシュを使用するか
+            Y: Observation time series (T, n)
+            use_cache: Whether to use cached results
 
         Returns:
-            Feat_X: 過去特徴量行列 (m, N)
-            Feat_Y: 未来特徴量行列 (m, N)
+            Feat_X: Past feature matrix (m, N)
+            Feat_Y: Future feature matrix (m, N)
         """
-        # キャッシュ無効化: _lightweight_operator_updateとPhase-2のfit()が同一エポック内で
-        # 複数回呼ばれ、computation graphの管理が複雑になるため安全に無効化
+        # Cache disabled: _lightweight_operator_update and Phase-2 fit() can be called
+        # multiple times per epoch, making computation graph management complex
         use_cache = False
 
-        # 入力形状の記録（キャッシュ機構維持のため）
+        # Record input shape (for cache validation infrastructure)
         input_shape = Y.shape
 
-        # キャッシュチェック（現在は無効化されているため常にスキップ）
+        # Cache check (currently disabled, always skipped)
         if (use_cache and
             self._cached_feature_matrices is not None and
             self._last_input_shape == input_shape):
             return self._cached_feature_matrices['Feat_X'], self._cached_feature_matrices['Feat_Y']
 
-        # Step 1: 全時点でエンコーダー適用（バッチ処理対応）
-        # u_η(y_t) → m_t ∈ R^m (定式化 Section 3.1)
-
-        # バッチ処理でエンコーダーを呼び出し
-        # 訓練時は勾配保持、推論時は効率化のため勾配無効化
+        # Step 1: Apply encoder at all time points (batch processing)
+        # u_eta(y_t) -> m_t in R^m (Section 3.1)
         if self.encoder.training:
-            # 訓練時: 勾配を保持してエンコーダーパラメータ更新を可能にする
-            # Phase-2でのCCA損失勾配フロー確保のため重要
-            M = self.encoder(Y)  # (T, H, W, C) or (T, n) → (T, m)
+            # Training: retain gradients for encoder parameter updates
+            # Critical for CCA loss gradient flow in Phase-2
+            M = self.encoder(Y)  # (T, H, W, C) or (T, n) -> (T, m)
         else:
-            # 推論時: 勾配無効化で効率化
-            self.encoder.eval()  # BatchNorm無効化
+            # Inference: disable gradients for efficiency
+            self.encoder.eval()
             with torch.no_grad():
-                M = self.encoder(Y)  # (T, H, W, C) or (T, n) → (T, m)
+                M = self.encoder(Y)  # (T, H, W, C) or (T, n) -> (T, m)
 
-        # エンコーダー出力から統一的に形状を取得
-        T, m = M.shape  # エンコーダー後は常に(T, m)
+        T, m = M.shape  # always (T, m) after encoder
 
         L = self.window_length
-        N = T - 2 * L + 1  # 有効サンプル数
+        N = T - 2 * L + 1  # effective sample count
 
         if N <= 0:
             raise ValueError(f"Time series too short for window length {L}")
 
-            # 次元確認と調整
-            if M.dim() == 1:  # (m,) の場合
+            # Dimension check and adjustment
+            if M.dim() == 1:
                 M = M.unsqueeze(0)  # (1, m)
-            elif M.dim() == 3:  # (T, 1, m) の場合
+            elif M.dim() == 3:
                 M = M.squeeze(1)  # (T, m)
 
-        # Step 2: 特徴量マッピング φ_m の構築
-        # 定式化 Section 3.3: 同一成分のグループ化 → MLP変換
+        # Step 2: Build feature mapping phi_m
+        # Section 3.3: group same components -> transform
         Feat_X_list = []
         Feat_Y_list = []
 
         for i in range(N):
-            t = i + L  # 実際の時点（Lから開始）
+            t = i + L  # actual time point (starts from L)
 
-            # 過去ブロック: p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-L)^T)^T
-            # 時点t-1からt-Lまで逆順で取得
+            # Past block: p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-L)^T)^T
+            # Retrieve from t-1 to t-L in reverse order
             past_indices = list(range(t-1, t-L-1, -1))  # [t-1, t-2, ..., t-L]
             past_features = M[past_indices]  # (L, m)
 
-            # 未来ブロック: f(t) = (y(t)^T, y(t+1)^T, ..., y(t+L-1)^T)^T
+            # Future block: f(t) = (y(t)^T, y(t+1)^T, ..., y(t+L-1)^T)^T
             future_features = M[t:t+L]  # (L, m)
 
-            # φ_m 変換: 成分別グループ化 → スカラー出力
+            # phi_m transform: per-component grouping -> scalar output
             feat_past = self._apply_feature_mapping(past_features)  # (m,)
             feat_future = self._apply_feature_mapping(future_features)  # (m,)
 
@@ -320,7 +274,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         Feat_X = torch.stack(Feat_X_list, dim=1)  # (m, N)
         Feat_Y = torch.stack(Feat_Y_list, dim=1)  # (m, N)
 
-        # キャッシュ保存 (勾配グラフ保持のためcloneしない)
+        # Save to cache (no clone to preserve gradient graph)
         if use_cache:
             self._cached_feature_matrices = {'Feat_X': Feat_X, 'Feat_Y': Feat_Y}
             self._last_input_shape = input_shape
@@ -329,48 +283,46 @@ class StochasticRealizationWithEncoder(nn.Module):
 
     def _apply_feature_mapping(self, features: torch.Tensor) -> torch.Tensor:
         """
-        定式化対応: 特徴量マッピング φ_m の実装（成分別変換）
+        Apply feature mapping phi_m (per-component transform).
 
         Theory Section 4.4.1:
-        1. 同一成分のグループ化: φ_u^(i)(p(t)) := [φ_u^(i)(y(t-1)), ..., φ_u^(i)(y(t-ℓ))]^T ∈ ℝˡ
-        2. 成分別スカラー変換: φ̃_m^(i)(p(t)) = Transform_i(φ_u^(i)(p(t))) ∈ ℝ
-        3. 最終ベクトル構成: φ_m(p(t)) = [φ̃_m^(1)(p(t)), ..., φ̃_m^(m)(p(t))]^T ∈ ℝᵐ
+        1. Group same components: phi_u^(i)(p(t)) in R^l
+        2. Per-component scalar transform: phi_tilde_m^(i) in R
+        3. Final vector: phi_m(p(t)) in R^m
 
-        実装選択肢（feature_mapping_type設定で切り替え）:
-        - "averaging": 時間平均 (1/ℓ) Σ φ_u^(i)(y(t-j)) （Theory equation 345）
-        - "linear":    線形変換 w_i^T φ_u^(i)(p(t)) （パラメータ学習可能）
-        - "mlp":       浅いMLP MLP_i(φ_u^(i)(p(t))) （Theory equation 333）
+        Mapping options (selected by feature_mapping_type):
+        - "averaging": temporal mean (1/l) sum (Theory eq. 345)
+        - "linear": learnable linear w_i^T phi_u^(i)(p(t))
+        - "mlp": shallow MLP (Theory eq. 333)
 
         Args:
-            features: (ℓ, m) 特徴量ブロック
-                ℓ: window_length
-                m: feature_dim (エンコーダー出力次元)
+            features: (l, m) feature block
 
         Returns:
-            feat_output: (m,) マッピング結果
+            feat_output: (m,) mapping result
         """
         L_win, m = features.shape
 
         if self.feature_mapping_type == "averaging":
-            # 従来の時間平均実装 (Theory equation 345)
+            # Temporal averaging (Theory equation 345)
             # φ̃_m^(i) ≈ (1/ℓ) Σ_{j=1}^ℓ φ_u^(i)(y(t-j))
             feat_output = torch.mean(features, dim=0)  # (m,)
 
         elif self.feature_mapping_type in ["linear", "mlp"]:
-            # 成分別変換実装 (Theory equation 333)
+            # Per-component transform (Theory equation 333)
             feat_components = []
 
             for i in range(m):
-                # Step 1: 成分iのグループ化
+                # Step 1: Group component i
                 # φ_u^(i)(p(t)) = [φ_u^(i)(y(t-1)), ..., φ_u^(i)(y(t-ℓ))]^T ∈ ℝˡ
                 feat_u_i = features[:, i]  # (ℓ,)
 
-                # Step 2: 成分別変換適用
+                # Step 2: Apply per-component transform
                 # φ̃_m^(i)(p(t)) = Transform_i(φ_u^(i)(p(t))) ∈ ℝ
                 feat_tilde_i = self.component_transforms[i](feat_u_i)  # (1,)
                 feat_components.append(feat_tilde_i.squeeze())
 
-            # Step 3: 最終ベクトル構成
+            # Step 3: Compose final vector
             feat_output = torch.stack(feat_components)  # (m,)
 
         else:
@@ -384,39 +336,37 @@ class StochasticRealizationWithEncoder(nn.Module):
         Feat_Y: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        定式化対応: サンプル共分散ブロック計算
+        Compute sample covariance blocks (Section 3.4).
 
-        定式化 Section 3.4:
-        - 中心化特徴量行列（サンプル平均減算）
-        - サンプル共分散ブロック:
-          G = (1/N) Feat_X Feat_X^T ∈ R^{m×m} (過去の分散)
-          H = (1/N) Feat_Y Feat_Y^T ∈ R^{m×m} (未来の分散)
-          A = (1/N) Feat_Y Feat_X^T ∈ R^{m×m} (過去-未来の共分散)
+        After mean-centering:
+          G = (1/N) Feat_X Feat_X^T (past variance)
+          H = (1/N) Feat_Y Feat_Y^T (future variance)
+          A = (1/N) Feat_Y Feat_X^T (past-future cross-covariance)
 
         Args:
-            Feat_X: 過去特徴量行列 (m, N)
-            Feat_Y: 未来特徴量行列 (m, N)
+            Feat_X: Past feature matrix (m, N)
+            Feat_Y: Future feature matrix (m, N)
 
         Returns:
-            G: 過去分散行列 (m, m)
-            H: 未来分散行列 (m, m)
-            A: 交差共分散行列 (m, m)
+            G: Past variance matrix (m, m)
+            H: Future variance matrix (m, m)
+            A: Cross-covariance matrix (m, m)
         """
         m, N = Feat_X.shape
 
-        # 中心化（サンプル平均減算）
+        # Mean-centering
         Feat_X_mean = torch.mean(Feat_X, dim=1, keepdim=True)  # (m, 1)
         Feat_Y_mean = torch.mean(Feat_Y, dim=1, keepdim=True)  # (m, 1)
 
         Feat_X_centered = Feat_X - Feat_X_mean  # (m, N)
         Feat_Y_centered = Feat_Y - Feat_Y_mean  # (m, N)
 
-        # サンプル共分散ブロック
+        # Sample covariance blocks
         G = (Feat_X_centered @ Feat_X_centered.T) / N  # (m, m)
         H = (Feat_Y_centered @ Feat_Y_centered.T) / N  # (m, m)
         A = (Feat_Y_centered @ Feat_X_centered.T) / N  # (m, m)
 
-        # 統計情報保存（デバッグ用）
+        # Save statistics for debugging
         self._feature_statistics = {
             'past_mean': Feat_X_mean.squeeze(),
             'future_mean': Feat_Y_mean.squeeze(),
@@ -431,18 +381,17 @@ class StochasticRealizationWithEncoder(nn.Module):
         H: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        定式化対応: Ridge正則化による数値安定化
+        Ridge regularization for numerical stability (Section 3.4).
 
-        定式化 Section 3.4:
-        Ridge正則化: G_reg = G + λI_m, H_reg = H + λI_m, λ > 0
+        G_reg = G + lambda*I_m, H_reg = H + lambda*I_m
 
         Args:
-            G: 過去分散行列 (m, m)
-            H: 未来分散行列 (m, m)
+            G: Past variance matrix (m, m)
+            H: Future variance matrix (m, m)
 
         Returns:
-            G_reg: 正則化過去分散行列 (m, m)
-            H_reg: 正則化未来分散行列 (m, m)
+            G_reg: Regularized past variance matrix (m, m)
+            H_reg: Regularized future variance matrix (m, m)
         """
         m = G.size(0)
         I_m = torch.eye(m, device=G.device, dtype=G.dtype)
@@ -458,32 +407,28 @@ class StochasticRealizationWithEncoder(nn.Module):
         H_reg: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        定式化対応: 白色化行列の安定計算
+        Compute whitening matrices via eigendecomposition (Section 3.4).
 
-        定式化 Section 3.4:
-        白色化行列計算: G_reg^{-1/2}, H_reg^{-1/2} の安定的計算（固有値分解使用）
-
-        数値安定化:
-        - 最小固有値クリッピング
-        - 条件数管理
+        Stable computation of G_reg^{-1/2}, H_reg^{-1/2} with
+        minimum eigenvalue clipping for numerical stability.
 
         Args:
-            G_reg: 正則化過去分散行列 (m, m)
-            H_reg: 正則化未来分散行列 (m, m)
+            G_reg: Regularized past variance matrix (m, m)
+            H_reg: Regularized future variance matrix (m, m)
 
         Returns:
             G_inv_sqrt: G_reg^{-1/2} (m, m)
             H_inv_sqrt: H_reg^{-1/2} (m, m)
         """
         def stable_matrix_inv_sqrt(A: torch.Tensor, min_eigval: float = 1e-8) -> torch.Tensor:
-            """数値安定的な A^{-1/2} 計算"""
-            # 対称化
+            """Numerically stable A^{-1/2} computation."""
+            # Symmetrize
             A_sym = 0.5 * (A + A.T)
 
-            # 固有値分解
+            # Eigendecomposition
             eigvals, eigvecs = torch.linalg.eigh(A_sym)
 
-            # 最小固有値クリッピング（数値安定化）
+            # Clip minimum eigenvalue for numerical stability
             eigvals_clipped = torch.clamp(eigvals, min=min_eigval)
 
             # A^{-1/2} = V diag(λ^{-1/2}) V^T
@@ -495,7 +440,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         G_inv_sqrt = stable_matrix_inv_sqrt(G_reg)
         H_inv_sqrt = stable_matrix_inv_sqrt(H_reg)
 
-        # 白色化行列保存（デバッグ用）
+        # Save whitening matrices for debugging
         self._whitening_matrices = {
             'G_inv_sqrt': G_inv_sqrt,
             'H_inv_sqrt': H_inv_sqrt
@@ -510,29 +455,27 @@ class StochasticRealizationWithEncoder(nn.Module):
         H_inv_sqrt: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        定式化対応: SVDによる正準相関分析
+        Canonical correlation analysis via SVD (Section 3.5).
 
-        定式化 Section 3.5:
-        1. 白色化された交差ブロック: A_tilde := H_reg^{-1/2} A G_reg^{-1/2}
-        2. SVD分解: A_tilde = U Σ V^T
-        3. 正準方向の逆変換:
-           a_i = G_reg^{-1/2} v_i ∈ R^m
-           b_i = H_reg^{-1/2} u_i ∈ R^m
+        1. Whitened cross-block: A_tilde := H_reg^{-1/2} A G_reg^{-1/2}
+        2. SVD: A_tilde = U Sigma V^T
+        3. Inverse transform of canonical directions:
+           a_i = G_reg^{-1/2} v_i, b_i = H_reg^{-1/2} u_i
 
         Args:
-            A: 交差共分散行列 (m, m)
+            A: Cross-covariance matrix (m, m)
             G_inv_sqrt: G_reg^{-1/2} (m, m)
             H_inv_sqrt: H_reg^{-1/2} (m, m)
 
         Returns:
-            U: 左特異ベクトル (m, m)
-            Σ: 特異値 (正準相関係数) (m,)
-            V^T: 右特異ベクトル転置 (m, m)
+            U: Left singular vectors (m, m)
+            S_vals: Singular values (canonical correlations) (m,)
+            Vt: Right singular vectors transposed (m, m)
         """
-        # 白色化された交差ブロック
+        # Whitened cross-block
         A_tilde = H_inv_sqrt @ A @ G_inv_sqrt  # (m, m)
 
-        # SVD分解
+        # SVD decomposition
         U, S_vals, Vt = torch.linalg.svd(A_tilde, full_matrices=False)
 
         return U, S_vals, Vt
@@ -545,27 +488,25 @@ class StochasticRealizationWithEncoder(nn.Module):
         H_inv_sqrt: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        定式化対応: 正準方向の抽出と逆変換
+        Extract and inverse-transform canonical directions (Section 3.5).
 
-        定式化 Section 3.5:
-        正準方向の逆変換:
-        a_i = G_reg^{-1/2} v_i ∈ R^m (過去空間での正準方向)
-        b_i = H_reg^{-1/2} u_i ∈ R^m (未来空間での正準方向)
+        a_i = G_reg^{-1/2} v_i (canonical direction in past space)
+        b_i = H_reg^{-1/2} u_i (canonical direction in future space)
 
         Args:
-            U: 左特異ベクトル (m, m)
-            Vt: 右特異ベクトル転置 (m, m)
+            U: Left singular vectors (m, m)
+            Vt: Right singular vectors transposed (m, m)
             G_inv_sqrt: G_reg^{-1/2} (m, m)
             H_inv_sqrt: H_reg^{-1/2} (m, m)
 
         Returns:
-            canonical_dirs_past: 過去正準方向 a_i (m, r)
-            canonical_dirs_future: 未来正準方向 b_i (m, r)
+            canonical_dirs_past: Past canonical directions a_i (m, r)
+            canonical_dirs_future: Future canonical directions b_i (m, r)
         """
-        # 上位 r 個の正準方向選択
+        # Select top r canonical directions
         r = min(self.num_components, U.size(1))
 
-        # 正準方向の逆変換
+        # Inverse-transform canonical directions
         canonical_dirs_past = G_inv_sqrt @ Vt[:r, :].T  # (m, r)
         canonical_dirs_future = H_inv_sqrt @ U[:, :r]   # (m, r)
 
@@ -573,20 +514,19 @@ class StochasticRealizationWithEncoder(nn.Module):
 
     def fit(self, Y: torch.Tensor, encoder: Optional[nn.Module] = None) -> 'StochasticRealizationWithEncoder':
         """
-        定式化対応: 関数的CCAに基づく確率的実現の学習
+        Fit stochastic realization based on functional CCA (Section 3).
 
-        定式化 Section 3 全体の実装:
-        1. 時不変エンコーダーとの統合
-        2. Hilbert空間での特徴量プロセス構築
-        3. 関数的CCA制約最適化問題の解決
-        4. 正準方向から状態変数への変換
+        1. Integrate with time-invariant encoder
+        2. Build Hilbert-space feature process
+        3. Solve functional CCA constrained optimization
+        4. Transform canonical directions to state variables
 
         Args:
-            Y: 観測時系列 (T, n)
-            encoder: エンコーダー（Noneの場合は初期化時のものを使用）
+            Y: Observation time series (T, n)
+            encoder: Encoder (uses the one from __init__ if None)
 
         Returns:
-            self: 学習済みインスタンス
+            self: Fitted instance
         """
         if encoder is not None:
             self.encoder = encoder
@@ -594,38 +534,37 @@ class StochasticRealizationWithEncoder(nn.Module):
         Y = Y.to(self.device)
         self.encoder = self.encoder.to(self.device)
 
-        # キャッシュクリア: 前エポックのgraph freed tensorsを参照しないようにする
-        # fit()→estimate_states()間のみキャッシュ有効
+        # Clear cache to avoid referencing graph-freed tensors from previous epoch
+        # Cache valid only between fit() and estimate_states()
         self._cached_feature_matrices = None
         self._last_input_shape = None
 
-        # Step 1: 時不変エンコーダーを用いた特徴量行列構築
+        # Step 1: Build feature matrices using time-invariant encoder
         Feat_X, Feat_Y = self._build_feature_matrices(Y)
 
-        # Step 2: サンプル共分散ブロック計算
+        # Step 2: Compute sample covariance blocks
         G, H, A = self._compute_covariance_blocks(Feat_X, Feat_Y)
 
-        # Step 3: Ridge正則化
+        # Step 3: Ridge regularization
         G_reg, H_reg = self._apply_ridge_regularization(G, H)
 
-        # Step 4: 白色化行列計算
+        # Step 4: Compute whitening matrices
         G_inv_sqrt, H_inv_sqrt = self._compute_whitening_matrices(G_reg, H_reg)
 
-        # Step 5: 正準相関分析（SVD）
+        # Step 5: Canonical correlation analysis (SVD)
         U, S_vals, Vt = self._solve_canonical_correlation(A, G_inv_sqrt, H_inv_sqrt)
 
-        # Step 6: 正準方向抽出
+        # Step 6: Extract canonical directions
         canonical_dirs_past, canonical_dirs_future = self._extract_canonical_directions(
             U, Vt, G_inv_sqrt, H_inv_sqrt
         )
 
-        # 学習結果保存
+        # Save fitted results
         self.canonical_directions_past = canonical_dirs_past
         self.canonical_directions_future = canonical_dirs_future
         self.canonical_correlations = S_vals[:min(self.num_components, len(S_vals))]
 
-        # 既存実装との整合性: B行列の構築 (B = Σ^{1/2} a^T 形式)
-        # 既存filter()メソッドとの互換性確保のため
+        # Build B matrix (B = Sigma^{1/2} a^T) for compatibility with legacy filter()
         sqrt_correlations = torch.sqrt(self.canonical_correlations)  # Σ^{1/2}
         self.B_matrix = torch.diag(sqrt_correlations) @ canonical_dirs_past.T  # (r, m)
 
@@ -635,40 +574,38 @@ class StochasticRealizationWithEncoder(nn.Module):
 
     def estimate_states(self, Y: torch.Tensor) -> torch.Tensor:
         """
-        定式化準拠: 正準変量から状態変数への変換
+        Transform canonical variates to state variables.
 
-        定式化対応:
-        過去プロセス正準変量: z_p(t) = [a_1^T φ_m(p(t)), ..., a_r^T φ_m(p(t))]^T ∈ R^r
-        状態変数: x(t) = Σ^{1/2} z_p(t)
+        Past-process canonical variate: z_p(t) = [a_1^T phi_m(p(t)), ..., a_r^T phi_m(p(t))]^T in R^r
+        State variable: x(t) = Sigma^{1/2} z_p(t)
 
-        計算フロー最適化: fit()で計算済みの情報を再利用
+        Reuses feature matrices computed during fit() when available.
 
         Args:
-            Y: 観測時系列 (T, n)
+            Y: Observation time series (T, n)
 
         Returns:
-            X: 状態系列 (T_eff, r)
+            X: State sequence (T_eff, r)
         """
         if not self.is_fitted:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
         Y = Y.to(self.device)
 
-        # キャッシュされた特徴量行列を再利用（fit()で計算済み）
+        # Reuse cached feature matrices (computed during fit())
         if self._cached_feature_matrices is not None:
-            Phi_X = self._cached_feature_matrices['Feat_X']  # 過去ブロック特徴量
+            Phi_X = self._cached_feature_matrices['Feat_X']
         else:
-            # キャッシュがない場合のみ再計算
+            # Recompute only when cache is unavailable
             Phi_X, _ = self._build_feature_matrices(Y)
 
-        # 定式化準拠の状態変数計算
-        # Step 1: 過去プロセス正準変量 z_p(t) = [a_1^T phi_m(p(t)), ..., a_r^T phi_m(p(t))]^T
+        # Step 1: Past-process canonical variate z_p(t)
         z_p = self.canonical_directions_past.T @ Phi_X  # (r, N)
 
-        # Step 2: 正準相関係数による重み付け x(t) = Σ^{1/2} z_p(t)
+        # Step 2: Weight by canonical correlations: x(t) = Sigma^{1/2} z_p(t)
         sqrt_canonical_corrs = torch.sqrt(self.canonical_correlations)  # Σ^{1/2} ∈ R^r
 
-        # 重み付け適用: 各正準変量に対応する相関係数の平方根を乗算
+        # Apply weighting: multiply each canonical variate by sqrt of its correlation
         X_weighted = sqrt_canonical_corrs.unsqueeze(1) * z_p  # (r, N)
         X = X_weighted.T  # (N, r)
 
@@ -676,26 +613,24 @@ class StochasticRealizationWithEncoder(nn.Module):
 
     def filter_compatible(self, Y: torch.Tensor) -> torch.Tensor:
         """
-        既存filter()メソッドとの互換性確保
+        Backward-compatible wrapper for legacy filter() interface.
 
-        定式化準拠: estimate_states()の結果と数値的に一致するよう修正
-        短期解決として内部でestimate_states()を呼び出して数値精度を統一
+        Delegates to estimate_states() for numerical consistency.
 
         Args:
-            Y: 観測時系列 (T, n)
+            Y: Observation time series (T, n)
 
         Returns:
-            X: 状態系列 (T_eff, r) - estimate_states()と数値的に同一結果
+            X: State sequence (T_eff, r) - numerically identical to estimate_states()
         """
-        # 定式化準拠のestimate_states()を呼び出して数値精度を統一
         return self.estimate_states(Y)
 
     def get_canonical_analysis_results(self) -> Dict[str, Any]:
         """
-        正準相関分析の結果取得
+        Get canonical correlation analysis results.
 
         Returns:
-            Dict: 分析結果
+            Dict: Analysis results
         """
         if not self.is_fitted:
             return {"status": "not_fitted"}
@@ -744,23 +679,22 @@ class Realization:
         jitter:        small epsilon to add to diagonals of covariances
         cond_thresh:   max allowed condition number before rejection
         """
-        # **修正**: 数値パラメータの型変換を明示的に実行
+        # Explicit type conversion for numerical parameters
         self.h = int(past_horizon)
-        self.jitter = float(jitter)  # **追加**: 明示的なfloat変換
-        self.cond_thresh = float(cond_thresh)  # **追加**: 明示的なfloat変換
-        
-        # rank処理
+        self.jitter = float(jitter)
+        self.cond_thresh = float(cond_thresh)
+
         if rank is not None:
-            self.rank = int(rank)  # **修正**: 明示的なint変換
+            self.rank = int(rank)
         else:
             self.rank = rank
-            
-        self.reg_type = str(reg_type)  # **追加**: 明示的なstr変換
 
-        # mパラメータ（ラグ共分散推定用サンプル数）
+        self.reg_type = str(reg_type)
+
+        # m parameter (sample count for lag-covariance estimation)
         self.m = int(m) if m is not None else None
 
-        # 初期化
+        # Initialization
         self.B = None
         self._L_vals = None
 
@@ -776,25 +710,19 @@ class Realization:
             # raise RealizationError("Time series too short for horizon h")
             return
 
-        # 0) 中心化
+        # 0) Mean-center
         mu = Y.mean(dim=0, keepdim=True)
-        Y_c = Y - mu 
-        
-        # # 1) ブロック‐ハンケル行列
-        # H_p_float = torch.stack([Y_c[i : i+h].flip(dims=(0,)).reshape(-1) for i in range(N)], dim=1)
-        # H_f_float = torch.stack([Y_c[i+1 : i+h+1].reshape(-1) for i in range(N)], dim=1)
-        # H_p = H_p_float.double()
-        # H_f = H_f_float.double()
+        Y_c = Y - mu
 
         device = Y_c.device
-        # mを自動決定（設定可能、適応的デフォルト）
+        # Auto-determine m (configurable, adaptive default)
         max_available = T - 2 * h
         if max_available <= 0:
-            # past_horizonを自動調整
+            # Auto-adjust past_horizon
             h_new = max(1, (T - 1) // 2)
-            print(f"realization調整: past_horizon {h} → {h_new} (データ長: {T})")
+            print(f"realization adjusted: past_horizon {h} -> {h_new} (data length: {T})")
             h = h_new
-            self.h = h_new  # 属性も更新
+            self.h = h_new
             max_available = T - 2 * h
 
         m_default = min(500, max(1, max_available))
@@ -802,15 +730,15 @@ class Realization:
         if m is None:
             m = m_default
         else:
-            m = min(m, max_available)  # 利用可能範囲に制限
-        rank   = self.rank      # 低ランク近似の次数
+            m = min(m, max_available)  # clip to available range
+        rank   = self.rank      # low-rank approximation order
         # eps_chol   = 1e-7
         # eps_jitter = 1e-10
         eps_chol   = float(self.jitter)
         eps_jitter = float(self.jitter)
         q_over     = 5
 
-        # 1. ── ラグ共分散 (バッチ外積, float32) -----------------
+        # 1. -- Lag covariances (batch outer products, float32) -----
         idx = torch.randint(0, max_available, (m,), device=device)
         Y0  = Y_c[idx]                          # (m, p)
         Lambda    = {}
@@ -822,7 +750,7 @@ class Realization:
             if h + 1 > l > 0:
                 Lambda[-l] = cov.T
 
-        # 2. ── ブロック行列 (k×k ブロック) ----------------------
+        # 2. -- Block matrices (k x k blocks) ----------------------
         dim_H   = h * p
         H32  = torch.zeros(dim_H, dim_H, dtype=torch.float32, device=device)
         Tp32 = torch.zeros_like(H32)
@@ -835,7 +763,7 @@ class Realization:
         
         Tp32.diagonal().add_(eps_jitter)        # jitter for SPD
 
-        # 3. ── 逆平方根 (float64 で) -----------------------------
+        # 3. -- Inverse square root (float64) ----------------------
         Tp64 = Tp32.to(torch.float64)
         Tp64 = 0.5 * (Tp64 + Tp64.T)
         try:
@@ -846,30 +774,14 @@ class Realization:
         except RuntimeError as e:
             print(f"real.fit failed cholesky decom: {e}")
             
-            # ========================================
-            # 数値安定性失敗時の対応方針メモ:
-            # 
-            # 選択肢1: 微分可能な変換で数値修正
-            #   - torch.nn.functional.softplus(eigvals, beta=10) + eps_chol
-            #   - 勾配は保持されるが、手法の数学的意味が変わる可能性
-            # 
-            # 選択肢2: 例外エポックスキップ（現在の方針）
-            #   - RealizationErrorを投げてトレーナー側でエポック継続
-            #   - 手法の学習戦略に破綻しない
-            #
-            # 選択肢3: 正則化による事前防止
-            #   - 学習時に固有値負値化を防ぐ正則化項
-            #   - 根本的解決だが実装が複雑
-            # ========================================
-            
-            # NaN/Inf チェック - これ自体が数値破綻の兆候
+            # NaN/Inf check - indicator of numerical breakdown
             if not torch.isfinite(Tp64).all():
                 print("Critical: Tp64 contains non-finite values.")
                 raise RealizationError("Matrix contains non-finite values - numerical breakdown")
             
-            # 対称性と固有値分解の最後の試行
+            # Last attempt: symmetry check and eigendecomposition
             try:
-                # 対称性チェック
+                # Symmetry check
                 is_symmetric = torch.allclose(Tp64, Tp64.T, atol=1e-8)
                 
                 if is_symmetric:
@@ -880,13 +792,13 @@ class Realization:
                     eigvals = eigvals_complex.real
                     eigvecs = eigvecs_complex.real
                 
-                # 固有値の数値安定性チェック
+                # Eigenvalue numerical stability check
                 if torch.any(eigvals <= 0) or not torch.isfinite(eigvals).all():
                     print(f"Unstable eigenvalues: min={eigvals.min().item()}, has_inf={not torch.isfinite(eigvals).all()}")
                     raise RealizationError("Eigenvalues are numerically unstable")
                 
-                # TODO: 方針変更時はここで eigvals のクリップ等を実装
-                # eigvals = torch.clamp(eigvals, min=eps_chol)  # 勾配途切れ注意
+                # TODO: implement eigval clipping here if policy changes
+                # eigvals = torch.clamp(eigvals, min=eps_chol)  # caution: breaks gradients
                 
                 inv_sqrt = eigvals.rsqrt()
                 D = torch.diag(inv_sqrt)
@@ -899,139 +811,22 @@ class Realization:
                 print(f"All numerical recovery attempts failed: {inner_e}")
                 raise RealizationError(f"Complete numerical breakdown in realization: {inner_e}")
         
-        # 4. ── 正規化 Hankel (float64) --------------------------
+        # 4. -- Normalized Hankel (float64) --------------------------
         T64 = W64.T @ (H32.to(torch.float64) @ W64)
         
-        # 5. ── ランダム化 rank‑r SVD  or SVD----------------------------
+        # 5. -- Rank-r SVD or full SVD --------------------------------
         if rank is None or rank >= dim_H:
             U64, S64, Vh64 = torch.linalg.svd(T64, full_matrices=False)
             U, S, Vh = U64.to(torch.float32), S64.to(torch.float32), Vh64.to(torch.float32)
             # B = Lambda^{1/2} Vᵀ W_pp
             self.B = torch.diag(S.pow(0.5)) @ Vh @ W64.to(torch.float32)
             self._L_vals = S
-        else:                                  # ランク r の切り出し
+        else:                                  # rank-r truncation
             U64, S64, Vh64 = torch.linalg.svd(T64, full_matrices=False)
             U, S, Vh = U64.to(torch.float32), S64.to(torch.float32), Vh64.to(torch.float32)
             U_r, S_r, Vh_r = U[:, :rank], S[:rank], Vh[:rank,:]
             self.B = torch.diag(S_r.pow(0.5)) @ Vh_r @ W64.to(torch.float32)
             self._L_vals = S_r
-            
-            
-        # r = min(rank, dim_H)
-        # G   = torch.randn(dim_H, r + q_over, dtype=torch.float64, device=device)
-        # Y2  = T64 @ G
-        # Q, _= torch.linalg.qr(Y2, mode='reduced')
-        # B   = Q.T @ T64
-        # Ub, S64, Vh64 = torch.linalg.svd(B, full_matrices=False)
-        # U64 = Q @ Ub
-        # U_r = U64[:, :r]
-        # S_r = S64[:r]
-        # V_r = Vh64[:r, :].T       
-        
-        
-
-        
-
-        # #for debug
-        # self.H =H_p
-        # # print(f'first Y: {Y.detach().cpu()[:4, :4]}')
-        
-        # # 2) 経験共分散
-        # # print(f'print N before computing S_pp: {N}') #debug
-        # S_pp = (H_p @ H_p.T) / (N-1)
-        # S_ff = (H_f @ H_f.T) / (N-1)
-        # S_fp = (H_f @ H_p.T) / (N-1)
-
-
-        # # 3) ジッター
-        # I_pp = torch.eye(S_pp.size(0), device=S_pp.device).to(S_pp.dtype)
-        # I_ff = torch.eye(S_ff.size(0), device=S_ff.device).to(S_pp.dtype)
-        # S_pp = S_pp + self.jitter * I_pp
-        # S_ff = S_ff + self.jitter * I_ff
-
-        # # 3.5)対称化
-        # S_pp = 0.5 * (S_pp + S_pp.T)
-        # S_ff = 0.5 * (S_ff + S_ff.T)
-
-        # #debug
-        # self._Spp_eigvals = eigvalsh(S_pp)
-        
-        # # 4) 条件数チェック
-        # def compute_eigvals(A):
-        #     try:
-        #         return eigvalsh(A)
-        #     except RuntimeError:
-        #         # eigh がダメなら SVD で特異値（≒固有値）取得
-        #         return svd(A, compute_uv=False)
-        '''
-        #一旦除去
-        # cond_pp = compute_eigvals(S_pp).max() / compute_eigvals(S_pp).min()
-        # cond_ff = compute_eigvals(S_ff).max() / compute_eigvals(S_ff).min()
-        # if cond_pp > self.cond_thresh or cond_ff > self.cond_thresh:
-        #     raise RealizationError("block Covariance : ill-conditioned")
-        # print(f'(real) debag: eigvalsh(S_pp):{eigvalsh(S_pp)}')
-        '''
-        '''
-        # # -- debug dump --
-        # # 1) そもそも finite か？
-        # if not torch.isfinite(S_pp).all():
-        #     print("S_pp contains non-finite entries!")
-        # # 2) 先頭要素が何か
-        # # print(f"S_pp[0,0]={S_pp[0,0].item()}, diag min={torch.min(torch.diag(S_pp)).item()}")
-        # # 3) 固有値最小値／最大値
-        # try:
-        #     eigs = torch.linalg.eigvalsh(S_pp)
-        #     # print(f"eigvals (min, max) = ({eigs[0].item()}, {eigs[-1].item()})")
-        # except Exception as e:
-        #     print("eigvalsh failed:", e)
-        # # 4) 完全な行列のサンプル
-        # # print("S_pp[0:3,0:3] =\n", S_pp[:3,:3].cpu().numpy())
-        # # -- end debug dump --
-        '''
-
-        # # 5) Cholesky
-        # L_pp = cholesky(S_pp)  # lower
-        # L_ff = cholesky(S_ff)
-        
-        # # L_pp = L_pp.float(); L_ff = L_ff.float()
-        # # I_pp = L_pp.float(); I_ff = L_ff.float()
-
-
-        # # 6) Calculate root-inverse
-        # W_pp = solve_triangular(L_pp, I_pp, upper=False)
-        # W_ff = solve_triangular(L_ff, I_ff, upper=False)
-
-        # W_pp = W_pp.float(); W_ff = W_ff.float(); S_fp = S_fp.float()
-
-        '''
-        # # 5.6) compute square-root inverse
-        # eigval_p, Eigvecs_p = torch.linalg.eigh(S_pp)
-        # inv_sqrt_p = eigval_p.rsqrt()
-        # W_pp = Eigvecs_p @ torch.diag(inv_sqrt_p) @ Eigvecs_p.T
-        # eigval_f, Eigvecs_f = torch.linalg.eigh(S_ff) 
-        # inv_sqrt_f = eigval_f.rsqrt()
-        # W_ff = Eigvecs_f @ torch.diag(inv_sqrt_f) @ Eigvecs_f.T
-        '''
-
-        # # 7) SVD
-        # T_mat = W_ff @ S_fp @ W_pp.T
-        # U, L_vals, Vt = svd(T_mat)
-
-        # # 8) 低ランク切り出し
-        # if 0 < self.rank < L_vals.numel():
-        #     U_r   = U[:, :self.rank]            # (ph, rank)
-        #     L_r   = L_vals[: self.rank]         # (rank,)
-        #     Vt_r  = Vt[: self.rank, :]          # (rank, ph)
-        #     L_vals = L_r
-        #     Vt     = Vt_r
-        #     # B = Lambda^{1/2} Vᵀ W_pp
-        #     self.B = torch.diag(L_r.pow(0.5)) @ Vt_r @ W_pp
-        # else:
-        #     # フルランク版
-        #     self.B = torch.diag(L_vals.pow(0.5)) @ Vt @ W_pp
-
-        # # 9) 特異値を保存
-        # self._L_vals = L_vals
 
     def filter(self, Y: torch.Tensor) -> torch.Tensor:
         h = self.h
@@ -1046,9 +841,9 @@ class Realization:
 
     def singular_value_reg(self, sv_weight : float) -> torch.Tensor:
         """
-        特異値正則化を返す。
-        reg_type=="sum"     -> sum(σ_i)
-        reg_type=="squared" -> sum((1 - σ_i)^2)
+        Return singular value regularization loss.
+        reg_type=="sum"     -> sum(sigma_i)
+        reg_type=="squared" -> sum((1 - sigma_i)^2)
         """
         if self.reg_type == "sum":
             _tr = self._L_vals.sum()
@@ -1066,15 +861,15 @@ class Realization:
         return sv_weight * _reg
 
     # =====================================
-    # 既存機能の改善と追加ユーティリティ
+    # Utility methods
     # =====================================
 
     def get_state_statistics(self) -> Dict[str, Any]:
         """
-        状態推定の統計情報取得
-        
+        Get state estimation statistics.
+
         Returns:
-            Dict: 統計情報
+            Dict: Statistics
         """
         if not hasattr(self, 'X_state_torch') or self.X_state_torch is None:
             return {"status": "not_fitted"}
@@ -1103,14 +898,14 @@ class Realization:
         method: str = "linear"
     ) -> torch.Tensor:
         """
-        状態の将来予測
-        
+        Predict future states.
+
         Args:
-            n_steps: 予測ステップ数
-            method: 予測手法 ("linear" | "last_value")
-            
+            n_steps: Number of prediction steps
+            method: Prediction method ("linear" | "last_value")
+
         Returns:
-            torch.Tensor: 予測状態 (n_steps, r)
+            torch.Tensor: Predicted states (n_steps, r)
         """
         if not hasattr(self, 'X_state_torch') or self.X_state_torch is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
@@ -1119,19 +914,19 @@ class Realization:
         T, r = X.shape
         
         if method == "linear":
-            # 線形外挿
+            # Linear extrapolation
             if T >= 2:
-                trend = X[-1] - X[-2]  # 最新のトレンド
+                trend = X[-1] - X[-2]  # latest trend
                 predictions = []
                 for step in range(1, n_steps + 1):
                     pred = X[-1] + step * trend
                     predictions.append(pred)
                 return torch.stack(predictions)
             else:
-                method = "last_value"  # フォールバック
-        
+                method = "last_value"  # fallback
+
         if method == "last_value":
-            # 最後の値を繰り返し
+            # Repeat last value
             last_state = X[-1]
             return last_state.unsqueeze(0).expand(n_steps, r).clone()
         
@@ -1144,14 +939,14 @@ class Realization:
         df_obs_layer
     ) -> Dict[str, Any]:
         """
-        Kalman更新との互換性検証
-        
+        Validate compatibility with Kalman update.
+
         Args:
-            df_state_layer: DF-A層
-            df_obs_layer: DF-B層
-            
+            df_state_layer: DF-A layer
+            df_obs_layer: DF-B layer
+
         Returns:
-            Dict: 検証結果
+            Dict: Validation results
         """
         validation = {
             "compatible": True,
@@ -1160,7 +955,7 @@ class Realization:
             "recommendations": []
         }
         
-        # 必須コンポーネントの存在確認
+        # Check required components
         requirements = [
             ("df_state_layer.V_A", hasattr(df_state_layer, 'V_A') and df_state_layer.V_A is not None),
             ("df_state_layer.U_A", hasattr(df_state_layer, 'U_A') and df_state_layer.U_A is not None),
@@ -1175,7 +970,7 @@ class Realization:
                 validation["compatible"] = False
                 validation["issues"].append(f"Missing requirement: {req_name}")
         
-        # 次元整合性チェック
+        # Dimension consistency check
         if validation["compatible"]:
             try:
                 r_realization = self.rank if self.rank is not None else self.X_state_torch.size(1)
@@ -1185,7 +980,7 @@ class Realization:
                     validation["issues"].append(f"State dimension mismatch: realization={r_realization}, df_state={r_df_state}")
                     validation["compatible"] = False
                     
-                # 特徴次元
+                # Feature dimensions
                 dA = df_state_layer.feature_dim
                 dB = df_obs_layer.obs_feature_dim
                 
@@ -1195,7 +990,7 @@ class Realization:
                     "feature_dim_B": dB
                 }
                 
-                # 推奨事項
+                # Recommendations
                 if dA < 2 * r_realization:
                     validation["recommendations"].append(f"Consider increasing feature_dim_A (current: {dA}, recommended: >={2*r_realization})")
                     
@@ -1206,7 +1001,7 @@ class Realization:
         return validation
 
     # =====================================
-    # 設定ファイル対応
+    # Configuration helpers
     # =====================================
 
     def create_kalman_config(
@@ -1214,13 +1009,13 @@ class Realization:
         **overrides
     ) -> Dict[str, Any]:
         """
-        Kalman Filter用設定作成
-        
+        Create Kalman Filter configuration.
+
         Args:
-            **overrides: 設定上書き
-            
+            **overrides: Configuration overrides
+
         Returns:
-            Dict: Kalman設定
+            Dict: Kalman configuration
         """
         default_config = {
             'noise_estimation': {
@@ -1240,7 +1035,7 @@ class Realization:
             'device': 'cpu'
         }
         
-        # 上書き適用
+        # Apply overrides
         def deep_update(base_dict, update_dict):
             for key, value in update_dict.items():
                 if isinstance(value, dict) and key in base_dict:
@@ -1256,27 +1051,22 @@ class Realization:
 
 def build_realization(cfg):
     """
-    修正版Factory: エンコーダーの有無によって適切な実装を選択
-
-    設定エラーハンドリング対応:
-    - エンコーダーありの場合: encoder_output_dim必須
-    - エンコーダーなしの場合: 従来のRealization
+    Factory: select appropriate implementation based on encoder availability.
 
     Args:
-        cfg: 設定オブジェクト
+        cfg: Configuration object
 
     Returns:
-        Realization または StochasticRealizationWithEncoder
+        Realization or StochasticRealizationWithEncoder
 
     Raises:
-        ValueError: encoder_output_dim未指定など設定エラー
+        ValueError: Configuration error (e.g., missing encoder_output_dim)
     """
-    # エンコーダーの有無で分岐
+    # Branch based on encoder availability
     use_encoder = getattr(cfg, 'use_encoder', False) and hasattr(cfg, 'encoder')
 
     if use_encoder:
-        # 新型: エンコーダー対応版
-        # encoder_output_dimの明示指定を要求（設定エラーハンドリング）
+        # Encoder-aware version: requires explicit encoder_output_dim
         if not hasattr(cfg, 'encoder_output_dim'):
             raise ValueError(
                 "encoder_output_dim must be specified when using encoder. "
@@ -1292,7 +1082,7 @@ def build_realization(cfg):
             device=getattr(cfg, 'device', 'cpu')
         )
     else:
-        # 従来型: Realizationクラス
+        # Legacy Realization class
         r = getattr(cfg, "rank", None)
         if r is not None and r < 0:
             raise ValueError(f"Invalid rank: {r} (must be >= 0 or None)")

@@ -1,15 +1,11 @@
 """
-モード分解・スペクトル分析モジュール
+Mode decomposition and spectrum analysis module.
 
-Koopman作用素理論に基づくDFIVスペクトル解析を提供。
-学習済みV_A行列から固有値・モード分解を実行し、
-連続時間スペクトル特性を抽出する。
-
-実装機能:
-- 基本スペクトル分析：固有値・連続時間変換
-- 真値との MSE 評価（利用可能時）
-- 学習済みモデルからのV_A抽出
-- 結果保存（JSON, NPZ形式）
+Provides Koopman operator-based spectral analysis for DFIV:
+- Eigenvalue decomposition and continuous-time conversion from learned V_A
+- MSE evaluation against ground truth eigenvalues (when available)
+- V_A extraction from trained models
+- Result saving (JSON, NPZ formats)
 """
 
 import torch
@@ -22,60 +18,53 @@ from pathlib import Path
 
 class SpectrumAnalyzer:
     """
-    Koopmanスペクトル分析クラス
+    Koopman spectrum analyzer.
 
-    V_A行列からの固有値分解と連続時間スペクトル特性の抽出を実行。
-    離散時間固有値から連続時間固有値への変換も含む。
+    Performs eigenvalue decomposition from V_A and extracts continuous-time
+    spectral characteristics, including discrete-to-continuous eigenvalue conversion.
     """
 
     def __init__(self, sampling_interval: float):
         """
         Args:
-            sampling_interval: サンプリング間隔 Δt (連続時間変換用)
+            sampling_interval: Sampling interval dt for continuous-time conversion.
         """
         self.dt = sampling_interval
 
     def analyze_spectrum(self, V_A: torch.Tensor) -> Dict[str, Any]:
         """
-        V_A からのスペクトル分析
+        Spectrum analysis from V_A.
 
         Args:
-            V_A: 転送作用素行列 (d_A, d_A)
+            V_A: Transfer operator matrix (d_A, d_A)
 
         Returns:
-            Dict: スペクトル分析結果
-                - eigenvalues_discrete: λ ∈ C^{d_A} (離散時間固有値)
-                - eigenvalues_continuous: μ ∈ C^{d_A} (連続時間固有値)
-                - growth_rates: Re(μ) (成長率/減衰率)
-                - frequencies_hz: Im(μ)/(2π) (振動周波数 Hz)
-                - dominant_indices: 主要モードインデックス
-                - stable_indices: 安定モードインデックス
-                - eigenvalues_magnitude: |λ| (離散時間振幅)
-                - eigenvalues_phase: arg(λ) (離散時間位相)
+            Dict with spectrum analysis results:
+                - eigenvalues_discrete: lambda in C^{d_A} (discrete-time eigenvalues)
+                - eigenvalues_continuous: mu in C^{d_A} (continuous-time eigenvalues)
+                - growth_rates: Re(mu) (growth/decay rates)
+                - frequencies_hz: Im(mu)/(2*pi) (oscillation frequencies in Hz)
+                - dominant_indices: Dominant mode indices
+                - stable_indices: Stable mode indices
+                - eigenvalues_magnitude: |lambda| (discrete-time magnitudes)
+                - eigenvalues_phase: arg(lambda) (discrete-time phases)
         """
-        # デバイス・形状情報をログ出力（デバッグ用）
-        print(f"📋 V_A分析開始: shape={V_A.shape}, device={V_A.device}, dtype={V_A.dtype}")
-
         with torch.no_grad():
-            # 固有値分解
             eigenvalues_discrete, eigenvectors = torch.linalg.eig(V_A)
 
-            # 連続時間変換: μ = (1/Δt) * log(λ)
+            # Continuous-time conversion: mu = (1/dt) * log(lambda)
             eigenvalues_continuous = self._discrete_to_continuous_eigenvalues(
                 eigenvalues_discrete
             )
 
-            # スペクトル特性抽出
             growth_rates = eigenvalues_continuous.real
             frequencies_rad = eigenvalues_continuous.imag
             frequencies_hz = frequencies_rad / (2 * np.pi)
 
-            # 離散時間特性
             eigenvalues_magnitude = torch.abs(eigenvalues_discrete)
             eigenvalues_phase = torch.angle(eigenvalues_discrete)
 
-            # モード分類
-            dominant_threshold = 0.1  # 設定可能にしたい場合は__init__に移動
+            dominant_threshold = 0.1
             dominant_indices = self._find_dominant_modes(
                 eigenvalues_magnitude, threshold=dominant_threshold
             )
@@ -103,17 +92,15 @@ class SpectrumAnalyzer:
         eigenvalues_discrete: torch.Tensor
     ) -> torch.Tensor:
         """
-        離散時間固有値から連続時間固有値への変換
-
-        μ = (1/Δt) * log(λ)
+        Convert discrete-time eigenvalues to continuous-time: mu = (1/dt) * log(lambda).
 
         Args:
-            eigenvalues_discrete: 離散時間固有値 λ ∈ C^{d_A}
+            eigenvalues_discrete: Discrete-time eigenvalues lambda in C^{d_A}
 
         Returns:
-            torch.Tensor: 連続時間固有値 μ ∈ C^{d_A}
+            Continuous-time eigenvalues mu in C^{d_A}.
         """
-        # log計算（ゼロ近似の場合の数値安定性考慮）
+        # Numerical stability for near-zero eigenvalues
         eigenvalues_log = torch.log(eigenvalues_discrete + 1e-12)
         eigenvalues_continuous = eigenvalues_log / self.dt
 
@@ -125,14 +112,14 @@ class SpectrumAnalyzer:
         threshold: float = 0.1
     ) -> List[int]:
         """
-        主要モードの特定
+        Identify dominant modes.
 
         Args:
-            eigenvalues_magnitude: 固有値の絶対値 |λ|
-            threshold: 閾値（スペクトル半径に対する比率）
+            eigenvalues_magnitude: Eigenvalue magnitudes |lambda|
+            threshold: Threshold as ratio of spectral radius
 
         Returns:
-            List[int]: 主要モードのインデックス
+            List of dominant mode indices.
         """
         spectral_radius = torch.max(eigenvalues_magnitude)
         dominant_mask = eigenvalues_magnitude > threshold * spectral_radius
@@ -140,13 +127,13 @@ class SpectrumAnalyzer:
 
     def _find_stable_modes(self, growth_rates: torch.Tensor) -> List[int]:
         """
-        安定モードの特定
+        Identify stable modes (Re(mu) < 0).
 
         Args:
-            growth_rates: 成長率 Re(μ)
+            growth_rates: Growth rates Re(mu)
 
         Returns:
-            List[int]: 安定モード（Re(μ) < 0）のインデックス
+            List of stable mode indices.
         """
         stable_mask = growth_rates < 0
         return stable_mask.nonzero(as_tuple=True)[0].tolist()
@@ -157,27 +144,23 @@ class SpectrumAnalyzer:
         true_eigenvalues: torch.Tensor
     ) -> Dict[str, float]:
         """
-        真値との比較評価（利用可能時）
+        Evaluate against ground truth eigenvalues.
 
         Args:
-            predicted_eigenvalues: 推定固有値 μ_pred ∈ C^{d_A}
-            true_eigenvalues: 真の固有値 μ_true ∈ C^{k}
+            predicted_eigenvalues: Predicted eigenvalues mu_pred in C^{d_A}
+            true_eigenvalues: True eigenvalues mu_true in C^{k}
 
         Returns:
-            Dict: 評価指標
-                - mse_real: 実部のMSE
-                - mse_imag: 虚部のMSE
-                - mse_magnitude: 絶対値のMSE
-                - n_matched: マッチした固有値数
+            Dict with mse_real, mse_imag, mse_magnitude, n_matched.
         """
         with torch.no_grad():
-            # 最近接マッチング
+            # Nearest-neighbor matching
             matched_pred, matched_true = self._match_eigenvalues(
                 predicted_eigenvalues, true_eigenvalues
             )
 
             if len(matched_pred) == 0:
-                warnings.warn("固有値マッチングに失敗しました")
+                warnings.warn("Eigenvalue matching failed")
                 return {
                     'mse_real': float('inf'),
                     'mse_imag': float('inf'),
@@ -185,7 +168,7 @@ class SpectrumAnalyzer:
                     'n_matched': 0
                 }
 
-            # MSE計算
+            # MSE computation
             mse_real = torch.mean((matched_pred.real - matched_true.real)**2).item()
             mse_imag = torch.mean((matched_pred.imag - matched_true.imag)**2).item()
             mse_magnitude = torch.mean(
@@ -205,25 +188,24 @@ class SpectrumAnalyzer:
         true_eigenvalues: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        固有値の最近接マッチング
+        Nearest-neighbor eigenvalue matching.
 
         Args:
-            pred_eigenvalues: 推定固有値
-            true_eigenvalues: 真の固有値
+            pred_eigenvalues: Predicted eigenvalues
+            true_eigenvalues: True eigenvalues
 
         Returns:
-            Tuple: (マッチした推定固有値, マッチした真の固有値)
+            Tuple of (matched predicted eigenvalues, matched true eigenvalues).
         """
         matched_pred = []
         matched_true = []
         used_true_indices = set()
 
         for pred_val in pred_eigenvalues:
-            # 最近接の真値を探索
             distances = torch.abs(true_eigenvalues - pred_val)
             best_idx = torch.argmin(distances).item()
 
-            # 重複使用を避ける
+            # Avoid duplicate matching
             if best_idx not in used_true_indices:
                 matched_pred.append(pred_val)
                 matched_true.append(true_eigenvalues[best_idx])
@@ -237,122 +219,104 @@ class SpectrumAnalyzer:
 
 class TrainedModelSpectrumAnalysis:
     """
-    学習済みモデルからのスペクトル解析クラス
+    Spectrum analysis from trained models.
 
-    学習済みDFIVモデルからV_A行列を抽出し、
-    スペクトル分析を実行する。
+    Extracts V_A matrix from trained DFIV models and performs spectrum analysis.
     """
 
     def __init__(self, sampling_interval: float):
         """
         Args:
-            sampling_interval: サンプリング間隔
+            sampling_interval: Sampling interval dt.
         """
         self.sampling_interval = sampling_interval
         self.analyzer = SpectrumAnalyzer(sampling_interval)
 
     def extract_transfer_matrix_from_model(self, model: Any) -> torch.Tensor:
         """
-        学習済みモデルからV_A抽出
+        Extract V_A from a trained model.
 
         Args:
-            model: 学習済みDFIVモデル（DFStateLayerを含む）
+            model: Trained DFIV model (containing DFStateLayer)
 
         Returns:
-            torch.Tensor: V_A行列 (d_A, d_A)
+            V_A matrix (d_A, d_A).
         """
         try:
-            # モデル構造に応じてV_A抽出
             if hasattr(model, 'ssm') and hasattr(model.ssm, 'df_state_layer'):
-                # 一般的なモデル構造
                 V_A = model.ssm.df_state_layer.get_transfer_operator()
             elif hasattr(model, 'df_state_layer'):
-                # 直接DFStateLayer
                 V_A = model.df_state_layer.get_transfer_operator()
             elif hasattr(model, 'get_transfer_operator'):
-                # DFStateLayerそのもの
                 V_A = model.get_transfer_operator()
             elif isinstance(model, dict):
-                # checkpointファイルから直接抽出
-                # 複数のキー構造パターンに対応
+                # Extract from checkpoint dict (multiple key patterns supported)
                 df_state_dict = None
 
-                # パターン1: checkpoint['model_state_dict']['df_state']（古い形式の可能性）
                 if 'model_state_dict' in model and 'df_state' in model['model_state_dict']:
                     df_state_dict = model['model_state_dict']['df_state']
-                    print(f"📂 V_A抽出: checkpoint['model_state_dict']['df_state']から取得")
-                # パターン2: checkpoint['df_state']（現在の標準形式）
                 elif 'df_state' in model:
                     df_state_dict = model['df_state']
-                    print(f"📂 V_A抽出: checkpoint['df_state']から取得")
                 else:
                     raise ValueError(
-                        f"checkpoint構造が不正です。df_state辞書が見つかりません。\n"
-                        f"期待されるキーパターン:\n"
+                        f"Invalid checkpoint structure: df_state dict not found.\n"
+                        f"Expected key patterns:\n"
                         f"  - checkpoint['model_state_dict']['df_state']\n"
                         f"  - checkpoint['df_state']\n"
-                        f"実際のcheckpointのトップレベルキー: {list(model.keys())}"
+                        f"Actual top-level keys: {list(model.keys())}"
                     )
 
-                # V_A行列の抽出
                 if 'V_A' in df_state_dict:
                     V_A = df_state_dict['V_A']
-                    print(f"✅ V_A行列取得成功: shape={V_A.shape}")
                 else:
                     raise ValueError(
-                        f"df_state辞書にV_A行列が見つかりません。\n"
-                        f"df_stateのキー: {list(df_state_dict.keys())}\n"
-                        f"ヒント: df_state.get_inference_state_dict()でV_Aが保存されているか確認してください"
+                        f"V_A matrix not found in df_state dict.\n"
+                        f"df_state keys: {list(df_state_dict.keys())}"
                     )
             else:
-                raise ValueError("モデルからV_A行列を抽出できませんでした。モデル構造を確認してください。")
+                raise ValueError("Cannot extract V_A from model. Check model structure.")
 
             return V_A
 
         except Exception as e:
-            raise RuntimeError(f"V_A抽出エラー: {e}")
+            raise RuntimeError(f"V_A extraction error: {e}")
 
     def extract_transfer_matrix_from_path(self, model_path: str) -> torch.Tensor:
         """
-        保存済みモデルファイルからV_A抽出
+        Extract V_A from a saved model file.
 
         Args:
-            model_path: モデルファイルのパス
+            model_path: Path to the model file
 
         Returns:
-            torch.Tensor: V_A行列 (d_A, d_A)
+            V_A matrix (d_A, d_A).
         """
         try:
-            # モデル読み込み
             checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
-            # V_A直接保存の場合
             if 'V_A' in checkpoint:
                 return checkpoint['V_A']
 
-            # state_dict内にV_Aがある場合
             if 'state_dict' in checkpoint and 'V_A' in checkpoint['state_dict']:
                 return checkpoint['state_dict']['V_A']
 
-            # モデル全体が保存されている場合
             if 'model' in checkpoint:
                 return self.extract_transfer_matrix_from_model(checkpoint['model'])
 
-            # checkpointがmodel自体の場合
             return self.extract_transfer_matrix_from_model(checkpoint)
 
         except Exception as e:
-            raise RuntimeError(f"モデルファイル読み込みエラー: {e}")
+            raise RuntimeError(f"Model file loading error: {e}")
 
     def perform_spectrum_analysis_from_model(self, model: Any) -> Dict[str, Any]:
         """
-        学習済みモデルからスペクトル分析実行
+        Run spectrum analysis from a trained model.
 
         Args:
-            model: 学習済みモデル
+            model: Trained model
 
         Returns:
-            Dict: スペクトル分析結果 + V_A行列
+            Dict with spectrum analysis results and V_A matrix.
         """
         V_A = self.extract_transfer_matrix_from_model(model)
         spectrum_analysis = self.analyzer.analyze_spectrum(V_A)
@@ -366,13 +330,13 @@ class TrainedModelSpectrumAnalysis:
 
     def perform_spectrum_analysis_from_path(self, model_path: str) -> Dict[str, Any]:
         """
-        保存済みモデルファイルからスペクトル分析実行
+        Run spectrum analysis from a saved model file.
 
         Args:
-            model_path: モデルファイルパス
+            model_path: Model file path
 
         Returns:
-            Dict: スペクトル分析結果 + V_A行列
+            Dict with spectrum analysis results and V_A matrix.
         """
         V_A = self.extract_transfer_matrix_from_path(model_path)
         spectrum_analysis = self.analyzer.analyze_spectrum(V_A)
@@ -388,9 +352,9 @@ class TrainedModelSpectrumAnalysis:
 
 class SpectrumResultsSaver:
     """
-    スペクトル分析結果の保存クラス
+    Spectrum analysis result saver.
 
-    JSON（設定・メタデータ）とNPZ（数値データ）形式での保存をサポート。
+    Supports saving in JSON (config/metadata) and NPZ (numerical data) formats.
     """
 
     @staticmethod
@@ -400,12 +364,12 @@ class SpectrumResultsSaver:
         save_format: str = 'both'  # 'json', 'npz', 'both'
     ) -> None:
         """
-        スペクトル分析結果の保存
+        Save spectrum analysis results.
 
         Args:
-            results: 分析結果辞書
-            save_path: 保存パス（拡張子なし）
-            save_format: 保存形式
+            results: Analysis result dict
+            save_path: Save path (without extension)
+            save_format: Save format ('json', 'npz', or 'both')
         """
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,20 +382,17 @@ class SpectrumResultsSaver:
 
     @staticmethod
     def _save_json(results: Dict[str, Any], json_path: Path) -> None:
-        """JSON形式で保存（設定・メタデータ中心）"""
-        # JSONシリアライズ可能な形式に変換
+        """Save in JSON format (config/metadata)."""
         json_data = {}
 
         for key, value in results.items():
             if key == 'spectrum':
-                # スペクトル分析結果をJSON化
                 spectrum = value
                 json_spectrum = {}
 
                 for spectrum_key, spectrum_value in spectrum.items():
                     if isinstance(spectrum_value, torch.Tensor):
                         if torch.is_complex(spectrum_value):
-                            # 複素数を実部・虚部に分割
                             json_spectrum[f'{spectrum_key}_real'] = spectrum_value.real.tolist()
                             json_spectrum[f'{spectrum_key}_imag'] = spectrum_value.imag.tolist()
                         else:
@@ -444,7 +405,6 @@ class SpectrumResultsSaver:
                 json_data['spectrum'] = json_spectrum
 
             elif isinstance(value, torch.Tensor):
-                # その他のテンソル
                 if torch.is_complex(value):
                     json_data[f'{key}_real'] = value.real.tolist()
                     json_data[f'{key}_imag'] = value.imag.tolist()
@@ -461,7 +421,7 @@ class SpectrumResultsSaver:
 
     @staticmethod
     def _save_npz(results: Dict[str, Any], npz_path: Path) -> None:
-        """NPZ形式で保存（数値データ中心）"""
+        """Save in NPZ format (numerical data)."""
         npz_data = {}
 
         def _flatten_dict(d: Dict, prefix: str = '') -> None:
@@ -473,23 +433,19 @@ class SpectrumResultsSaver:
                 elif isinstance(value, torch.Tensor):
                     try:
                         if torch.is_complex(value):
-                            # CUDA tensorの場合はCPUに移動してからnumpy変換
                             tensor_cpu = value.cpu() if value.is_cuda else value
                             npz_data[f'{full_key}_real'] = tensor_cpu.real.numpy()
                             npz_data[f'{full_key}_imag'] = tensor_cpu.imag.numpy()
                         else:
-                            # CUDA tensorの場合はCPUに移動してからnumpy変換
                             tensor_cpu = value.cpu() if value.is_cuda else value
                             npz_data[full_key] = tensor_cpu.numpy()
                     except Exception as e:
-                        print(f"Tensor変換エラー (key: {full_key}, shape: {value.shape}, device: {value.device}, dtype: {value.dtype}): {e}")
-                        # エラー時はテンソル情報のみ保存
+                        print(f"Tensor conversion error (key: {full_key}, shape: {value.shape}): {e}")
                         npz_data[f'{full_key}_error'] = f"Conversion failed: {str(e)}"
                 elif isinstance(value, (list, tuple)):
                     try:
                         npz_data[full_key] = np.array(value)
                     except:
-                        # 配列化できない場合はスキップ
                         pass
                 elif isinstance(value, (int, float)):
                     npz_data[full_key] = np.array(value)
@@ -500,14 +456,14 @@ class SpectrumResultsSaver:
     @staticmethod
     def load_results(load_path: str, load_format: str = 'json') -> Dict[str, Any]:
         """
-        保存済み結果の読み込み
+        Load saved results.
 
         Args:
-            load_path: 読み込みパス
-            load_format: 読み込み形式 ('json' or 'npz')
+            load_path: File path to load
+            load_format: Format ('json' or 'npz')
 
         Returns:
-            Dict: 読み込み結果
+            Loaded result dict.
         """
         load_path = Path(load_path)
 
@@ -516,17 +472,17 @@ class SpectrumResultsSaver:
         elif load_format == 'npz':
             return SpectrumResultsSaver._load_npz(load_path)
         else:
-            raise ValueError(f"未対応の読み込み形式: {load_format}")
+            raise ValueError(f"Unsupported load format: {load_format}")
 
     @staticmethod
     def _load_json(json_path: Path) -> Dict[str, Any]:
-        """JSON読み込み"""
+        """Load JSON file."""
         with open(json_path, 'r', encoding='utf-8') as f:
             return json.load(f)
 
     @staticmethod
     def _load_npz(npz_path: Path) -> Dict[str, Any]:
-        """NPZ読み込み"""
+        """Load NPZ file."""
         data = np.load(npz_path)
         return dict(data)
 
@@ -536,40 +492,24 @@ def compute_eigenvalue_mse(
     true_eigenvalues: torch.Tensor
 ) -> Dict[str, float]:
     """
-    スペクトル固有値の MSE 評価（独立関数版）
+    Evaluate eigenvalue MSE (standalone function).
 
     Args:
-        predicted_eigenvalues: 推定固有値 μ_pred ∈ C^{d_A}
-        true_eigenvalues: 真の固有値 μ_true ∈ C^{k}
+        predicted_eigenvalues: Predicted eigenvalues mu_pred in C^{d_A}
+        true_eigenvalues: True eigenvalues mu_true in C^{k}
 
     Returns:
-        Dict: MSE評価結果
+        Dict with MSE evaluation results.
     """
-    analyzer = SpectrumAnalyzer(sampling_interval=1.0)  # サンプリング間隔は評価には不要
+    analyzer = SpectrumAnalyzer(sampling_interval=1.0)
     return analyzer.evaluate_against_truth(predicted_eigenvalues, true_eigenvalues)
 
 
 def create_spectrum_analyzer(sampling_interval: float) -> SpectrumAnalyzer:
-    """
-    スペクトル分析器の作成
-
-    Args:
-        sampling_interval: サンプリング間隔
-
-    Returns:
-        SpectrumAnalyzer: 初期化済み分析器
-    """
+    """Create a spectrum analyzer."""
     return SpectrumAnalyzer(sampling_interval)
 
 
 def create_model_spectrum_analyzer(sampling_interval: float) -> TrainedModelSpectrumAnalysis:
-    """
-    モデルスペクトル分析器の作成
-
-    Args:
-        sampling_interval: サンプリング間隔
-
-    Returns:
-        TrainedModelSpectrumAnalysis: 初期化済み分析器
-    """
+    """Create a model spectrum analyzer."""
     return TrainedModelSpectrumAnalysis(sampling_interval)

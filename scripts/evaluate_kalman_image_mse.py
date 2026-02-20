@@ -29,7 +29,7 @@ from typing import Dict, Any, Tuple, Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.architectures.rkn import rknEncoder, rknDecoder
+from src.models.architectures.cnn_image import cnn_imageEncoder, cnn_imageDecoder
 from src.ssm.df_state_layer import DFStateLayer, StateFeatureNet
 from src.ssm.df_observation_layer import DFObservationLayer, ObservationFeatureNet
 from src.ssm.realization import StochasticRealizationWithEncoder
@@ -66,7 +66,7 @@ def load_checkpoint(model_path: str) -> Tuple[Dict, Dict]:
 
 def build_encoder(ckpt: Dict, config: Dict, device: torch.device) -> nn.Module:
     enc_cfg = config.get('model', {}).get('encoder', {})
-    encoder = rknEncoder(
+    encoder = cnn_imageEncoder(
         input_resolution=tuple(enc_cfg.get('input_resolution', [48, 48, 1])),
         feature_dim=enc_cfg.get('feature_dim', 100),
         hidden=enc_cfg.get('hidden', 200),
@@ -87,7 +87,7 @@ def build_encoder(ckpt: Dict, config: Dict, device: torch.device) -> nn.Module:
 
 def build_decoder(ckpt: Dict, config: Dict, device: torch.device) -> nn.Module:
     dec_cfg = config.get('model', {}).get('decoder', {})
-    decoder = rknDecoder(
+    decoder = cnn_imageDecoder(
         input_resolution=tuple(dec_cfg.get('input_resolution', [48, 48, 1])),
         feature_dim=dec_cfg.get('feature_dim', 100),
         grid=tuple(dec_cfg.get('grid', [3, 3, 16])),

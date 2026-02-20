@@ -1,46 +1,46 @@
 # ====================================================================
-# 画像再構成実験用設定 (論文Table 6準拠)
-# 用途: クアッドコプター画像のone-step-ahead予測再構成
-# データ: data/rkn_quad/quad1_n.npz (paper_data_protocol: train_obs→学習, test_obs→評価)
-# アーキテクチャ: rknEncoder (stride=2) + rknDecoder (ConvTranspose2d)
+# Image Reconstruction Experiment Config (per Table 6 in the paper)
+# Task: One-step-ahead prediction reconstruction of quadcopter images
+# Data: data/rkn_quad/quad1_n.npz (paper_data_protocol: train_obs->train, test_obs->eval)
+# Architecture: cnn_imageEncoder (stride=2) + cnn_imageDecoder (ConvTranspose2d)
 # ====================================================================
 
 experiment:
   mode: "reconstruction"
 
 data:
-  train_ratio: 0.7            # paper_data_protocol=true時は無視される
+  train_ratio: 0.7            # ignored when paper_data_protocol=true
   val_ratio: 0.2
   test_ratio: 0.1
-  normalization: "unit_scale"  # [0,255] → [0,1]
-  batch_size: 150              # 論文Table 6: 150
+  normalization: "unit_scale"  # [0,255] -> [0,1]
+  batch_size: 150              # Table 6: 150
   image_shape: [48, 48, 1]
-  paper_data_protocol: true    # train_obs全体→学習, test_obs→評価 (論文準拠)
+  paper_data_protocol: true    # train_obs->train, test_obs->eval (paper protocol)
 
 model:
   encoder:
-    type: "rkn"
+    type: "cnn_image"
     input_resolution: [48, 48, 1]
-    feature_dim: 100              # 論文Table 6: m=100
+    feature_dim: 100              # Table 6: m=100
     hidden: 200
-    conv_channels: [12, 12]       # 論文Table 6: [12, 12]
-    conv_strides: [2, 2]          # 論文Table 6: stride=2
+    conv_channels: [12, 12]       # Table 6: [12, 12]
+    conv_strides: [2, 2]          # Table 6: stride=2
     activation: "relu"
     normalize_input: false
     normalize_output: false
     track_running_stats: true
 
   decoder:
-    type: "rkn"
+    type: "cnn_image"
     input_resolution: [48, 48, 1]
-    feature_dim: 100              # 論文Table 6: m=100
-    grid: [3, 3, 16]              # 論文Table 6: FC→144→Reshape(3,3,16)
-    upsample_mode: "conv_transpose"  # 論文Table 6: ConvTranspose2d
-    conv_channels: [16, 12, 1]    # 論文Table 6
+    feature_dim: 100              # Table 6: m=100
+    grid: [3, 3, 16]              # Table 6: FC->144->Reshape(3,3,16)
+    upsample_mode: "conv_transpose"  # Table 6: ConvTranspose2d
+    conv_channels: [16, 12, 1]    # Table 6
     activation: "relu"
     output_activation: "sigmoid"
 
-  # ターゲット予測用 (再構成モードでは未使用だが互換性のため保持)
+  # Target prediction head (unused in reconstruction mode, kept for compatibility)
   state_decoder:
     feature_dim: 100
     state_dim: 8
@@ -48,32 +48,32 @@ model:
     activation: "relu"
 
 training:
-  epochs: 25                  # 5 warmup + 20 active (論文Table 6準拠)
-  T1_iterations: 1            # v2実験で効果なし確認済み。Phase 1 DF品質はPhase 2 rec_lossに寄与せず
+  epochs: 25                  # 5 warmup + 20 active (per Table 6)
+  T1_iterations: 1            # No effect on Phase 2 rec_loss (verified in v2 experiment)
   T2_iterations: 1
-  phase1_warmup_epochs: 5     # 論文Table 6: Stage-1 = 5 epochs
+  phase1_warmup_epochs: 5     # Table 6: Stage-1 = 5 epochs
 
   experiment_mode: "reconstruction"
   target_loss_weight: 0.0
   reconstruction_loss_weight: 1.0
 
-  lr_phi: 1e-3                # v4: 1e-4 → 1e-3 (コードデフォルト値に復元、Phase 1品質向上)
-  lr_psi: 1e-3                # v4: 1e-4 → 1e-3 (コードデフォルト値に復元、Phase 1品質向上)
+  lr_phi: 1e-3                # v4: 1e-4 -> 1e-3 (restored to code default, improves Phase 1)
+  lr_psi: 1e-3                # v4: 1e-4 -> 1e-3 (restored to code default, improves Phase 1)
   weight_decay: 1e-6
 
-  lr_encoder: 1e-3            # v5: 1e-5 → 1e-3 (Adamデフォルト値。Phase 2 encoder勾配=0.005で更新量が極小だった)
-  lr_decoder: 1e-3            # v5: 1e-4 → 1e-3 (Adamデフォルト値。rec_loss改善がdecoder支配のため)
-  lambda_cca: 0.0001          # v4: 0.001 → 0.0001 (v1値に復元、rec_loss/CCA tradeoff是正)
+  lr_encoder: 1e-3            # v5: 1e-5 -> 1e-3 (Adam default; Phase 2 encoder grad=0.005 was too small)
+  lr_decoder: 1e-3            # v5: 1e-4 -> 1e-3 (Adam default; rec_loss was decoder-dominated)
+  lambda_cca: 0.0001          # v4: 0.001 -> 0.0001 (restored to v1 value, rec_loss/CCA tradeoff)
   update_strategy: "encoder_decoder_only"
 
 ssm:
   realization:
-    past_horizon: 30            # 論文Table 6: ℓ=30
-    rank: 20                    # 論文Table 6: r=20
-    encoder_output_dim: 100     # 論文Table 6: m=100
+    past_horizon: 30            # Table 6: l=30
+    rank: 20                    # Table 6: r=20
+    encoder_output_dim: 100     # Table 6: m=100
     ridge_param: 1e-3
     jitter: 1e-6
-    m: 100                      # 論文Table 6: m=100
+    m: 100                      # Table 6: m=100
 
     feature_mapping:
       type: "mlp"
@@ -81,8 +81,8 @@ ssm:
       activation: "relu"
 
   df_state:
-    feature_dim: 50             # 論文Table 6: dA=50
-    lambda_A: 1e-2              # 論文Table 6: λA=1e-2
+    feature_dim: 50             # Table 6: dA=50
+    lambda_A: 1e-2              # Table 6: lambda_A=1e-2
     lambda_B: 1e-3
     feature_net:
       hidden_sizes: [128, 64]
@@ -93,8 +93,8 @@ ssm:
       min_block_size: 100
 
   df_observation:
-    obs_feature_dim: 50         # 論文Table 6: dB=50
-    multivariate_feature_dim: 100  # 論文Table 6: m=100
+    obs_feature_dim: 50         # Table 6: dB=50
+    multivariate_feature_dim: 100  # Table 6: m=100
     lambda_B: 1e-3
     lambda_dB: 1e-3
     obs_net:
