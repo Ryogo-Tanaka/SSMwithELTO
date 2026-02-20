@@ -789,7 +789,7 @@ def load_experimental_data_with_architecture(
             else:
                 return dataset
 
-    elif encoder_type in ["time_invariant", "tcn"]:
+    elif encoder_type == "time_invariant":
         dataset_params = {k: v for k, v in data_config.items()
                          if k not in ['batch_size', 'num_workers', 'pin_memory',
                                      'image_shape', 'target_shape',

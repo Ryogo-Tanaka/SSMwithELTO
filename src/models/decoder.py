@@ -53,9 +53,6 @@ def build_decoder(cfg, experiment_mode=None):
 
         return cls(**init_args)
 
-    if cfg_type == "tcn" and "tcn" not in _DECODERS:
-        raise ValueError("tcnDecoder not found. Verify tcn.py is importable.")
-
     try:
         cls = _DECODERS[cfg_type]
     except KeyError:
@@ -66,9 +63,5 @@ def build_decoder(cfg, experiment_mode=None):
         init_args = {k: v for k, v in cfg.items() if k != "type"}
     else:
         init_args = {k: getattr(cfg, k) for k in vars(cfg) if k != "type"}
-
-    if cfg_type == "tcn":
-        if "output_dim" not in init_args:
-            raise ValueError("tcnDecoder requires output_dim")
 
     return cls(**init_args)

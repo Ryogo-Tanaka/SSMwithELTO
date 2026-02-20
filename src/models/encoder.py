@@ -15,16 +15,13 @@ for module_info in pkgutil.iter_modules([str(pkg_path)]):
         _ENCODERS[name] = getattr(module, cls_name)
 
 def build_encoder(cfg):
-    """Factory: build an encoder from cfg.type (e.g. "tcn", "cnn_image")."""
+    """Factory: build an encoder from cfg.type (e.g. "cnn_image", "time_invariant")."""
     if isinstance(cfg, dict):
         cfg_type = cfg.get('type')
     else:
         cfg_type = getattr(cfg, 'type', None)
     if cfg_type is None:
         raise ValueError("encoder config must include 'type' key or attribute")
-
-    if cfg_type == "tcn" and "tcn" not in _ENCODERS:
-        raise ValueError("tcnEncoder not found. Verify tcn.py is importable.")
 
     try:
         cls = _ENCODERS[cfg_type]
@@ -36,8 +33,5 @@ def build_encoder(cfg):
         init_args = {k: v for k, v in cfg.items() if k != "type"}
     else:
         init_args = {k: getattr(cfg, k) for k in vars(cfg) if k != "type"}
-
-    if cfg_type == "tcn" and "output_dim" not in init_args:
-        init_args["output_dim"] = 1
 
     return cls(**init_args)

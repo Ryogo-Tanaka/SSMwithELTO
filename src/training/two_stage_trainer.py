@@ -510,13 +510,6 @@ class TwoStageTrainer:
             if not hidden_dims:
                 hidden_dims = [64, 32]
 
-        elif any(key.startswith('tcn.') for key in encoder_dict.keys()):
-            architecture = 'mlp'
-
-            if 'in_proj.weight' in encoder_dict:
-                input_dim = encoder_dict['in_proj.weight'].shape[1]
-                output_dim = encoder_dict['in_proj.weight'].shape[0]
-
         elif any(key.startswith('conv') for key in encoder_dict.keys()):
             architecture = 'resnet'
             first_conv_keys = [k for k in encoder_dict.keys() if 'conv' in k and 'weight' in k]
