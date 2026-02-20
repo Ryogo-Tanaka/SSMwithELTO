@@ -1,11 +1,9 @@
-# src/models/decoder.py
-
 import pkgutil
 import importlib
 from pathlib import Path
 from . import architectures
 
-# Scan architectures/ for any <name>Decoder and <name>_targetDecoder classes
+# Auto-register <name>Decoder and <name>_targetDecoder classes from architectures/
 _DECODERS: dict[str, type] = {}
 _TARGET_DECODERS: dict[str, type] = {}
 pkg_path = Path(architectures.__file__).parent
@@ -23,16 +21,9 @@ for module_info in pkgutil.iter_modules([str(pkg_path)]):
         _TARGET_DECODERS[name] = getattr(module, target_cls_name)
 
 def build_decoder(cfg, experiment_mode=None):
-    """
-    Factory for decoders with experiment mode support.
-    Args:
-      cfg: dict / Namespace with
-        - type: key in _DECODERS (e.g. "tcn", "cnn_image", "time_invariant")
-        - other keys: kwargs for that decoder class
-      experiment_mode: Optional str ("target_prediction" | "reconstruction")
-                      Overrides decoder selection for target prediction
-    Returns:
-      An instance of the chosen Decoder class.
+    """Factory: build a decoder from cfg.type.
+
+    If experiment_mode="target_prediction", prefers <type>_targetDecoder when available.
     """
     if isinstance(cfg, dict):
         cfg_type = cfg.get('type')
@@ -41,7 +32,7 @@ def build_decoder(cfg, experiment_mode=None):
     if cfg_type is None:
         raise ValueError("decoder config must include 'type' key or attribute")
 
-    # Target prediction mode: use <type>_targetDecoder if available
+    # Target prediction mode: prefer <type>_targetDecoder if available
     if experiment_mode == "target_prediction":
         if cfg_type in _TARGET_DECODERS:
             cls = _TARGET_DECODERS[cfg_type]

@@ -1,4 +1,3 @@
-# src/utils/data_loader.py
 """
 Unified data loader for time series and image data.
 
@@ -278,9 +277,8 @@ class UniversalTimeSeriesDataset(Dataset):
             warnings.warn("Converting 1D data to 2D")
             data = data.reshape(-1, 1)
         elif data.ndim == 2:
-            pass  # Standard time series (T, d)
+            pass
         elif data.ndim == 4:
-            # Image data (T, H, W, C)
             pass
         else:
             raise DataLoaderError(f"Unsupported data shape: {data.shape}. Supported: (T,), (T, d), (T, H, W, C)")
@@ -844,7 +842,6 @@ def load_experimental_data_with_architecture(
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
-# Backward compatibility wrapper
 def load_experimental_data(
     data_path: str,
     config: Optional[Dict[str, Any]] = None,

@@ -36,7 +36,6 @@ import numpy as np
 import torch
 import yaml
 
-# Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-evaluate_kalman_image_mse.py - Kalman Filtering Image Prediction MSE Evaluation (Phase A-KF)
+Kalman Filtering Image Prediction MSE Evaluation
 
-Evaluates the v4 trained model's Image Prediction MSE using three methods:
+Evaluates a trained model's Image Prediction MSE using three methods:
   Step 1: Direct prediction baseline (no Kalman filtering)
   Step 2: Kalman filtering + df_obs round-trip prediction
   Step 3: Kalman filtering + feature-space direct prediction (no round-trip)
 
 Usage:
   PYTHONUNBUFFERED=1 python scripts/evaluate_kalman_image_mse.py \
-    --model results/paper_reconstruction_v4/models/final_model.pth \
+    --model results/phase_c_clean_1500_v3/seed1/models/final_model.pth \
     --data data/rkn_quad/quad1_n.npz \
-    --output results/kalman_eval_v4 \
+    --output results/kalman_eval \
     --device cuda
 """
 
@@ -58,6 +58,9 @@ def compute_image_mse_per_timestep(y_true: torch.Tensor, y_pred: torch.Tensor) -
 def load_checkpoint(model_path: str) -> Tuple[Dict, Dict]:
     """Load checkpoint and config."""
     print(f"Loading checkpoint: {model_path}")
+    # Register legacy module alias for checkpoints saved before Phase E rename
+    import src.models.architectures.cnn_image as _cnn_image_module
+    sys.modules['src.models.architectures.rkn'] = _cnn_image_module
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
     config = ckpt.get('config', {})
     print(f"  Top-level keys: {list(ckpt.keys())}")
@@ -230,8 +233,7 @@ def load_test_data(data_path: str, device: torch.device) -> torch.Tensor:
 
     # Handle both 5D (1,T,H,W,C) clean data and 4D (T,H,W,C) noisy data
     if test_obs.ndim == 5 and test_obs.shape[0] == 1:
-        test_obs = test_obs[0]  # (1,T,H,W,C) -> (T,H,W,C)
-    # else: already (T,H,W,C)
+        test_obs = test_obs[0]
 
     # Normalize: uint8 [0,255] -> float32 [0,1]
     if test_obs.dtype == np.uint8:

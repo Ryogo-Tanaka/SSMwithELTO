@@ -1,5 +1,3 @@
-# src/ssm/cross_fitting.py
-
 import torch
 import numpy as np
 from typing import List, Tuple, Callable, Optional, Dict, Any

@@ -1,19 +1,9 @@
-# src/config.py
-
 import argparse
 import yaml
 from types import SimpleNamespace
 
 def _dict_to_namespace(d: dict) -> SimpleNamespace:
-    """
-    Recursively convert a nested dict to SimpleNamespace for dot-access.
-
-    Example:
-      {"model": {"encoder": {"type":"mlp", "input_dim":10}}, "training": {"lr":0.001}}
-    becomes:
-      Namespace(model=Namespace(encoder=Namespace(type="mlp", input_dim=10)),
-                training=Namespace(lr=0.001))
-    """
+    """Recursively convert a nested dict to SimpleNamespace for dot-access."""
     ns = SimpleNamespace()
     for key, value in d.items():
         if isinstance(value, dict):
@@ -23,18 +13,10 @@ def _dict_to_namespace(d: dict) -> SimpleNamespace:
     return ns
 
 def load_cfg() -> SimpleNamespace:
-    """
-    Load configuration from a YAML file specified via --config CLI argument.
+    """Load configuration from a YAML file specified via --config CLI argument.
 
-    1. Parse --config from command line
-    2. Load YAML file into dict
-    3. Convert to SimpleNamespace for dot-access (e.g., cfg.model.encoder.type)
-    4. Set default visualization.output_dir if not specified
-
-    Usage:
-      python train.py --config configs/model.yaml
-      cfg = load_cfg()
-      # cfg.model.encoder.type is now accessible
+    Returns a SimpleNamespace tree for dot-access (e.g., cfg.model.encoder.type).
+    Sets default visualization.output_dir if not specified in the YAML.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(

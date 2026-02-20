@@ -577,3 +577,9 @@ def make_state_decoder(cfg: Dict[str, Any]) -> cnn_image_targetDecoder:
         hidden=hidden,
         **{k: v for k, v in cfg.items() if k not in ['feature_dim', 'state_dim', 'hidden']}
     )
+
+
+# Backward-compatible aliases for checkpoints saved before Phase E rename
+rknEncoder = cnn_imageEncoder
+rknDecoder = cnn_imageDecoder
+rkn_targetDecoder = cnn_image_targetDecoder

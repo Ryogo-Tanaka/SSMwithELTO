@@ -1,5 +1,3 @@
-# src/inference/noise_covariance.py
-
 import torch
 import warnings
 from typing import Union, Tuple, Dict, Any
@@ -59,11 +57,9 @@ class ObservationNoiseCovarianceEstimator:
         if T < 2:
             raise ValueError(f"Too few samples for covariance estimation: T={T}")
 
-        # Sample covariance estimation
         residuals_centered = residuals - residuals.mean(dim=0, keepdim=True)  # (T, d_B)
         R_sample = (residuals_centered.T @ residuals_centered) / (T - 1)  # (d_B, d_B)
 
-        # Apply regularization
         R_regularized = self.regularize_covariance(R_sample)
 
         if return_stats:
@@ -101,7 +97,6 @@ class ObservationNoiseCovarianceEstimator:
             min_allowed = max_eigenvalue / self.max_condition_number
             eigenvalues_final = torch.clamp(eigenvalues_clipped, min=min_allowed)
 
-            # Reconstruct
             R_final = eigenvectors @ torch.diag(eigenvalues_final) @ eigenvectors.T
 
         except torch.linalg.LinAlgError:
@@ -122,12 +117,10 @@ class ObservationNoiseCovarianceEstimator:
     ) -> Dict[str, float]:
         """Compute diagnostic statistics."""
         try:
-            # Sample covariance statistics
             eigenvals_sample = torch.linalg.eigvals(R_sample).real
             cond_sample = eigenvals_sample.max() / eigenvals_sample.min()
             det_sample = torch.det(R_sample)
 
-            # Post-regularization statistics
             eigenvals_reg = torch.linalg.eigvals(R_regularized).real
             cond_reg = eigenvals_reg.max() / eigenvals_reg.min()
             det_reg = torch.det(R_regularized)

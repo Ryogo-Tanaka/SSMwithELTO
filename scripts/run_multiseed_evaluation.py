@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
 """
-Phase C: 5-Seed Evaluation Pipeline for Paper Table 1 Reproduction
+Multi-Seed Evaluation Pipeline for Paper Table 1 Reproduction
 
-Orchestrates training and Kalman filtering evaluation across 5 data seeds
+Orchestrates training and Kalman filtering evaluation across multiple data seeds
 for all conditions (clean/noisy x 1.5k/15k).
 
 Calls existing scripts via subprocess:
-  - scripts/run_full_experiment.py (training)
+  - scripts/run_quadlink_experiment.py (training)
   - scripts/evaluate_kalman_image_mse.py (Kalman evaluation)
-
-No existing files are modified.
 
 Usage:
     # Clean-1.5k (default condition)
-    PYTHONUNBUFFERED=1 python scripts/run_5seed_evaluation.py \
+    PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition clean-1.5k \
         --base-output results/phase_c_clean_1500_v3 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 1,2,3,4,5
 
     # Noisy-1.5k
-    PYTHONUNBUFFERED=1 python scripts/run_5seed_evaluation.py \
+    PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition noisy-1.5k \
         --base-output results/phase_c_noisy_1500_v3 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 1,2,3,4,5
 
     # Clean-15k (single data file, all seeds share quad_long_n.npz)
-    PYTHONUNBUFFERED=1 python scripts/run_5seed_evaluation.py \
+    PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition clean-15k \
         --base-output results/phase_c_clean_15000_v3 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 1,2,3,4,5
 
     # Aggregate only (skip training and evaluation)
-    PYTHONUNBUFFERED=1 python scripts/run_5seed_evaluation.py \
+    PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition noisy-1.5k \
         --base-output results/phase_c_noisy_1500_v3 \
         --aggregate-only
 
     # Retry specific seeds
-    PYTHONUNBUFFERED=1 python scripts/run_5seed_evaluation.py \
+    PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition noisy-1.5k \
         --base-output results/phase_c_noisy_1500_v3 \
         --config configs/quad_image_reconstruction_config.yaml \

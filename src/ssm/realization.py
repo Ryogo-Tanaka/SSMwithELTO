@@ -57,48 +57,42 @@ class StochasticRealizationWithEncoder(nn.Module):
         super().__init__()
 
         self.encoder = encoder
-        self.window_length = int(past_horizon)  # l
-        self.num_components = int(rank)  # r
-        self.ridge_param = float(ridge_param)  # lambda
-        self.min_eigenvalue = float(jitter)  # numerical stabilization
-        self.m = int(m)  # lag-covariance estimation sample count
+        self.window_length = int(past_horizon)
+        self.num_components = int(rank)
+        self.ridge_param = float(ridge_param)
+        self.min_eigenvalue = float(jitter)
+        self.m = int(m)
         self.device = device
 
-        # Encoder output dimension m: prefer explicit encoder_output_dim, fallback to auto-detection
         if encoder_output_dim is not None:
             self.feature_dim = encoder_output_dim
         else:
             self.feature_dim = self._get_encoder_output_dim()
 
         # Fitted parameters (set after fit())
-        self.canonical_directions_past: Optional[torch.Tensor] = None  # a_i in R^m
-        self.canonical_directions_future: Optional[torch.Tensor] = None  # b_i in R^m
-        self.canonical_correlations: Optional[torch.Tensor] = None  # rho_i
+        self.canonical_directions_past: Optional[torch.Tensor] = None
+        self.canonical_directions_future: Optional[torch.Tensor] = None
+        self.canonical_correlations: Optional[torch.Tensor] = None
         self.is_fitted = False
 
         # Backward compatibility with legacy Realization class
         self.h = self.window_length
         self.rank = self.num_components
 
-        # Intermediate result cache for computation optimization
+        # Intermediate result cache
         self._cached_feature_matrices: Optional[Dict[str, torch.Tensor]] = None
         self._cached_covariance_blocks: Optional[Dict[str, torch.Tensor]] = None
         self._cached_whitening_matrices: Optional[Dict[str, torch.Tensor]] = None
         self._last_input_shape: Optional[Tuple[int, int]] = None
 
-        # Statistics for debugging
         self._feature_statistics: Optional[Dict[str, torch.Tensor]] = None
 
-        # Feature mapping transform initialization
         self.feature_mapping_type = feature_mapping_type
 
         if feature_mapping_type == "averaging":
-            # Temporal averaging (no learnable parameters)
             self.component_transforms = None
 
         elif feature_mapping_type in ["linear", "mlp"]:
-            # Per-component transforms: m independent networks, each l -> 1
-
             if feature_mapping_type == "linear":
                 hidden_dims = []
             else:
@@ -107,14 +101,13 @@ class StochasticRealizationWithEncoder(nn.Module):
                 else:
                     hidden_dims = feature_mapping_hidden_dims
 
-            # Build m per-component transforms
             self.component_transforms = nn.ModuleList([
                 self._build_component_transform(
-                    input_dim=self.window_length,  # ℓ
+                    input_dim=self.window_length,
                     hidden_dims=hidden_dims,
                     activation=feature_mapping_activation
                 )
-                for _ in range(self.feature_dim)  # m components
+                for _ in range(self.feature_dim)
             ])
         else:
             raise ValueError(
@@ -156,24 +149,17 @@ class StochasticRealizationWithEncoder(nn.Module):
         layers = []
         in_dim = input_dim
 
-        # Build hidden layers
         for h_dim in hidden_dims:
             layers.append(nn.Linear(in_dim, h_dim))
             layers.append(act_fn())
             in_dim = h_dim
 
-        # Final layer: -> R (scalar output)
         layers.append(nn.Linear(in_dim, 1))
 
         return nn.Sequential(*layers)
 
     def _get_encoder_output_dim(self) -> int:
-        """
-        Get encoder output dimension m.
-
-        Prefers explicit config parameter over dummy-input probing.
-        """
-        # Try direct attribute access on encoder
+        """Get encoder output dimension m via attribute lookup."""
         if hasattr(self.encoder, 'output_dim'):
             return self.encoder.output_dim
 
@@ -209,32 +195,27 @@ class StochasticRealizationWithEncoder(nn.Module):
             Feat_X: Past feature matrix (m, N)
             Feat_Y: Future feature matrix (m, N)
         """
-        # Cache disabled: _lightweight_operator_update and Phase-2 fit() can be called
-        # multiple times per epoch, making computation graph management complex
+        # Cache disabled: fit() may be called multiple times per epoch,
+        # making computation graph management complex
         use_cache = False
 
-        # Record input shape (for cache validation infrastructure)
         input_shape = Y.shape
 
-        # Cache check (currently disabled, always skipped)
         if (use_cache and
             self._cached_feature_matrices is not None and
             self._last_input_shape == input_shape):
             return self._cached_feature_matrices['Feat_X'], self._cached_feature_matrices['Feat_Y']
 
-        # Step 1: Apply encoder at all time points (batch processing)
-        # u_eta(y_t) -> m_t in R^m (Section 3.1)
+        # Step 1: Apply encoder u_eta at all time points (Section 3.1)
         if self.encoder.training:
-            # Training: retain gradients for encoder parameter updates
-            # Critical for CCA loss gradient flow in Phase-2
-            M = self.encoder(Y)  # (T, H, W, C) or (T, n) -> (T, m)
+            # Retain gradients for Phase-2 CCA loss backpropagation
+            M = self.encoder(Y)  # (T, m)
         else:
-            # Inference: disable gradients for efficiency
             self.encoder.eval()
             with torch.no_grad():
-                M = self.encoder(Y)  # (T, H, W, C) or (T, n) -> (T, m)
+                M = self.encoder(Y)  # (T, m)
 
-        T, m = M.shape  # always (T, m) after encoder
+        T, m = M.shape
 
         L = self.window_length
         N = T - 2 * L + 1  # effective sample count
@@ -242,29 +223,25 @@ class StochasticRealizationWithEncoder(nn.Module):
         if N <= 0:
             raise ValueError(f"Time series too short for window length {L}")
 
-            # Dimension check and adjustment
             if M.dim() == 1:
-                M = M.unsqueeze(0)  # (1, m)
+                M = M.unsqueeze(0)
             elif M.dim() == 3:
-                M = M.squeeze(1)  # (T, m)
+                M = M.squeeze(1)
 
-        # Step 2: Build feature mapping phi_m
-        # Section 3.3: group same components -> transform
+        # Step 2: Build feature mapping phi_m (Section 3.3)
         Feat_X_list = []
         Feat_Y_list = []
 
         for i in range(N):
-            t = i + L  # actual time point (starts from L)
+            t = i + L
 
-            # Past block: p(t) = (y(t-1)^T, y(t-2)^T, ..., y(t-L)^T)^T
-            # Retrieve from t-1 to t-L in reverse order
-            past_indices = list(range(t-1, t-L-1, -1))  # [t-1, t-2, ..., t-L]
+            # Past block: p(t) = (y(t-1), ..., y(t-L)) in reverse order
+            past_indices = list(range(t-1, t-L-1, -1))
             past_features = M[past_indices]  # (L, m)
 
-            # Future block: f(t) = (y(t)^T, y(t+1)^T, ..., y(t+L-1)^T)^T
+            # Future block: f(t) = (y(t), ..., y(t+L-1))
             future_features = M[t:t+L]  # (L, m)
 
-            # phi_m transform: per-component grouping -> scalar output
             feat_past = self._apply_feature_mapping(past_features)  # (m,)
             feat_future = self._apply_feature_mapping(future_features)  # (m,)
 
@@ -274,7 +251,6 @@ class StochasticRealizationWithEncoder(nn.Module):
         Feat_X = torch.stack(Feat_X_list, dim=1)  # (m, N)
         Feat_Y = torch.stack(Feat_Y_list, dim=1)  # (m, N)
 
-        # Save to cache (no clone to preserve gradient graph)
         if use_cache:
             self._cached_feature_matrices = {'Feat_X': Feat_X, 'Feat_Y': Feat_Y}
             self._last_input_shape = input_shape
@@ -304,25 +280,18 @@ class StochasticRealizationWithEncoder(nn.Module):
         L_win, m = features.shape
 
         if self.feature_mapping_type == "averaging":
-            # Temporal averaging (Theory equation 345)
-            # φ̃_m^(i) ≈ (1/ℓ) Σ_{j=1}^ℓ φ_u^(i)(y(t-j))
+            # Temporal averaging (Eq. 345)
             feat_output = torch.mean(features, dim=0)  # (m,)
 
         elif self.feature_mapping_type in ["linear", "mlp"]:
-            # Per-component transform (Theory equation 333)
+            # Per-component transform (Eq. 333)
             feat_components = []
 
             for i in range(m):
-                # Step 1: Group component i
-                # φ_u^(i)(p(t)) = [φ_u^(i)(y(t-1)), ..., φ_u^(i)(y(t-ℓ))]^T ∈ ℝˡ
-                feat_u_i = features[:, i]  # (ℓ,)
-
-                # Step 2: Apply per-component transform
-                # φ̃_m^(i)(p(t)) = Transform_i(φ_u^(i)(p(t))) ∈ ℝ
+                feat_u_i = features[:, i]  # (l,)
                 feat_tilde_i = self.component_transforms[i](feat_u_i)  # (1,)
                 feat_components.append(feat_tilde_i.squeeze())
 
-            # Step 3: Compose final vector
             feat_output = torch.stack(feat_components)  # (m,)
 
         else:
@@ -354,19 +323,16 @@ class StochasticRealizationWithEncoder(nn.Module):
         """
         m, N = Feat_X.shape
 
-        # Mean-centering
-        Feat_X_mean = torch.mean(Feat_X, dim=1, keepdim=True)  # (m, 1)
-        Feat_Y_mean = torch.mean(Feat_Y, dim=1, keepdim=True)  # (m, 1)
+        Feat_X_mean = torch.mean(Feat_X, dim=1, keepdim=True)
+        Feat_Y_mean = torch.mean(Feat_Y, dim=1, keepdim=True)
 
-        Feat_X_centered = Feat_X - Feat_X_mean  # (m, N)
-        Feat_Y_centered = Feat_Y - Feat_Y_mean  # (m, N)
+        Feat_X_centered = Feat_X - Feat_X_mean
+        Feat_Y_centered = Feat_Y - Feat_Y_mean
 
-        # Sample covariance blocks
         G = (Feat_X_centered @ Feat_X_centered.T) / N  # (m, m)
         H = (Feat_Y_centered @ Feat_Y_centered.T) / N  # (m, m)
         A = (Feat_Y_centered @ Feat_X_centered.T) / N  # (m, m)
 
-        # Save statistics for debugging
         self._feature_statistics = {
             'past_mean': Feat_X_mean.squeeze(),
             'future_mean': Feat_Y_mean.squeeze(),
@@ -421,26 +387,17 @@ class StochasticRealizationWithEncoder(nn.Module):
             H_inv_sqrt: H_reg^{-1/2} (m, m)
         """
         def stable_matrix_inv_sqrt(A: torch.Tensor, min_eigval: float = 1e-8) -> torch.Tensor:
-            """Numerically stable A^{-1/2} computation."""
-            # Symmetrize
+            """Numerically stable A^{-1/2} via eigendecomposition with clipping."""
             A_sym = 0.5 * (A + A.T)
-
-            # Eigendecomposition
             eigvals, eigvecs = torch.linalg.eigh(A_sym)
-
-            # Clip minimum eigenvalue for numerical stability
             eigvals_clipped = torch.clamp(eigvals, min=min_eigval)
-
-            # A^{-1/2} = V diag(λ^{-1/2}) V^T
             inv_sqrt_eigvals = eigvals_clipped.rsqrt()
             A_inv_sqrt = eigvecs @ torch.diag(inv_sqrt_eigvals) @ eigvecs.T
-
             return A_inv_sqrt
 
         G_inv_sqrt = stable_matrix_inv_sqrt(G_reg)
         H_inv_sqrt = stable_matrix_inv_sqrt(H_reg)
 
-        # Save whitening matrices for debugging
         self._whitening_matrices = {
             'G_inv_sqrt': G_inv_sqrt,
             'H_inv_sqrt': H_inv_sqrt
@@ -472,10 +429,7 @@ class StochasticRealizationWithEncoder(nn.Module):
             S_vals: Singular values (canonical correlations) (m,)
             Vt: Right singular vectors transposed (m, m)
         """
-        # Whitened cross-block
         A_tilde = H_inv_sqrt @ A @ G_inv_sqrt  # (m, m)
-
-        # SVD decomposition
         U, S_vals, Vt = torch.linalg.svd(A_tilde, full_matrices=False)
 
         return U, S_vals, Vt
@@ -503,10 +457,9 @@ class StochasticRealizationWithEncoder(nn.Module):
             canonical_dirs_past: Past canonical directions a_i (m, r)
             canonical_dirs_future: Future canonical directions b_i (m, r)
         """
-        # Select top r canonical directions
         r = min(self.num_components, U.size(1))
 
-        # Inverse-transform canonical directions
+        # Inverse-transform to original space
         canonical_dirs_past = G_inv_sqrt @ Vt[:r, :].T  # (m, r)
         canonical_dirs_future = H_inv_sqrt @ U[:, :r]   # (m, r)
 
@@ -535,37 +488,25 @@ class StochasticRealizationWithEncoder(nn.Module):
         self.encoder = self.encoder.to(self.device)
 
         # Clear cache to avoid referencing graph-freed tensors from previous epoch
-        # Cache valid only between fit() and estimate_states()
         self._cached_feature_matrices = None
         self._last_input_shape = None
 
-        # Step 1: Build feature matrices using time-invariant encoder
         Feat_X, Feat_Y = self._build_feature_matrices(Y)
-
-        # Step 2: Compute sample covariance blocks
         G, H, A = self._compute_covariance_blocks(Feat_X, Feat_Y)
-
-        # Step 3: Ridge regularization
         G_reg, H_reg = self._apply_ridge_regularization(G, H)
-
-        # Step 4: Compute whitening matrices
         G_inv_sqrt, H_inv_sqrt = self._compute_whitening_matrices(G_reg, H_reg)
-
-        # Step 5: Canonical correlation analysis (SVD)
         U, S_vals, Vt = self._solve_canonical_correlation(A, G_inv_sqrt, H_inv_sqrt)
 
-        # Step 6: Extract canonical directions
         canonical_dirs_past, canonical_dirs_future = self._extract_canonical_directions(
             U, Vt, G_inv_sqrt, H_inv_sqrt
         )
 
-        # Save fitted results
         self.canonical_directions_past = canonical_dirs_past
         self.canonical_directions_future = canonical_dirs_future
         self.canonical_correlations = S_vals[:min(self.num_components, len(S_vals))]
 
-        # Build B matrix (B = Sigma^{1/2} a^T) for compatibility with legacy filter()
-        sqrt_correlations = torch.sqrt(self.canonical_correlations)  # Σ^{1/2}
+        # B = Sigma^{1/2} a^T for compatibility with legacy filter()
+        sqrt_correlations = torch.sqrt(self.canonical_correlations)
         self.B_matrix = torch.diag(sqrt_correlations) @ canonical_dirs_past.T  # (r, m)
 
         self.is_fitted = True
@@ -592,20 +533,14 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         Y = Y.to(self.device)
 
-        # Reuse cached feature matrices (computed during fit())
         if self._cached_feature_matrices is not None:
             Phi_X = self._cached_feature_matrices['Feat_X']
         else:
-            # Recompute only when cache is unavailable
             Phi_X, _ = self._build_feature_matrices(Y)
 
-        # Step 1: Past-process canonical variate z_p(t)
+        # z_p(t) = a^T phi_m(p(t)), then x(t) = Sigma^{1/2} z_p(t)
         z_p = self.canonical_directions_past.T @ Phi_X  # (r, N)
-
-        # Step 2: Weight by canonical correlations: x(t) = Sigma^{1/2} z_p(t)
-        sqrt_canonical_corrs = torch.sqrt(self.canonical_correlations)  # Σ^{1/2} ∈ R^r
-
-        # Apply weighting: multiply each canonical variate by sqrt of its correlation
+        sqrt_canonical_corrs = torch.sqrt(self.canonical_correlations)  # (r,)
         X_weighted = sqrt_canonical_corrs.unsqueeze(1) * z_p  # (r, N)
         X = X_weighted.T  # (N, r)
 
@@ -626,12 +561,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         return self.estimate_states(Y)
 
     def get_canonical_analysis_results(self) -> Dict[str, Any]:
-        """
-        Get canonical correlation analysis results.
-
-        Returns:
-            Dict: Analysis results
-        """
+        """Get canonical correlation analysis results."""
         if not self.is_fitted:
             return {"status": "not_fitted"}
 
@@ -675,11 +605,10 @@ class Realization:
     ):
         """
         Args:
-        past_horizon:  number of time-lags in past/future Hankel blocks
-        jitter:        small epsilon to add to diagonals of covariances
-        cond_thresh:   max allowed condition number before rejection
+            past_horizon: Number of time-lags in past/future Hankel blocks
+            jitter: Small epsilon added to covariance diagonals
+            cond_thresh: Max allowed condition number before rejection
         """
-        # Explicit type conversion for numerical parameters
         self.h = int(past_horizon)
         self.jitter = float(jitter)
         self.cond_thresh = float(cond_thresh)
@@ -691,14 +620,10 @@ class Realization:
 
         self.reg_type = str(reg_type)
 
-        # m parameter (sample count for lag-covariance estimation)
         self.m = int(m) if m is not None else None
 
-        # Initialization
         self.B = None
         self._L_vals = None
-
-        # for debug
         self._Spp_eigvals = None
         self.H = None
 
@@ -707,7 +632,6 @@ class Realization:
         h = self.h
         N = T - 2*h + 1
         if N <= 0:
-            # raise RealizationError("Time series too short for horizon h")
             return
 
         # 0) Mean-center
@@ -715,10 +639,8 @@ class Realization:
         Y_c = Y - mu
 
         device = Y_c.device
-        # Auto-determine m (configurable, adaptive default)
         max_available = T - 2 * h
         if max_available <= 0:
-            # Auto-adjust past_horizon
             h_new = max(1, (T - 1) // 2)
             print(f"realization adjusted: past_horizon {h} -> {h_new} (data length: {T})")
             h = h_new
@@ -730,10 +652,8 @@ class Realization:
         if m is None:
             m = m_default
         else:
-            m = min(m, max_available)  # clip to available range
-        rank   = self.rank      # low-rank approximation order
-        # eps_chol   = 1e-7
-        # eps_jitter = 1e-10
+            m = min(m, max_available)
+        rank   = self.rank
         eps_chol   = float(self.jitter)
         eps_jitter = float(self.jitter)
         q_over     = 5
@@ -741,8 +661,8 @@ class Realization:
         # 1. -- Lag covariances (batch outer products, float32) -----
         idx = torch.randint(0, max_available, (m,), device=device)
         Y0  = Y_c[idx]                          # (m, p)
-        Lambda    = {}
-        
+        Lambda = {}
+
         for l in range(0, 2 * h):
             Yl = Y_c[idx + l]                  # (m, p)
             cov = (Yl.T @ Y0) / m              # (p, p)
@@ -751,17 +671,17 @@ class Realization:
                 Lambda[-l] = cov.T
 
         # 2. -- Block matrices (k x k blocks) ----------------------
-        dim_H   = h * p
+        dim_H = h * p
         H32  = torch.zeros(dim_H, dim_H, dtype=torch.float32, device=device)
         Tp32 = torch.zeros_like(H32)
-        
+
         z = torch.zeros(p, p, dtype=torch.float32, device=device)
         for i in range(h):
             for j in range(h):
                 H32 [i*p:(i+1)*p, j*p:(j+1)*p] = Lambda.get(i + j + 1, z)
                 Tp32[i*p:(i+1)*p, j*p:(j+1)*p] = Lambda.get(i - j, z)
         
-        Tp32.diagonal().add_(eps_jitter)        # jitter for SPD
+        Tp32.diagonal().add_(eps_jitter)
 
         # 3. -- Inverse square root (float64) ----------------------
         Tp64 = Tp32.to(torch.float64)
@@ -774,16 +694,14 @@ class Realization:
         except RuntimeError as e:
             print(f"real.fit failed cholesky decom: {e}")
             
-            # NaN/Inf check - indicator of numerical breakdown
             if not torch.isfinite(Tp64).all():
                 print("Critical: Tp64 contains non-finite values.")
                 raise RealizationError("Matrix contains non-finite values - numerical breakdown")
             
-            # Last attempt: symmetry check and eigendecomposition
+            # Fallback: eigendecomposition
             try:
-                # Symmetry check
                 is_symmetric = torch.allclose(Tp64, Tp64.T, atol=1e-8)
-                
+
                 if is_symmetric:
                     eigvals, eigvecs = torch.linalg.eigh(Tp64)
                 else:
@@ -792,14 +710,10 @@ class Realization:
                     eigvals = eigvals_complex.real
                     eigvecs = eigvecs_complex.real
                 
-                # Eigenvalue numerical stability check
                 if torch.any(eigvals <= 0) or not torch.isfinite(eigvals).all():
                     print(f"Unstable eigenvalues: min={eigvals.min().item()}, has_inf={not torch.isfinite(eigvals).all()}")
                     raise RealizationError("Eigenvalues are numerically unstable")
-                
-                # TODO: implement eigval clipping here if policy changes
-                # eigvals = torch.clamp(eigvals, min=eps_chol)  # caution: breaks gradients
-                
+
                 inv_sqrt = eigvals.rsqrt()
                 D = torch.diag(inv_sqrt)
                 W64 = eigvecs @ D @ eigvecs.T
@@ -831,9 +745,8 @@ class Realization:
     def filter(self, Y: torch.Tensor) -> torch.Tensor:
         h = self.h
         N = Y.shape[0] - 2*h + 1
-        # Yf = torch.stack([Y[i+1 : i+h+1].reshape(-1) for i in range(N)], dim=1)
         Yp = torch.stack([Y[i : i + h].flip(dims=(0, )).reshape(-1) for i in range(N)], dim=1)
-        X_state = (self.B @ Yp).T  # shape (N, r), time ; t = h,...,h+N-1
+        X_state = (self.B @ Yp).T  # (N, r)
 
         self.X_state_torch = X_state
 
@@ -865,12 +778,7 @@ class Realization:
     # =====================================
 
     def get_state_statistics(self) -> Dict[str, Any]:
-        """
-        Get state estimation statistics.
-
-        Returns:
-            Dict: Statistics
-        """
+        """Get state estimation statistics."""
         if not hasattr(self, 'X_state_torch') or self.X_state_torch is None:
             return {"status": "not_fitted"}
         
@@ -914,19 +822,17 @@ class Realization:
         T, r = X.shape
         
         if method == "linear":
-            # Linear extrapolation
             if T >= 2:
-                trend = X[-1] - X[-2]  # latest trend
+                trend = X[-1] - X[-2]
                 predictions = []
                 for step in range(1, n_steps + 1):
                     pred = X[-1] + step * trend
                     predictions.append(pred)
                 return torch.stack(predictions)
             else:
-                method = "last_value"  # fallback
+                method = "last_value"
 
         if method == "last_value":
-            # Repeat last value
             last_state = X[-1]
             return last_state.unsqueeze(0).expand(n_steps, r).clone()
         
@@ -955,7 +861,6 @@ class Realization:
             "recommendations": []
         }
         
-        # Check required components
         requirements = [
             ("df_state_layer.V_A", hasattr(df_state_layer, 'V_A') and df_state_layer.V_A is not None),
             ("df_state_layer.U_A", hasattr(df_state_layer, 'U_A') and df_state_layer.U_A is not None),
@@ -970,7 +875,6 @@ class Realization:
                 validation["compatible"] = False
                 validation["issues"].append(f"Missing requirement: {req_name}")
         
-        # Dimension consistency check
         if validation["compatible"]:
             try:
                 r_realization = self.rank if self.rank is not None else self.X_state_torch.size(1)
@@ -980,7 +884,6 @@ class Realization:
                     validation["issues"].append(f"State dimension mismatch: realization={r_realization}, df_state={r_df_state}")
                     validation["compatible"] = False
                     
-                # Feature dimensions
                 dA = df_state_layer.feature_dim
                 dB = df_obs_layer.obs_feature_dim
                 
@@ -990,7 +893,6 @@ class Realization:
                     "feature_dim_B": dB
                 }
                 
-                # Recommendations
                 if dA < 2 * r_realization:
                     validation["recommendations"].append(f"Consider increasing feature_dim_A (current: {dA}, recommended: >={2*r_realization})")
                     
@@ -1004,19 +906,8 @@ class Realization:
     # Configuration helpers
     # =====================================
 
-    def create_kalman_config(
-        self,
-        **overrides
-    ) -> Dict[str, Any]:
-        """
-        Create Kalman Filter configuration.
-
-        Args:
-            **overrides: Configuration overrides
-
-        Returns:
-            Dict: Kalman configuration
-        """
+    def create_kalman_config(self, **overrides) -> Dict[str, Any]:
+        """Create Kalman Filter configuration with optional overrides."""
         default_config = {
             'noise_estimation': {
                 'method': 'residual_based',
@@ -1035,7 +926,6 @@ class Realization:
             'device': 'cpu'
         }
         
-        # Apply overrides
         def deep_update(base_dict, update_dict):
             for key, value in update_dict.items():
                 if isinstance(value, dict) and key in base_dict:
@@ -1062,11 +952,9 @@ def build_realization(cfg):
     Raises:
         ValueError: Configuration error (e.g., missing encoder_output_dim)
     """
-    # Branch based on encoder availability
     use_encoder = getattr(cfg, 'use_encoder', False) and hasattr(cfg, 'encoder')
 
     if use_encoder:
-        # Encoder-aware version: requires explicit encoder_output_dim
         if not hasattr(cfg, 'encoder_output_dim'):
             raise ValueError(
                 "encoder_output_dim must be specified when using encoder. "
@@ -1082,7 +970,6 @@ def build_realization(cfg):
             device=getattr(cfg, 'device', 'cpu')
         )
     else:
-        # Legacy Realization class
         r = getattr(cfg, "rank", None)
         if r is not None and r < 0:
             raise ValueError(f"Invalid rank: {r} (must be >= 0 or None)")

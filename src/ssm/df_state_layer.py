@@ -1,5 +1,3 @@
-# src/ssm/df_state_layer.py
-
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Dict, Any
@@ -11,9 +9,7 @@ from .cross_fitting import CrossFittingManager, TwoStageCrossFitter, CrossFittin
 class StateFeatureNet(nn.Module):
     """
     State feature map phi_theta: R^r -> R^{d_A}.
-
-    Neural network mapping state variables to a high-dimensional feature space.
-    Shared between DF-A and DF-B.
+    Neural network shared between DF-A and DF-B.
     """
 
     def __init__(
@@ -122,7 +118,6 @@ class DFStateLayer(nn.Module):
 
         self.cf_config = cross_fitting_config or {'n_blocks': 5, 'min_block_size': 10}
 
-        # Fitted parameters
         self.V_A: Optional[torch.Tensor] = None  # Transfer operator (d_A, d_A)
         self.U_A: Optional[torch.Tensor] = None  # Readout matrix (d_A, r)
         self._is_fitted = False
@@ -130,9 +125,8 @@ class DFStateLayer(nn.Module):
         self._stage1_cache = {}
         self._stage2_cache = {}
         self._cf_manager: Optional[CrossFittingManager] = None
-    
 
-    
+
     def _ridge_stage1(
         self,
         X_features: torch.Tensor,
@@ -161,11 +155,8 @@ class DFStateLayer(nn.Module):
         if N < d_A:
             warnings.warn(f"Sample count {N} < feature dimension {d_A}. May be numerically unstable")
 
-        # Gram matrix + regularization
         XtX = X_features.T @ X_features
         XtX_reg = XtX + reg_lambda * torch.eye(d_A).type_as(XtX).to(XtX.device)
-
-        # Cross-covariance
         YtX = Y_targets.T @ X_features
 
         original_device = X_features.device
@@ -229,13 +220,11 @@ class DFStateLayer(nn.Module):
         reg_lambda: float
     ) -> torch.Tensor:
         """
-        Stage-2 Ridge regression: readout matrix estimation.
-
-        U = (H H^T + lambda I)^{-1} H X^T
+        Stage-2 Ridge regression: U = (H^T H + lambda I)^{-1} H^T X.
 
         Args:
-            H_features: Cross-fitted features H^{(cf)}_A (N, d_A)
-            X_targets: Target states X^+ (N, r)
+            H_features: Cross-fitted features (N, d_A)
+            X_targets: Target states (N, r)
             reg_lambda: Regularization parameter lambda_B
 
         Returns:
@@ -271,15 +260,7 @@ class DFStateLayer(nn.Module):
         return U
     
     def _initialize_cross_fitting(self, T_eff: int) -> CrossFittingManager:
-        """
-        Initialize cross-fitting manager.
-
-        Args:
-            T_eff: Effective time series length
-
-        Returns:
-            CrossFittingManager: Initialized cross-fitting manager, or None if data is too small
-        """
+        """Initialize cross-fitting manager. Returns None if data is too small."""
         cf_config = self.cf_config.copy()
 
         min_block_size = cf_config.get('min_block_size', 10)
@@ -299,16 +280,7 @@ class DFStateLayer(nn.Module):
         X_states: torch.Tensor,
         use_simple_fallback: bool = False
     ) -> torch.Tensor:
-        """
-        Compute Stage-1 loss with cross-fitting support.
-
-        Args:
-            X_states: State sequence (T, r)
-            use_simple_fallback: Whether to use simplified (non-cross-fitting) version
-
-        Returns:
-            torch.Tensor: Stage-1 loss (scalar)
-        """
+        """Compute Stage-1 loss with cross-fitting support."""
         T, r = X_states.shape
 
         phi_seq = self.phi_theta(X_states)
@@ -319,7 +291,6 @@ class DFStateLayer(nn.Module):
         T_eff = phi_minus.size(0)
 
         if use_simple_fallback or T_eff < 20:
-            # Small data or simple fallback: estimate on all data
             V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
             phi_pred = (V_A @ phi_minus.T).T
             loss = torch.norm(phi_pred - phi_plus, p='fro') ** 2 / phi_plus.numel()
@@ -339,7 +310,6 @@ class DFStateLayer(nn.Module):
             else:
                 cf_fitter = TwoStageCrossFitter(cf_manager)
 
-                # Estimate V_A^{(-k)} without gradients
                 with torch.no_grad():
                     V_list = cf_fitter.cross_fit_stage1(
                         phi_minus, phi_plus,
@@ -347,7 +317,6 @@ class DFStateLayer(nn.Module):
                         reg_lambda=self.lambda_A
                     )
 
-                # Compute out-of-fold prediction error (with gradients)
                 total_loss = 0.0
                 for k in range(cf_manager.n_blocks):
                     block_indices = cf_manager.get_block_indices(k)
@@ -355,7 +324,7 @@ class DFStateLayer(nn.Module):
                     phi_minus_k = phi_minus[block_indices]
                     phi_plus_k = phi_plus[block_indices]
 
-                    V_k = V_list[k]  # No gradient (detached)
+                    V_k = V_list[k]
                     phi_pred_k = (V_k @ phi_minus_k.T).T
 
                     loss_k = torch.norm(phi_pred_k - phi_plus_k, p='fro') ** 2 / phi_plus_k.numel()
@@ -408,7 +377,6 @@ class DFStateLayer(nn.Module):
         min_block_size = self.cf_config.get('min_block_size', 20)
 
         if T_eff < max(n_blocks * min_block_size, 100):
-            # Small data: no cross-fitting (full-data Ridge)
             V_A = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
             phi_pred = (V_A @ phi_minus.T).T
 
@@ -420,7 +388,6 @@ class DFStateLayer(nn.Module):
 
             optimizer_phi.step()
 
-            # Update cache
             with torch.no_grad():
                 self._stage1_cache = {
                     'V_A': V_A,
@@ -437,7 +404,6 @@ class DFStateLayer(nn.Module):
                 'mode': 'no_crossfitting'
             }
 
-        # Cross-fitting execution
         from .cross_fitting import CrossFittingManager
 
         cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
@@ -445,27 +411,22 @@ class DFStateLayer(nn.Module):
         k = epoch % cf_manager.n_blocks
         optimizer_phi.zero_grad()
 
-        # Compute features with current phi_theta
         phi_seq = self.phi_theta(X_states)
         phi_minus = phi_seq[:-1]
         phi_plus = phi_seq[1:]
 
-        # Out-of-fold indices
         oof_indices = cf_manager.get_out_of_fold_indices(k)
         phi_minus_oof = phi_minus[oof_indices]
         phi_plus_oof = phi_plus[oof_indices]
 
-        # Compute V_A^{(-k)}
         V_A_k = self._ridge_stage1_with_grad(phi_minus_oof, phi_plus_oof, self.lambda_A)
 
-        # In-fold indices
         block_indices = cf_manager.get_block_indices(k)
         phi_minus_block = phi_minus[block_indices]
         phi_plus_block = phi_plus[block_indices]
 
         phi_pred_block = (V_A_k @ phi_minus_block.T).T
 
-        # Block k loss
         prediction_loss_k = torch.norm(phi_pred_block - phi_plus_block, p='fro') ** 2 / phi_plus_block.size(0)
         regularization_loss_k = self.lambda_A * torch.norm(V_A_k, p='fro') ** 2
         loss_k = prediction_loss_k + regularization_loss_k
@@ -473,7 +434,6 @@ class DFStateLayer(nn.Module):
         loss_k.backward()
         optimizer_phi.step()
 
-        # Update cache
         with torch.no_grad():
             phi_seq_final = self.phi_theta(X_states)
             phi_minus_final = phi_seq_final[:-1]
@@ -518,7 +478,6 @@ class DFStateLayer(nn.Module):
         min_block_size = self.cf_config.get('min_block_size', 20)
 
         if T_eff < max(n_blocks * min_block_size, 100):
-            # Insufficient data: full-data Ridge regression
             U_A = self._ridge_stage2(H_features, X_targets, self.lambda_B)
             X_pred = (U_A.T @ H_features.T).T
             return X_pred, U_A
@@ -529,7 +488,6 @@ class DFStateLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # Build U_A^{(-k)} list (out-of-fold)
             U_A_list = []
             for k in range(cf_manager.n_blocks):
                 oof_indices = cf_manager.get_out_of_fold_indices(k)
@@ -539,15 +497,12 @@ class DFStateLayer(nn.Module):
                 U_A_k = self._ridge_stage2(H_oof, X_oof, self.lambda_B)
                 U_A_list.append(U_A_k)
 
-            # Out-of-fold prediction (with gradients)
             X_pred_cf = torch.zeros_like(X_targets)
             for k in range(cf_manager.n_blocks):
                 block_indices = cf_manager.get_block_indices(k)
                 H_block = H_features[block_indices]
-
                 X_pred_cf[block_indices] = (U_A_list[k].T @ H_block.T).T
 
-            # Final U_A: full-data estimate
             U_A_final = self._ridge_stage2(H_features, X_targets, self.lambda_B)
 
             return X_pred_cf, U_A_final
@@ -589,12 +544,11 @@ class DFStateLayer(nn.Module):
 
         optimizer_phi.zero_grad()
 
-        # Dynamically compute features with gradients
         phi_seq = self.phi_theta(X_states)
         phi_minus = phi_seq[:-1]
         phi_plus = phi_seq[1:]
 
-        # Recompute V_A dynamically (gradients flow through phi_theta)
+        # Recompute V_A with gradients flowing through phi_theta
         V_A_current = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
 
         H = (V_A_current @ phi_minus.T).T
@@ -604,7 +558,6 @@ class DFStateLayer(nn.Module):
         min_block_size = self.cf_config.get('min_block_size', 20)
 
         if T_eff < max(n_blocks * min_block_size, 100):
-            # Small data: no cross-fitting
             U_A = self._ridge_stage2(H, X_plus, self.lambda_B)
             X_pred = (U_A.T @ H.T).T
 
@@ -624,39 +577,32 @@ class DFStateLayer(nn.Module):
                 'mode': 'no_crossfitting'
             }
 
-        # Cross-fitting execution
         from .cross_fitting import CrossFittingManager
         cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
 
         k = epoch % cf_manager.n_blocks
-
         optimizer_phi.zero_grad()
 
-        # Compute H with current phi_theta
         phi_seq = self.phi_theta(X_states)
         phi_minus = phi_seq[:-1]
         phi_plus = phi_seq[1:]
         V_A_current = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
         H = (V_A_current @ phi_minus.T).T
 
-        # Compute U_A^{(-k)} on out-of-fold data
         oof_indices = cf_manager.get_out_of_fold_indices(k)
         U_A_k = self._ridge_stage2(H[oof_indices], X_plus[oof_indices], self.lambda_B)
 
-        # Predict on in-fold block
         block_indices = cf_manager.get_block_indices(k)
         X_pred_k = (U_A_k.T @ H[block_indices].T).T
 
-        # Block k loss
         pred_loss_k = torch.norm(X_pred_k - X_plus[block_indices], p='fro') ** 2 / X_plus[block_indices].size(0)
         reg_loss_k = self.lambda_B * torch.norm(U_A_k, p='fro') ** 2
         loss_k = pred_loss_k + reg_loss_k
 
         loss_k.backward()
-
         optimizer_phi.step()
 
-        # Update inference cache (recompute on full data to reflect phi_theta updates)
+        # Recompute on full data to reflect phi_theta updates
         with torch.no_grad():
             phi_seq_final = self.phi_theta(X_states)
             phi_minus_final = phi_seq_final[:-1]
@@ -725,19 +671,16 @@ class DFStateLayer(nn.Module):
         if verbose:
             print(f"Cross-fitting: T={T_eff}, n_blocks={cf_manager.n_blocks}")
 
-        # Stage-1: Transfer operator estimation (cross-fitting)
+        # Stage-1: Transfer operator estimation
         V_list = cf_fitter.cross_fit_stage1(
             Phi_minus, Phi_plus,
             self._ridge_stage1,
             reg_lambda=self.lambda_A
         )
-        
-        # Average transfer operator (final V_A)
-        self.V_A = torch.stack(V_list).mean(dim=0)
 
-        # Out-of-fold feature computation
+        self.V_A = torch.stack(V_list).mean(dim=0)
         H_cf = cf_fitter.compute_out_of_fold_features(Phi_minus, V_list)
-        
+
         # Stage-2: Readout matrix estimation
         self.U_A = cf_fitter.cross_fit_stage2(
             H_cf, X_plus,
@@ -760,13 +703,8 @@ class DFStateLayer(nn.Module):
         if verbose:
             print("Training without cross-fitting")
 
-        # Stage-1: Direct estimation
         self.V_A = self._ridge_stage1(Phi_minus, Phi_plus, self.lambda_A)
-        
-        # Intermediate features
         H = (self.V_A @ Phi_minus.T).T
-
-        # Stage-2: Readout estimation
         self.U_A = self._ridge_stage2(H, X_plus, self.lambda_B)
         
         if verbose:
@@ -795,7 +733,6 @@ class DFStateLayer(nn.Module):
         min_block_size = self.cf_config.get('min_block_size', 20)
 
         if T_eff < max(n_blocks * min_block_size, 100):
-            # Insufficient data: full-data Ridge regression (with gradients)
             V_A = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
             phi_pred = (V_A @ phi_minus.T).T
             return phi_pred, V_A
@@ -806,19 +743,14 @@ class DFStateLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # V_A estimation (cross-fitting) - with gradients for theta updates
             V_A_list = cf_fitter.cross_fit_stage1(
                 phi_minus, phi_plus,
                 stage1_estimator=lambda X, Y: self._ridge_stage1_with_grad(X, Y, self.lambda_A)
             )
 
-            # Out-of-fold prediction (with gradients)
             phi_pred_cf = cf_fitter.compute_out_of_fold_features(phi_minus, V_A_list)
-
-            # Final V_A: full-data estimate (with gradients)
             V_A_final = self._ridge_stage1_with_grad(phi_minus, phi_plus, self.lambda_A)
 
-            # Cache results
             if not hasattr(self, '_cross_fitting_cache'):
                 self._cross_fitting_cache = {}
             self._cross_fitting_cache.update({
@@ -874,7 +806,6 @@ class DFStateLayer(nn.Module):
 
             V_A = self._ridge_stage1(phi_minus, phi_plus, self.lambda_A)
 
-            # Cache V_A list for Stage-2
             if not hasattr(self, '_cross_fitting_cache'):
                 self._cross_fitting_cache = {}
             self._cross_fitting_cache.update({
@@ -935,7 +866,6 @@ class DFStateLayer(nn.Module):
             V_A = self._stage1_cache['V_A']
             U_A = self._stage2_cache['U_A']
         elif 'V_A' in self._stage1_cache:
-            # Stage-1 only: compute U_A on the fly
             V_A = self._stage1_cache['V_A']
             if 'phi_minus' in self._stage1_cache and 'X_plus' in self._stage1_cache:
                 with torch.no_grad():
@@ -995,10 +925,8 @@ class DFStateLayer(nn.Module):
                     features.append(phi_pred)
 
         if training:
-            # Phase-2: retain gradients for encoder->DF-A->decoder path
             _predict_loop()
         else:
-            # Inference: save memory with no_grad
             with torch.no_grad():
                 _predict_loop()
 
@@ -1059,25 +987,20 @@ class DFStateLayer(nn.Module):
             'phi_theta': self.phi_theta.state_dict(),
         }
 
-        # Include fitted V_A, U_A needed for filtering evaluation
         if hasattr(self, 'V_A') and self.V_A is not None:
             state_dict['V_A'] = self.V_A
         if hasattr(self, 'U_A') and self.U_A is not None:
             state_dict['U_A'] = self.U_A
 
-        # Config excluded (loaded from config file at inference)
-        # Caches excluded (not needed for inference)
-
         return state_dict
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
-        """Custom load_state_dict: also sets V_A/U_A properly."""
+        """Custom load_state_dict that also restores V_A/U_A."""
         v_a = state_dict.pop('V_A', None)
         u_a = state_dict.pop('U_A', None)
 
         super().load_state_dict(state_dict, strict=strict)
 
-        # Set V_A, U_A
         if v_a is not None:
             self.V_A = v_a.to(self.device) if hasattr(self, 'device') else v_a
         if u_a is not None:

@@ -1,11 +1,9 @@
-# src/models/encoder.py
-
 import pkgutil
 import importlib
 from pathlib import Path
 from . import architectures
 
-# Scan the architectures folder and register any <name>Encoder classes
+# Auto-register <name>Encoder classes from architectures/
 _ENCODERS: dict[str, type] = {}
 pkg_path = Path(architectures.__file__).parent
 
@@ -17,15 +15,7 @@ for module_info in pkgutil.iter_modules([str(pkg_path)]):
         _ENCODERS[name] = getattr(module, cls_name)
 
 def build_encoder(cfg):
-    """
-    Factory function for encoders.
-    Args:
-      cfg: a configuration object or dict containing:
-        - type:   the key matching one of _ENCODERS, e.g. "tcn", "_mlp"
-        - other keys: constructor arguments for that encoder class
-    Returns:
-      An instance of the selected Encoder class, initialized with cfg values.
-    """
+    """Factory: build an encoder from cfg.type (e.g. "tcn", "cnn_image")."""
     if isinstance(cfg, dict):
         cfg_type = cfg.get('type')
     else:

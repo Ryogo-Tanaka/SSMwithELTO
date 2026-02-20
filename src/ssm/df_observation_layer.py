@@ -1,5 +1,3 @@
-# src/ssm/df_observation_layer.py
-
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Dict, Any
@@ -11,8 +9,7 @@ from .cross_fitting import CrossFittingManager, TwoStageCrossFitter, CrossFittin
 class ObservationFeatureNet(nn.Module):
     """
     Observation feature map psi_omega: R^m -> R^{d_B}.
-
-    Maps multivariate features (encoder output) to a high-dimensional feature space.
+    Maps encoder output to a high-dimensional feature space.
     """
 
     def __init__(
@@ -65,11 +62,11 @@ class ObservationFeatureNet(nn.Module):
         Returns:
             torch.Tensor: Observation features (batch_size, d_B) or (d_B,)
         """
-        if m.dim() == 1:  # (m,)
-            m = m.unsqueeze(0)  # (1, m)
-            return self.net(m).squeeze(0)  # (d_B,)
-        elif m.dim() == 2:  # (batch_size, m)
-            return self.net(m)  # (batch_size, d_B)
+        if m.dim() == 1:
+            m = m.unsqueeze(0)
+            return self.net(m).squeeze(0)
+        elif m.dim() == 2:
+            return self.net(m)
         else:
             raise ValueError(f"Unsupported input shape: {m.shape}. Expected (m,) or (batch_size, m)")
 
@@ -120,10 +117,9 @@ class DFObservationLayer(nn.Module):
         self.lambda_B = float(lambda_B)
         self.lambda_dB = float(lambda_dB)
 
-        # Shared feature network (direct reference from DF-A)
+        # Shared feature network from DF-A
         self.phi_theta = df_state_layer.phi_theta
 
-        # Observation feature network psi_omega
         obs_config = obs_net_config or {}
         self.psi_omega = ObservationFeatureNet(
             input_dim=multivariate_feature_dim,
@@ -133,7 +129,6 @@ class DFObservationLayer(nn.Module):
         
         self.cf_config = cross_fitting_config or {'n_blocks': 5, 'min_block_size': 10}
 
-        # Fitted parameters
         self.V_B: Optional[torch.Tensor] = None  # Observation transfer operator (d_B, d_A)
         self.U_B: Optional[torch.Tensor] = None  # Observation readout matrix (d_B, m)
         self._is_fitted = False
@@ -169,26 +164,21 @@ class DFObservationLayer(nn.Module):
         if N < max(d_A, d_B):
             warnings.warn(f"Sample count {N} < feature dimension max({d_A}, {d_B}). May be numerically unstable")
 
-        # Gram matrix + regularization
-        PhiTPhi = Phi_instrument.T @ Phi_instrument  # (d_A, d_A)
+        PhiTPhi = Phi_instrument.T @ Phi_instrument
         PhiTPhi_reg = PhiTPhi + reg_lambda * torch.eye(d_A, device=Phi_instrument.device, dtype=Phi_instrument.dtype)
-        
-        # Cross-covariance
+
         Psi_treatment = Psi_treatment.to(Phi_instrument.device)
         PsiTPhi = Psi_treatment.T @ Phi_instrument
 
-        # Matrix inversion (numerically stabilized)
         try:
             PhiTPhi_inv = torch.linalg.inv(PhiTPhi_reg)
             V_B = PsiTPhi @ PhiTPhi_inv
         except torch.linalg.LinAlgError:
-            # Cholesky fallback
             try:
                 L = torch.linalg.cholesky(PhiTPhi_reg)
                 PhiTPhi_inv = torch.cholesky_inverse(L)
                 V_B = PsiTPhi @ PhiTPhi_inv
             except torch.linalg.LinAlgError:
-                # SVD fallback
                 U, S, Vh = torch.linalg.svd(PhiTPhi_reg)
                 S_inv = torch.where(S > 1e-10, 1.0 / S, 0.0)
                 PhiTPhi_inv = (Vh.T * S_inv) @ Vh
@@ -212,7 +202,7 @@ class DFObservationLayer(nn.Module):
 
         if N != N_t:
             raise ValueError(f"Feature-target sample count mismatch: {N} vs {N_t}")
-        PhiPhi = Phi_instrument.T @ Phi_instrument  # (d_A, d_A)
+        PhiPhi = Phi_instrument.T @ Phi_instrument
         PhiPhi_reg = PhiPhi + reg_lambda * torch.eye(d_A, device=Phi_instrument.device, dtype=Phi_instrument.dtype)
 
         Psi_treatment = Psi_treatment.to(Phi_instrument.device)
@@ -250,7 +240,6 @@ class DFObservationLayer(nn.Module):
         min_block_size = getattr(self, 'cf_config', {}).get('min_block_size', 20)
 
         if T_eff < max(n_blocks * min_block_size, 100):
-            # Insufficient data: full-data Ridge regression (with gradients)
             V_B = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
             psi_pred = (V_B @ phi_prev.T).T
             return psi_pred, V_B
@@ -261,20 +250,15 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # V_B estimation (cross-fitting, with gradients)
-            # Note: psi_curr computed with no_grad (omega frozen)
+            # psi_curr computed with no_grad (omega frozen)
             V_B_list = cf_fitter.cross_fit_stage1(
                 phi_prev, psi_curr,
                 stage1_estimator=lambda X, Y: self._ridge_stage1_vb_with_grad(X, Y, self.lambda_B)
             )
 
-            # Out-of-fold prediction (with gradients)
             psi_pred_cf = cf_fitter.compute_out_of_fold_features(phi_prev, V_B_list)
-
-            # Final V_B: full-data estimate (with gradients)
             V_B_final = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
 
-            # Cache results
             if not hasattr(self, '_cross_fitting_cache'):
                 self._cross_fitting_cache = {}
             self._cross_fitting_cache.update({
@@ -301,12 +285,10 @@ class DFObservationLayer(nn.Module):
         reg_lambda: float
     ) -> torch.Tensor:
         """
-        Stage-2 Ridge regression: observation readout matrix estimation (multivariate).
-
-        U_B = (H H^T + lambda I)^{-1} H M^T
+        Stage-2 Ridge regression: U_B = (H^T H + lambda I)^{-1} H^T M.
 
         Args:
-            H_instrument: Cross-fitted instrumental variable features (N, d_B)
+            H_instrument: Cross-fitted features (N, d_B)
             M_target: Target multivariate features (N, m)
             reg_lambda: Regularization parameter lambda_{dB}
 
@@ -328,13 +310,11 @@ class DFObservationLayer(nn.Module):
             HHt_inv = torch.linalg.inv(HHt_reg)
             U_B = HHt_inv @ HM
         except torch.linalg.LinAlgError:
-            # Cholesky fallback
             try:
                 L = torch.linalg.cholesky(HHt_reg)
                 HHt_inv = torch.cholesky_inverse(L)
                 U_B = HHt_inv @ HM
             except torch.linalg.LinAlgError:
-                # SVD fallback
                 U, S, Vh = torch.linalg.svd(HHt_reg)
                 S_inv = torch.where(S > 1e-10, 1.0 / S, 0.0)
                 HHt_inv = (Vh.T * S_inv) @ Vh
@@ -407,21 +387,17 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # U_B estimation (cross-fitting, with gradients)
-            # Note: H_features has gradients (omega-dependent)
             U_B_list = cf_fitter.cross_fit_stage2_matrix(
                 H_features, M_target,
                 stage2_estimator=lambda H, M: self._ridge_stage2_ub_matrix_with_grad(H, M, self.lambda_dB)
             )
 
-            # Out-of-fold prediction (with gradients)
             M_pred_cf = torch.zeros_like(M_target)
             for k in range(cf_manager.n_blocks):
                 block_indices = cf_manager.get_block_indices(k)
                 H_block = H_features[block_indices]
                 M_pred_cf[block_indices] = H_block @ U_B_list[k]
 
-            # Final U_B: full-data estimate (with gradients)
             U_B_final = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
 
             return M_pred_cf, U_B_final
@@ -433,11 +409,11 @@ class DFObservationLayer(nn.Module):
         except Exception as e:
             print(f"U_B cross-fitting failed, using standard method: {e}")
             U_B = self._ridge_stage2_ub_matrix_with_grad(H_features, M_target, self.lambda_dB)
-            M_pred = H_features @ U_B  # (T-1, d_B) @ (d_B, m) = (T-1, m)
+            M_pred = H_features @ U_B
             return M_pred, U_B
 
     def _freeze_parameters(self, module: nn.Module) -> Dict[str, torch.Tensor]:
-        """Temporarily freeze parameters and save their original state."""
+        """Temporarily freeze parameters and save original requires_grad state."""
         original_states = {}
         for name, param in module.named_parameters():
             original_states[name] = param.requires_grad
@@ -499,7 +475,6 @@ class DFObservationLayer(nn.Module):
         if T_x < 2:
             raise ValueError(f"Sequence too short: T={T_x}")
 
-        # Freeze psi_omega parameters
         psi_original_states = {}
         if fix_psi_omega:
             psi_original_states = self._freeze_parameters(self.psi_omega)
@@ -507,14 +482,11 @@ class DFObservationLayer(nn.Module):
         try:
             optimizer_phi.zero_grad()
 
-            # Instrumental variable features (phi_theta, with gradients)
             phi_instrument = self.phi_theta(X_hat_states)
 
-            # Observation features (psi_omega frozen, no gradients)
             with torch.no_grad():
-                psi_obs = self.psi_omega(m_features)  # (T, d_B)
+                psi_obs = self.psi_omega(m_features)
 
-            # Time alignment
             phi_prev = phi_instrument[:-1]
             psi_curr = psi_obs[1:]
 
@@ -523,7 +495,6 @@ class DFObservationLayer(nn.Module):
             min_block_size = self.cf_config.get('min_block_size', 20)
 
             if T_eff < max(n_blocks * min_block_size, 100):
-                # Small data: no cross-fitting
                 V_B = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
                 psi_pred = (V_B @ phi_prev.T).T
 
@@ -534,7 +505,6 @@ class DFObservationLayer(nn.Module):
                 loss_stage1.backward()
                 optimizer_phi.step()
 
-                # Update cache
                 with torch.no_grad():
                     self._stage1_cache = {
                         'V_B': V_B,
@@ -551,7 +521,6 @@ class DFObservationLayer(nn.Module):
                     'mode': 'no_crossfitting'
                 }
 
-            # Cross-fitting execution
             from .cross_fitting import CrossFittingManager
 
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
@@ -560,30 +529,25 @@ class DFObservationLayer(nn.Module):
 
             optimizer_phi.zero_grad()
 
-            # Compute instrumental variable features with current phi_theta
             phi_instrument = self.phi_theta(X_hat_states)
             phi_prev = phi_instrument[:-1]
 
-            # Observation features (psi_omega frozen)
             with torch.no_grad():
                 psi_obs = self.psi_omega(m_features)
                 psi_curr = psi_obs[1:]
 
-            # Out-of-fold indices
             oof_indices = cf_manager.get_out_of_fold_indices(k)
             phi_prev_oof = phi_prev[oof_indices]
             psi_curr_oof = psi_curr[oof_indices]
 
             V_B_k = self._ridge_stage1_vb_with_grad(phi_prev_oof, psi_curr_oof, self.lambda_B)
 
-            # In-fold indices
             block_indices = cf_manager.get_block_indices(k)
             phi_prev_block = phi_prev[block_indices]
             psi_curr_block = psi_curr[block_indices]
 
             psi_pred_block = (V_B_k @ phi_prev_block.T).T
 
-            # Block k loss
             prediction_loss_k = torch.norm(psi_pred_block - psi_curr_block, p='fro') ** 2 / psi_curr_block.size(0)
             regularization_loss_k = self.lambda_B * torch.norm(V_B_k, p='fro') ** 2
             loss_k = prediction_loss_k + regularization_loss_k
@@ -591,11 +555,9 @@ class DFObservationLayer(nn.Module):
             loss_k.backward()
             optimizer_phi.step()
 
-            # Update cache
             with torch.no_grad():
                 phi_final = self.phi_theta(X_hat_states)
                 psi_final = self.psi_omega(m_features)
-
                 phi_prev_final = phi_final[:-1]
                 psi_curr_final = psi_final[1:]
                 V_B_final = self._ridge_stage1_vb(phi_prev_final, psi_curr_final, self.lambda_B)
@@ -616,11 +578,9 @@ class DFObservationLayer(nn.Module):
             }
 
         finally:
-            # Restore psi_omega parameters
             if fix_psi_omega and psi_original_states:
                 self._restore_parameters(self.psi_omega, psi_original_states)
 
-    
     def train_stage2_with_gradients(
             self,
             M_features: torch.Tensor,
@@ -648,7 +608,6 @@ class DFObservationLayer(nn.Module):
         if 'V_B' not in self._stage1_cache:
             raise RuntimeError("Stage-1 must be executed first")
 
-        # Freeze phi_theta parameters
         phi_original_states = {}
         if fix_phi_theta:
             phi_original_states = self._freeze_parameters(self.phi_theta)
@@ -663,21 +622,18 @@ class DFObservationLayer(nn.Module):
 
             optimizer_psi.zero_grad()
 
-            # Dynamically compute V_B (psi_omega gradients, phi_theta frozen)
             psi_obs_current = self.psi_omega(M_features)
             psi_curr_grad = psi_obs_current[1:T_eff+1]
 
             V_B_current = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr_grad, self.lambda_B)
 
-            # Compute H (with psi_omega gradients)
             H = (V_B_current @ phi_prev.T).T
             n_blocks = self.cf_config.get('n_blocks', 5)
             min_block_size = self.cf_config.get('min_block_size', 20)
 
             if T_eff < max(n_blocks * min_block_size, 100):
-                # Small data: no cross-fitting
                 U_B = self._ridge_stage2_ub_matrix_with_grad(H, M_curr, self.lambda_dB)
-                M_pred = H @ U_B  # (T-1, m)
+                M_pred = H @ U_B
 
                 prediction_loss = torch.norm(M_pred - M_curr, p='fro') ** 2 / M_curr.size(0)
                 regularization_loss = self.lambda_dB * torch.norm(U_B, p='fro') ** 2
@@ -695,29 +651,23 @@ class DFObservationLayer(nn.Module):
                     'mode': 'no_crossfitting'
                 }
 
-            # Cross-fitting execution
             from .cross_fitting import CrossFittingManager
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
 
             k = epoch % cf_manager.n_blocks
-
             optimizer_psi.zero_grad()
 
-            # Compute H with current psi_omega
             psi_obs_current = self.psi_omega(M_features)
             psi_curr_grad = psi_obs_current[1:T_eff+1]
             V_B_current = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr_grad, self.lambda_B)
             H = (V_B_current @ phi_prev.T).T
 
-            # Compute U_B^{(-k)} on out-of-fold data
             oof_indices = cf_manager.get_out_of_fold_indices(k)
             U_B_k = self._ridge_stage2_ub_matrix_with_grad(H[oof_indices], M_curr[oof_indices], self.lambda_dB)
 
-            # Predict on in-fold block
             block_indices = cf_manager.get_block_indices(k)
             M_pred_k = H[block_indices] @ U_B_k
 
-            # Block k loss
             pred_loss_k = torch.norm(M_pred_k - M_curr[block_indices], p='fro') ** 2 / M_curr[block_indices].size(0)
             reg_loss_k = self.lambda_dB * torch.norm(U_B_k, p='fro') ** 2
             loss_k = pred_loss_k + reg_loss_k
@@ -725,7 +675,7 @@ class DFObservationLayer(nn.Module):
             loss_k.backward()
             optimizer_psi.step()
 
-            # Update inference cache (recompute on full data to reflect updates)
+            # Recompute on full data to reflect psi_omega updates
             with torch.no_grad():
                 X_hat_states = self._stage1_cache['X_hat']
                 phi_final = self.phi_theta(X_hat_states)
@@ -747,7 +697,6 @@ class DFObservationLayer(nn.Module):
             }
 
         finally:
-            # Restore phi_theta parameters
             if fix_phi_theta and phi_original_states:
                 self._restore_parameters(self.phi_theta, phi_original_states)
 
@@ -780,14 +729,12 @@ class DFObservationLayer(nn.Module):
         if T_x < 2:
             raise ValueError(f"Time series too short: T={T_x}")
 
-        # Instrumental variable features (from state predictions)
         with torch.no_grad():
-            Phi_instrument = self.phi_theta(X_hat_states)  # (T, d_A)
-        
+            Phi_instrument = self.phi_theta(X_hat_states)
+
         with torch.no_grad():
             Psi_obs = self.psi_omega(M_features)
 
-        # Time alignment: predict current observation at next step
         Phi_prev = Phi_instrument[:-1]
         Psi_curr = Psi_obs[1:]
         M_curr = M_features[1:]
@@ -815,20 +762,17 @@ class DFObservationLayer(nn.Module):
         if verbose:
             print(f"DF-B cross-fitting: T={T_eff}, n_blocks={cf_manager.n_blocks}")
 
-        # Stage-1: Observation transfer operator estimation (cross-fitting)
+        # Stage-1: Observation transfer operator estimation
         VB_list = cf_fitter.cross_fit_stage1(
             Phi_prev, Psi_curr,
             self._ridge_stage1_vb,
             reg_lambda=self.lambda_B
         )
-        
-        # Average observation transfer operator (final V_B)
-        self.V_B = torch.stack(VB_list).mean(dim=0)
 
-        # Out-of-fold instrumental variable feature computation
+        self.V_B = torch.stack(VB_list).mean(dim=0)
         H_cf = cf_fitter.compute_out_of_fold_features(Phi_prev, VB_list)
-        
-        # Stage-2: Observation readout matrix estimation (multivariate)
+
+        # Stage-2: Observation readout matrix estimation
         U_B_list = cf_fitter.cross_fit_stage2_matrix(
             H_cf, M_curr,
             self._ridge_stage2_ub_matrix,
@@ -836,7 +780,6 @@ class DFObservationLayer(nn.Module):
             reg_lambda=self.lambda_dB
         )
 
-        # Average U_B matrix (final U_B)
         self.U_B = torch.stack(U_B_list).mean(dim=0)
 
         if verbose:
@@ -853,12 +796,8 @@ class DFObservationLayer(nn.Module):
         if verbose:
             print("DF-B training without cross-fitting (multivariate)")
 
-        # Stage-1: Direct estimation
         self.V_B = self._ridge_stage1_vb(Phi_prev, Psi_curr, self.lambda_B)
-
         H = (self.V_B @ Phi_prev.T).T
-
-        # Stage-2: Readout matrix estimation (multivariate)
         self.U_B = self._ridge_stage2_ub_matrix(H, M_curr, self.lambda_dB)
 
         if verbose:
@@ -889,7 +828,6 @@ class DFObservationLayer(nn.Module):
             )
 
         if not self._is_fitted:
-            # Also accept cached results from stage1/stage2
             if 'V_B' in self._stage1_cache and 'U_B' in self._stage2_cache:
                 V_B = self._stage1_cache['V_B']
                 U_B = self._stage2_cache['U_B']
@@ -899,17 +837,15 @@ class DFObservationLayer(nn.Module):
             V_B = self.V_B
             U_B = self.U_B
         
-        # State feature map (shared phi_theta)
         phi_prev = self.phi_theta(x_hat_prev)
 
-        # Apply observation transfer operator + readout (ensure GPU device consistency)
         V_B = V_B.to(phi_prev.device)
         U_B = U_B.to(phi_prev.device)
         if phi_prev.dim() == 1:
-            h_pred = V_B @ phi_prev  # (d_B,)
-            return U_B.T @ h_pred    # (m,) - scalar input: U_B^T @ h
+            h_pred = V_B @ phi_prev
+            return U_B.T @ h_pred
         else:
-            h_pred = (V_B @ phi_prev.T).T  # (batch, d_B)
+            h_pred = (V_B @ phi_prev.T).T
             return h_pred @ U_B
     
     def predict_sequence(
@@ -985,28 +921,20 @@ class DFObservationLayer(nn.Module):
             'psi_omega': self.psi_omega.state_dict(),
         }
 
-        # Include trained V_B, U_B needed for filtering evaluation
         if hasattr(self, 'V_B') and self.V_B is not None:
             state_dict['V_B'] = self.V_B
         if hasattr(self, 'U_B') and self.U_B is not None:
             state_dict['U_B'] = self.U_B
 
-        # phi_theta is shared from df_state_layer at inference, no need to save
-        # Config excluded (loaded from config file at inference)
-        # Caches excluded (not needed for inference)
-
         return state_dict
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
-        """Custom load_state_dict: also restores V_B/U_B properly."""
-        # Handle V_B, U_B separately
+        """Custom load_state_dict that also restores V_B/U_B."""
         v_b = state_dict.pop('V_B', None)
         u_b = state_dict.pop('U_B', None)
 
-        # Load standard parameters
         super().load_state_dict(state_dict, strict=strict)
 
-        # Restore V_B, U_B
         if v_b is not None:
             self.V_B = v_b.to(self.device) if hasattr(self, 'device') else v_b
         if u_b is not None:

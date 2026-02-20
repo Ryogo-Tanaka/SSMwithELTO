@@ -1,8 +1,4 @@
-"""
-Hankel delay embedding for time series preprocessing.
-
-Converts low-dimensional time series to higher-dimensional delay-embedded
-observations suitable for encoder input.
+"""Hankel delay embedding for time series preprocessing.
 
 Usage:
     VDP: hankel_embed(y, 30)  # (T,) -> (T-29, 30)

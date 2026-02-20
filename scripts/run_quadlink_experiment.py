@@ -12,9 +12,9 @@ Features:
 
 Usage:
 python scripts/run_quadlink_experiment.py \
-    --config configs/full_experiment_config.yaml \
-    --data data/sim_complex.npz \
-    --output results/full_experiment_001 \
+    --config configs/quad_image_reconstruction_config.yaml \
+    --data data/quad1_n.npz \
+    --output results/experiment_001 \
     --use-kalman
 """
 
@@ -946,7 +946,7 @@ class FullExperimentPipeline:
                 'test_data_shape': list(test_targets.shape),
                 'predictions_shape': list(test_predictions.shape),
                 'selected_metrics': selected_metrics,
-                'model_architecture': 'RKN'
+                'model_architecture': 'cnn_image'
             }
 
             saved_metrics_file = target_evaluator.save_target_metrics_results(
@@ -1036,7 +1036,7 @@ class FullExperimentPipeline:
                 'test_data_shape': list(test_originals.shape),
                 'reconstructions_shape': list(test_reconstructions.shape),
                 'selected_metrics': selected_metrics,
-                'model_architecture': 'RKN'
+                'model_architecture': 'cnn_image'
             }
 
             saved_metrics_file = reconstruction_evaluator.save_reconstruction_metrics_results(

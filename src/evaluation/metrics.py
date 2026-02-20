@@ -517,7 +517,6 @@ class TargetPredictionMetrics:
         Returns:
             List of generated file paths.
         """
-        # Visualization not yet implemented; use numerical output instead
         generated_files = []
         return generated_files
 
@@ -661,7 +660,6 @@ class ReconstructionMetrics:
         Returns:
             List of generated file paths.
         """
-        # Visualization not yet implemented; use numerical output instead
         generated_files = []
         return generated_files
 
@@ -705,7 +703,6 @@ class ReconstructionMetrics:
                 true_t = y_true[t].flatten()
                 pred_t = y_pred[t].flatten()
 
-                # Pearson correlation
                 if torch.std(true_t) > 1e-8 and torch.std(pred_t) > 1e-8:
                     corr = torch.corrcoef(torch.stack([true_t, pred_t]))[0, 1].item()
                     if not torch.isnan(torch.tensor(corr)):

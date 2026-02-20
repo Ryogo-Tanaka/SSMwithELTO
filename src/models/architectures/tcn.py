@@ -1,4 +1,4 @@
-# src/models/architectures/tcn.py (encoder only)
+# src/models/architectures/tcn.py
 
 import math
 from typing import Optional, Tuple, List, Dict, Any
