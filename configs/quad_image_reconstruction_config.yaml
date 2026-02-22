@@ -73,7 +73,6 @@ ssm:
     encoder_output_dim: 100     # Table 6: m=100
     ridge_param: 1e-3
     jitter: 1e-6
-    m: 100                      # Table 6: m=100
 
     feature_mapping:
       type: "mlp"

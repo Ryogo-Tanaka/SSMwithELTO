@@ -65,7 +65,6 @@ ssm:
     encoder_output_dim: 50    # Paper Table 8: m=50
     ridge_param: 1e-3
     jitter: 1e-6
-    m: 50                     # Paper Table 8: m=50
 
     feature_mapping:
       type: "mlp"

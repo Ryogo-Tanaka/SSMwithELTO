@@ -38,7 +38,6 @@ class StochasticRealizationWithEncoder(nn.Module):
         rank: int = 8,
         ridge_param: float = 1e-3,
         jitter: float = 1e-8,
-        m: int = 500,
         device: str = 'cpu',
         feature_mapping_type: str = "averaging",
         feature_mapping_hidden_dims: Optional[List[int]] = None,
@@ -51,7 +50,6 @@ class StochasticRealizationWithEncoder(nn.Module):
             rank: State dimension r (number of top canonical directions)
             ridge_param: Ridge regularization parameter lambda
             jitter: Minimum eigenvalue clipping for numerical stability
-            m: Number of samples for lag-covariance estimation
             device: Computation device
         """
         super().__init__()
@@ -61,7 +59,6 @@ class StochasticRealizationWithEncoder(nn.Module):
         self.num_components = int(rank)
         self.ridge_param = float(ridge_param)
         self.min_eigenvalue = float(jitter)
-        self.m = int(m)
         self.device = device
 
         if encoder_output_dim is not None:

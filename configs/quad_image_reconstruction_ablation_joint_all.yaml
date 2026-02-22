@@ -72,7 +72,6 @@ ssm:
     encoder_output_dim: 50   # encoder output dimension
     ridge_param: 1e-3
     jitter: 1e-6
-    m: 50                  # lag covariance estimation samples
 
     feature_mapping:
       type: "mlp"      # averaging | linear | mlp

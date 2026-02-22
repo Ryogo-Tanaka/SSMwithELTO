@@ -180,7 +180,6 @@ def build_realization(ckpt: Dict, config: Dict, encoder: nn.Module,
         rank=int(real_cfg.get('rank', 20)),
         ridge_param=float(real_cfg.get('ridge_param', 1e-3)),
         jitter=float(real_cfg.get('jitter', 1e-6)),
-        m=int(real_cfg.get('m', 100)),
         device=str(device),
         feature_mapping_type=fm_cfg.get('type', 'mlp'),
         feature_mapping_hidden_dims=fm_cfg.get('hidden_dims', [32]),
@@ -216,7 +215,7 @@ def build_realization(ckpt: Dict, config: Dict, encoder: nn.Module,
     for p in realization.parameters():
         p.requires_grad = False
     print(f"  Realization: h={realization.h}, r={realization.rank}, "
-          f"m={realization.m}, mapping={realization.feature_mapping_type}")
+          f"feature_dim={realization.feature_dim}, mapping={realization.feature_mapping_type}")
     return realization
 
 

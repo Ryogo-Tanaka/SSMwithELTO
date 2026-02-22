@@ -332,7 +332,6 @@ class TwoStageTrainer:
                 rank=realization_config_copy.get('rank', 8),
                 ridge_param=realization_config_copy.get('ridge_param', 1e-3),
                 jitter=realization_config_copy.get('jitter', 1e-8),
-                m=realization_config_copy.get('m', 500),
                 device=str(device),
                 feature_mapping_type=feature_mapping_cfg.get('type', 'averaging'),
                 feature_mapping_hidden_dims=feature_mapping_cfg.get('hidden_dims', None),
@@ -2198,8 +2197,13 @@ def create_trainer_from_config(config_path: str, device: torch.device, output_di
     realization_config = config['ssm']['realization']
     if config.get('evaluation', {}).get('use_new_realization', True):
         realization_config_copy = realization_config.copy()
+        feature_mapping_cfg = realization_config_copy.pop('feature_mapping', {})
+        realization_config_copy.pop('m', None)
         realization = StochasticRealizationWithEncoder(
             encoder=encoder,
+            feature_mapping_type=feature_mapping_cfg.get('type', 'averaging'),
+            feature_mapping_hidden_dims=feature_mapping_cfg.get('hidden_dims', None),
+            feature_mapping_activation=feature_mapping_cfg.get('activation', 'relu'),
             **realization_config_copy
         )
     else:
