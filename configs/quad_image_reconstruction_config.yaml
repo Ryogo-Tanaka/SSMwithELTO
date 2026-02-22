@@ -49,7 +49,7 @@ model:
 
 training:
   epochs: 25                  # 5 warmup + 20 active (per Table 6)
-  T1_iterations: 1            # No effect on Phase 2 rec_loss (verified in v2 experiment)
+  T1_iterations: 1
   T2_iterations: 1
   phase1_warmup_epochs: 5     # Table 6: Stage-1 = 5 epochs
 
@@ -57,13 +57,13 @@ training:
   target_loss_weight: 0.0
   reconstruction_loss_weight: 1.0
 
-  lr_phi: 1e-3                # v4: 1e-4 -> 1e-3 (restored to code default, improves Phase 1)
-  lr_psi: 1e-3                # v4: 1e-4 -> 1e-3 (restored to code default, improves Phase 1)
+  lr_phi: 1e-3                # Adam default
+  lr_psi: 1e-3                # Adam default
   weight_decay: 1e-6
 
-  lr_encoder: 1e-3            # v5: 1e-5 -> 1e-3 (Adam default; Phase 2 encoder grad=0.005 was too small)
-  lr_decoder: 1e-3            # v5: 1e-4 -> 1e-3 (Adam default; rec_loss was decoder-dominated)
-  lambda_cca: 0.0001          # v4: 0.001 -> 0.0001 (restored to v1 value, rec_loss/CCA tradeoff)
+  lr_encoder: 1e-3            # Adam default
+  lr_decoder: 1e-3            # Adam default
+  lambda_cca: 0.0001          # CCA loss weight
   update_strategy: "encoder_decoder_only"
 
 ssm:

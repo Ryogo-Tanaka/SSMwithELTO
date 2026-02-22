@@ -1,7 +1,7 @@
 # ====================================================================
 # SL (Stuart-Landau) Oscillator Mode Decomposition Config (Paper Table 10)
-# Encoder: MLP 20->64->64->50 (tanh)
-# Decoder: MLP 50->64->64->20 (linear output)
+# Encoder: MLP 20->128->128->64->50 (3 hidden layers, tanh)
+# Decoder: MLP 50->64->128->128->20 (3 hidden layers, tanh)
 # Realization: r=13, past_horizon=20, encoder_output_dim=50
 # DF-A: feature_dim=30 (dA=30), lambda_A=0.01
 # DF-B: obs_feature_dim=30 (dB=30), multivariate_feature_dim=50
@@ -24,7 +24,7 @@ model:
     input_dim: 20             # Hankel: 2D obs x window 10 = 20
     output_dim: 50            # Paper Table 10: encoder output = 50
     architecture: "mlp"
-    hidden_dims: [64, 64]     # Paper Table 10: 2 hidden layers of 64
+    hidden_dims: [128, 128, 64]  # Large MLP: 3 hidden layers
     activation: "Tanh"        # Paper Table 10: tanh
     dropout: 0.0
     normalize_input: false
@@ -36,7 +36,7 @@ model:
     input_dim: 50             # Must match encoder output_dim
     output_dim: 20            # Must match encoder input_dim (Hankel: 2D x 10)
     architecture: "mlp"
-    hidden_dims: [64, 64]     # Paper Table 10: 2 hidden layers of 64
+    hidden_dims: [64, 128, 128]  # Large MLP: 3 hidden layers (mirror of encoder)
     activation: "Tanh"        # Internal activation (output is linear)
     dropout: 0.0
 
@@ -68,7 +68,7 @@ ssm:
 
     feature_mapping:
       type: "mlp"
-      hidden_dims: [64]       # Larger hidden for m=100 (VDP uses [32] for m=50)
+      hidden_dims: [64]       # hidden_dims=[64] (VDP uses [32])
       activation: "relu"
 
   df_state:

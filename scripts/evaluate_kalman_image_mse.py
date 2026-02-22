@@ -9,7 +9,7 @@ Evaluates a trained model's Image Prediction MSE using three methods:
 
 Usage:
   PYTHONUNBUFFERED=1 python scripts/evaluate_kalman_image_mse.py \
-    --model results/phase_c_clean_1500_v3/seed1/models/final_model.pth \
+    --model results/quadlink_seed1/models/final_model.pth \
     --data data/rkn_quad/quad1_n.npz \
     --output results/kalman_eval \
     --device cuda
@@ -58,7 +58,7 @@ def compute_image_mse_per_timestep(y_true: torch.Tensor, y_pred: torch.Tensor) -
 def load_checkpoint(model_path: str) -> Tuple[Dict, Dict]:
     """Load checkpoint and config."""
     print(f"Loading checkpoint: {model_path}")
-    # Register legacy module alias for checkpoints saved before Phase E rename
+    # Backward compatibility: legacy module name 'rkn' -> 'cnn_image'
     import src.models.architectures.cnn_image as _cnn_image_module
     sys.modules['src.models.architectures.rkn'] = _cnn_image_module
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
@@ -685,7 +685,6 @@ def main():
         s3 = results['step3_kalman_feature']
         print(f"  Step 3 (Kalman+FS):  MSE = {s3['mse_post_warmup']:.6f}, "
               f"RMSE = {s3['rmse_post_warmup']:.6f}")
-    print(f"  Paper Table 1 target: MSE = 0.2006 (clean-1.5k)")
     print("=" * 60)
 
     # Save results (summary without per-timestep data)

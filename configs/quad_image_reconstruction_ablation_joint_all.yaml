@@ -14,6 +14,7 @@ data:
   normalization: "unit_scale"  # [0,255] -> [0,1]
   batch_size: 300
   image_shape: [48, 48, 1]    # (H, W, C)
+  paper_data_protocol: true    # train_obs->train, test_obs->eval (same as main config)
 
 model:
   encoder:

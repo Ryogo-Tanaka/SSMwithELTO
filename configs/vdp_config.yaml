@@ -1,7 +1,7 @@
 # ====================================================================
 # VDP Oscillator Mode Decomposition Config (Paper Table 8)
-# Encoder: MLP 30->64->64->50 (tanh)
-# Decoder: MLP 50->64->64->30 (linear output)
+# Encoder: MLP 30->128->128->64->50 (3 hidden layers, tanh)
+# Decoder: MLP 50->64->128->128->30 (3 hidden layers, tanh)
 # Realization: r=9, past_horizon=20, encoder_output_dim=50
 # DF-A: feature_dim=30 (dA=30), lambda_A=0.01
 # DF-B: obs_feature_dim=30 (dB=30), multivariate_feature_dim=50
@@ -24,7 +24,7 @@ model:
     input_dim: 30             # Hankel window size
     output_dim: 50            # Paper Table 8: m=50
     architecture: "mlp"
-    hidden_dims: [64, 64]     # Paper Table 8: 2 hidden layers of 64
+    hidden_dims: [128, 128, 64]  # Large MLP: 3 hidden layers
     activation: "Tanh"        # Paper Table 8: tanh
     dropout: 0.0
     normalize_input: false
@@ -36,7 +36,7 @@ model:
     input_dim: 50             # Must match encoder output_dim
     output_dim: 30            # Must match encoder input_dim (Hankel window)
     architecture: "mlp"
-    hidden_dims: [64, 64]     # Paper Table 8: 2 hidden layers of 64
+    hidden_dims: [64, 128, 128]  # Large MLP: 3 hidden layers (mirror of encoder)
     activation: "Tanh"        # Internal activation (output is linear)
     dropout: 0.0
 

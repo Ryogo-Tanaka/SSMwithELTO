@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Seed Evaluation Pipeline for Paper Table 1 Reproduction
+Multi-Seed Evaluation Pipeline
 
 Orchestrates training and Kalman filtering evaluation across multiple data seeds
 for all conditions (clean/noisy x 1.5k/15k).
@@ -13,34 +13,34 @@ Usage:
     # Clean-1.5k (default condition)
     PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition clean-1.5k \
-        --base-output results/phase_c_clean_1500_v3 \
+        --base-output results/clean_1500 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 1,2,3,4,5
 
     # Noisy-1.5k
     PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition noisy-1.5k \
-        --base-output results/phase_c_noisy_1500_v3 \
+        --base-output results/noisy_1500 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 1,2,3,4,5
 
     # Clean-15k (single data file, all seeds share quad_long_n.npz)
     PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition clean-15k \
-        --base-output results/phase_c_clean_15000_v3 \
+        --base-output results/clean_15000 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 1,2,3,4,5
 
     # Aggregate only (skip training and evaluation)
     PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition noisy-1.5k \
-        --base-output results/phase_c_noisy_1500_v3 \
+        --base-output results/noisy_1500 \
         --aggregate-only
 
     # Retry specific seeds
     PYTHONUNBUFFERED=1 python scripts/run_multiseed_evaluation.py \
         --condition noisy-1.5k \
-        --base-output results/phase_c_noisy_1500_v3 \
+        --base-output results/noisy_1500 \
         --config configs/quad_image_reconstruction_config.yaml \
         --device cuda --seeds 3,4
 """
@@ -89,11 +89,11 @@ CONDITION_CONFIG = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="5-Seed Evaluation Pipeline for Paper Table 1 Reproduction"
+        description="5-Seed Evaluation Pipeline"
     )
     parser.add_argument(
         "--base-output", type=str,
-        default=str(PROJECT_ROOT / "results" / "phase_c_clean_1500"),
+        default=str(PROJECT_ROOT / "results" / "clean_1500"),
         help="Base output directory for all 5 seeds"
     )
     parser.add_argument(
@@ -357,8 +357,8 @@ def aggregate_results(results_per_seed, summary_dir, condition_name, paper_mean,
     txt_path = summary_dir / "table1_comparison.txt"
     with open(txt_path, "w") as f:
         f.write("=" * 65 + "\n")
-        f.write(f"Phase C: {condition_name} 5-Seed Evaluation Results\n")
-        f.write("Paper Table 1 Reproduction (DSE method)\n")
+        f.write(f"{condition_name} 5-Seed Evaluation Results\n")
+        f.write("DSE 5-Seed Evaluation Results\n")
         f.write("=" * 65 + "\n\n")
 
         f.write(f"{'Seed':<8} {'Kalman+RT MSE':<18} {'Direct MSE':<18}\n")
@@ -425,7 +425,7 @@ def main():
     eval_timeout = 6000 if is_15k else 600         # 100min or 10min
 
     print("=" * 65)
-    print(f"Phase C: {condition_name} 5-Seed Evaluation Pipeline")
+    print(f"{condition_name} 5-Seed Evaluation Pipeline")
     print("=" * 65)
     print(f"  Condition: {condition_name}")
     print(f"  Seeds: {seeds}")
