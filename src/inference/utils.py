@@ -524,9 +524,26 @@ def create_multivariate_kalman_filter(
 
     # Retrieve trained parameters
     V_A = df_state_layer.get_state_operator()  # (d_A, d_A)
-    U_A = df_state_layer.get_readout_matrix()  # (d_A, r)
     V_B = df_obs_layer.get_observation_operator()  # (d_B, d_A)
-    U_B = df_obs_layer.get_readout_matrix()  # (d_B, m)
+
+    # Readout: linear (U_A/U_B) or nonlinear (readout_net)
+    readout_type_A = getattr(df_state_layer, 'readout_type', 'linear')
+    readout_type_B = getattr(df_obs_layer, 'readout_type', 'linear')
+
+    U_A = None
+    U_B = None
+    readout_A = None
+    readout_B = None
+
+    if readout_type_A == 'nonlinear' and hasattr(df_state_layer, 'readout_net') and df_state_layer.readout_net is not None:
+        readout_A = df_state_layer.readout_net
+    else:
+        U_A = df_state_layer.get_readout_matrix()  # (d_A, r)
+
+    if readout_type_B == 'nonlinear' and hasattr(df_obs_layer, 'readout_net') and df_obs_layer.readout_net is not None:
+        readout_B = df_obs_layer.readout_net
+    else:
+        U_B = df_obs_layer.get_readout_matrix()  # (d_B, m)
 
     # Get dimensions
     d_A = V_A.size(0)
@@ -551,7 +568,9 @@ def create_multivariate_kalman_filter(
         R=R,
         encoder=encoder,
         df_obs_layer=df_obs_layer,
-        device=device
+        device=device,
+        readout_A=readout_A,
+        readout_B=readout_B
     )
 
     return kalman_filter
@@ -708,7 +727,15 @@ def batch_multivariate_filtering(
     batch_size, T, n = observation_sequences.shape
 
     # Get dimension info
-    r = df_state_layer.get_readout_matrix().size(1)  # Original state dimension
+    readout_type_A = getattr(df_state_layer, 'readout_type', 'linear')
+    if readout_type_A == 'nonlinear' and hasattr(df_state_layer, 'readout_net') and df_state_layer.readout_net is not None:
+        # Probe readout_net to determine r
+        with torch.no_grad():
+            dA = df_state_layer.get_state_operator().size(0)
+            probe_output = df_state_layer.readout_net(torch.zeros(dA, device=device))
+            r = probe_output.size(0)
+    else:
+        r = df_state_layer.get_readout_matrix().size(1)  # Original state dimension
     d_B = df_obs_layer.get_observation_operator().size(0)  # Observation feature dimension
 
     # Result storage
@@ -782,20 +809,41 @@ def validate_multivariate_kalman_setup(
         # Get dimensions
         V_A = df_state_layer.get_state_operator()
         V_B = df_obs_layer.get_observation_operator()
-        U_A = df_state_layer.get_readout_matrix()
-        U_B = df_obs_layer.get_readout_matrix()
 
         d_A = V_A.size(0)
         d_B = V_B.size(0)
-        r = U_A.size(1)
-        m = U_B.size(1)
+
+        # Determine readout type and dimensions
+        readout_type_A = getattr(df_state_layer, 'readout_type', 'linear')
+        readout_type_B = getattr(df_obs_layer, 'readout_type', 'linear')
+
+        U_A = None
+        U_B = None
+
+        if readout_type_A == 'nonlinear' and hasattr(df_state_layer, 'readout_net') and df_state_layer.readout_net is not None:
+            with torch.no_grad():
+                probe_output = df_state_layer.readout_net(torch.zeros(d_A))
+                r = probe_output.size(0)
+        else:
+            U_A = df_state_layer.get_readout_matrix()
+            r = U_A.size(1)
+
+        if readout_type_B == 'nonlinear' and hasattr(df_obs_layer, 'readout_net') and df_obs_layer.readout_net is not None:
+            with torch.no_grad():
+                probe_output = df_obs_layer.readout_net(torch.zeros(d_B))
+                m = probe_output.size(0)
+        else:
+            U_B = df_obs_layer.get_readout_matrix()
+            m = U_B.size(1)
 
         validation_results["dimension_info"] = {
             "d_A": d_A,
             "d_B": d_B,
             "r": r,
             "m": m,
-            "observation_dim": sample_observation.numel()
+            "observation_dim": sample_observation.numel(),
+            "readout_type_A": readout_type_A,
+            "readout_type_B": readout_type_B
         }
 
         # Dimension consistency check
@@ -807,11 +855,12 @@ def validate_multivariate_kalman_setup(
             validation_results["errors"].append(f"V_B dimension mismatch: expected ({d_B}, {d_A}), got {V_B.shape}")
             validation_results["valid"] = False
 
-        if U_A.shape != (d_A, r):
+        # U_A/U_B shape validation (only for linear readout)
+        if U_A is not None and U_A.shape != (d_A, r):
             validation_results["errors"].append(f"U_A dimension mismatch: expected ({d_A}, {r}), got {U_A.shape}")
             validation_results["valid"] = False
 
-        if U_B.shape != (d_B, m):
+        if U_B is not None and U_B.shape != (d_B, m):
             validation_results["errors"].append(f"U_B dimension mismatch: expected ({d_B}, {m}), got {U_B.shape}")
             validation_results["valid"] = False
 
@@ -858,7 +907,13 @@ def validate_multivariate_kalman_setup(
                 validation_results["warnings"].append(f"V_A eigenvalue check failed: {e}")
 
             # Matrix condition number check
-            for name, matrix in [("V_A", V_A), ("V_B", V_B), ("U_A", U_A), ("U_B", U_B)]:
+            matrices_to_check = [("V_A", V_A), ("V_B", V_B)]
+            if U_A is not None:
+                matrices_to_check.append(("U_A", U_A))
+            if U_B is not None:
+                matrices_to_check.append(("U_B", U_B))
+
+            for name, matrix in matrices_to_check:
                 try:
                     cond_num = torch.linalg.cond(matrix).item()
                     validation_results["numerical_stability"][f"{name}_condition_number"] = cond_num

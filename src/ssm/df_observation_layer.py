@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
 import warnings
 
 from .cross_fitting import CrossFittingManager, TwoStageCrossFitter, CrossFittingError
+from .readout_net import ReadoutNet
 
 
 class ObservationFeatureNet(nn.Module):
@@ -95,7 +97,8 @@ class DFObservationLayer(nn.Module):
         lambda_B: float = 1e-3,
         lambda_dB: float = 1e-3,
         obs_net_config: Optional[Dict[str, Any]] = None,
-        cross_fitting_config: Optional[Dict[str, Any]] = None
+        cross_fitting_config: Optional[Dict[str, Any]] = None,
+        readout_config: Optional[Dict[str, Any]] = None
     ):
         """
         Args:
@@ -106,10 +109,11 @@ class DFObservationLayer(nn.Module):
             lambda_dB: Stage-2 regularization parameter lambda_{dB}
             obs_net_config: Configuration for ObservationFeatureNet
             cross_fitting_config: Configuration for CrossFittingManager
+            readout_config: Configuration for readout map (type, hidden_dims, activation)
         """
         if df_state_layer is None:
             raise ValueError("df_state_layer is required. Pass a DFStateLayer instance.")
-        
+
         super().__init__()
         self.df_state = df_state_layer
         self.obs_feature_dim = obs_feature_dim
@@ -126,11 +130,22 @@ class DFObservationLayer(nn.Module):
             output_dim=obs_feature_dim,
             **obs_config
         )
-        
+
         self.cf_config = cross_fitting_config or {'n_blocks': 5, 'min_block_size': 10}
 
+        # Readout map configuration
+        self.readout_config = readout_config or {}
+        self.readout_type = self.readout_config.get('type', 'linear')
+        if self.readout_type == 'nonlinear':
+            self.readout_net = ReadoutNet(
+                input_dim=obs_feature_dim,
+                output_dim=multivariate_feature_dim,
+                hidden_dims=self.readout_config.get('hidden_dims', [32]),
+                activation=self.readout_config.get('activation', 'ReLU')
+            )
+
         self.V_B: Optional[torch.Tensor] = None  # Observation transfer operator (d_B, d_A)
-        self.U_B: Optional[torch.Tensor] = None  # Observation readout matrix (d_B, m)
+        self.U_B: Optional[torch.Tensor] = None  # Observation readout matrix (d_B, m) — linear only
         self._is_fitted = False
 
         self._stage1_cache = {}
@@ -353,6 +368,56 @@ class DFObservationLayer(nn.Module):
             U_B = HHt_inv @ HM
 
         return U_B
+
+    def _train_readout_net_on_data(
+        self,
+        H_features: torch.Tensor,
+        targets: torch.Tensor,
+        n_steps: int = 200
+    ):
+        """Train nonlinear readout net on given data (for fit_two_stage)."""
+        opt = torch.optim.Adam(
+            self.readout_net.parameters(),
+            lr=1e-3,
+            weight_decay=self.lambda_dB
+        )
+        H_detached = H_features.detach()
+        targets_detached = targets.detach()
+        with torch.enable_grad():
+            for _ in range(n_steps):
+                opt.zero_grad()
+                pred = self.readout_net(H_detached)
+                loss = F.mse_loss(pred, targets_detached)
+                loss.backward()
+                opt.step()
+
+    def apply_readout(self, h: torch.Tensor) -> torch.Tensor:
+        """Apply readout map (linear or nonlinear).
+
+        Args:
+            h: Feature-space input (*, d_B)
+
+        Returns:
+            torch.Tensor: Readout output (*, m)
+        """
+        if self.readout_type == 'nonlinear':
+            return self.readout_net(h)
+        else:
+            U_B = self._get_readout_matrix()
+            U_B = U_B.to(h.device)
+            if h.dim() == 1:
+                return U_B.T @ h
+            else:
+                return h @ U_B
+
+    def _get_readout_matrix(self) -> torch.Tensor:
+        """Get linear readout matrix U_B (linear mode only)."""
+        if self._is_fitted and self.U_B is not None:
+            return self.U_B
+        elif 'U_B' in self._stage2_cache:
+            return self._stage2_cache['U_B']
+        else:
+            raise RuntimeError("Readout matrix not available")
 
     def _compute_cross_fitting_prediction_ub_matrix(
         self,
@@ -631,6 +696,24 @@ class DFObservationLayer(nn.Module):
             n_blocks = self.cf_config.get('n_blocks', 5)
             min_block_size = self.cf_config.get('min_block_size', 20)
 
+            if self.readout_type == 'nonlinear':
+                # Nonlinear readout: forward through MLP, backprop to readout_net and psi_omega
+                M_pred = self.readout_net(H)
+                prediction_loss = torch.norm(M_pred - M_curr, p='fro') ** 2 / M_curr.size(0)
+                loss_stage2 = prediction_loss
+
+                loss_stage2.backward()
+                optimizer_psi.step()
+
+                return {
+                    'stage2_loss': loss_stage2.item(),
+                    'stage2_pred_loss': prediction_loss.item(),
+                    'stage2_reg_loss': 0.0,
+                    'n_blocks': 0,
+                    'mode': 'nonlinear_readout'
+                }
+
+            # Linear readout path (existing behavior)
             if T_eff < max(n_blocks * min_block_size, 100):
                 U_B = self._ridge_stage2_ub_matrix_with_grad(H, M_curr, self.lambda_dB)
                 M_pred = H @ U_B
@@ -758,7 +841,7 @@ class DFObservationLayer(nn.Module):
         T_eff = Phi_prev.size(0)
         cf_manager = CrossFittingManager(T_eff, **self.cf_config)
         cf_fitter = TwoStageCrossFitter(cf_manager)
-        
+
         if verbose:
             print(f"DF-B cross-fitting: T={T_eff}, n_blocks={cf_manager.n_blocks}")
 
@@ -772,18 +855,21 @@ class DFObservationLayer(nn.Module):
         self.V_B = torch.stack(VB_list).mean(dim=0)
         H_cf = cf_fitter.compute_out_of_fold_features(Phi_prev, VB_list)
 
-        # Stage-2: Observation readout matrix estimation
-        U_B_list = cf_fitter.cross_fit_stage2_matrix(
-            H_cf, M_curr,
-            self._ridge_stage2_ub_matrix,
-            detach_features=True,
-            reg_lambda=self.lambda_dB
-        )
-
-        self.U_B = torch.stack(U_B_list).mean(dim=0)
-
-        if verbose:
-            print(f"V_B shape: {self.V_B.shape}, U_B shape: {self.U_B.shape}")
+        # Stage-2: Observation readout estimation
+        if self.readout_type == 'nonlinear':
+            self._train_readout_net_on_data(H_cf, M_curr)
+            if verbose:
+                print(f"V_B shape: {self.V_B.shape}, readout_net: nonlinear")
+        else:
+            U_B_list = cf_fitter.cross_fit_stage2_matrix(
+                H_cf, M_curr,
+                self._ridge_stage2_ub_matrix,
+                detach_features=True,
+                reg_lambda=self.lambda_dB
+            )
+            self.U_B = torch.stack(U_B_list).mean(dim=0)
+            if verbose:
+                print(f"V_B shape: {self.V_B.shape}, U_B shape: {self.U_B.shape}")
     
     def _fit_without_cross_fitting(
         self,
@@ -798,10 +884,15 @@ class DFObservationLayer(nn.Module):
 
         self.V_B = self._ridge_stage1_vb(Phi_prev, Psi_curr, self.lambda_B)
         H = (self.V_B @ Phi_prev.T).T
-        self.U_B = self._ridge_stage2_ub_matrix(H, M_curr, self.lambda_dB)
 
-        if verbose:
-            print(f"V_B shape: {self.V_B.shape}, U_B shape: {self.U_B.shape}")
+        if self.readout_type == 'nonlinear':
+            self._train_readout_net_on_data(H, M_curr)
+            if verbose:
+                print(f"V_B shape: {self.V_B.shape}, readout_net: nonlinear")
+        else:
+            self.U_B = self._ridge_stage2_ub_matrix(H, M_curr, self.lambda_dB)
+            if verbose:
+                print(f"V_B shape: {self.V_B.shape}, U_B shape: {self.U_B.shape}")
     
     def predict_one_step(self, x_hat_prev: torch.Tensor) -> torch.Tensor:
         """
@@ -828,24 +919,37 @@ class DFObservationLayer(nn.Module):
             )
 
         if not self._is_fitted:
-            if 'V_B' in self._stage1_cache and 'U_B' in self._stage2_cache:
+            if 'V_B' in self._stage1_cache:
                 V_B = self._stage1_cache['V_B']
-                U_B = self._stage2_cache['U_B']
             else:
                 raise RuntimeError("Run fit_two_stage() or train_stage1/2_with_gradients() first")
         else:
             V_B = self.V_B
-            U_B = self.U_B
-        
-        phi_prev = self.phi_theta(x_hat_prev)
 
+        phi_prev = self.phi_theta(x_hat_prev)
         V_B = V_B.to(phi_prev.device)
-        U_B = U_B.to(phi_prev.device)
+
         if phi_prev.dim() == 1:
             h_pred = V_B @ phi_prev
-            return U_B.T @ h_pred
         else:
             h_pred = (V_B @ phi_prev.T).T
+
+        if self.readout_type == 'nonlinear':
+            return self.readout_net(h_pred)
+
+        # Linear readout path
+        if not self._is_fitted:
+            if 'U_B' in self._stage2_cache:
+                U_B = self._stage2_cache['U_B']
+            else:
+                raise RuntimeError("Stage-2 not completed")
+        else:
+            U_B = self.U_B
+
+        U_B = U_B.to(h_pred.device)
+        if h_pred.dim() == 1:
+            return U_B.T @ h_pred
+        else:
             return h_pred @ U_B
     
     def predict_sequence(
@@ -883,7 +987,12 @@ class DFObservationLayer(nn.Module):
             raise RuntimeError("Model not fitted")
     
     def get_readout_matrix(self) -> torch.Tensor:
-        """Get observation readout matrix U_B."""
+        """Get observation readout matrix U_B (linear mode only)."""
+        if self.readout_type == 'nonlinear':
+            raise RuntimeError(
+                "Linear readout matrix not available in nonlinear mode. "
+                "Use apply_readout() instead."
+            )
         if self._is_fitted:
             return self.U_B.clone()
         elif 'U_B' in self._stage2_cache:
@@ -895,47 +1004,59 @@ class DFObservationLayer(nn.Module):
         """Get trained parameters as a dictionary."""
         state_dict = {
             'psi_omega': self.psi_omega.state_dict(),
+            'readout_type': self.readout_type,
             'config': {
                 'obs_feature_dim': self.obs_feature_dim,
                 'lambda_B': self.lambda_B,
                 'lambda_dB': self.lambda_dB
             }
         }
-        
+
         if self._is_fitted:
-            state_dict.update({
-                'V_B': self.V_B,
-                'U_B': self.U_B,
-            })
-        
+            if self.V_B is not None:
+                state_dict['V_B'] = self.V_B
+            if self.readout_type == 'nonlinear' and hasattr(self, 'readout_net'):
+                state_dict['readout_net'] = self.readout_net.state_dict()
+            elif self.U_B is not None:
+                state_dict['U_B'] = self.U_B
+
         if self._stage1_cache:
             state_dict['stage1_cache'] = self._stage1_cache.copy()
         if self._stage2_cache:
             state_dict['stage2_cache'] = self._stage2_cache.copy()
-            
+
         return state_dict
     
     def get_inference_state_dict(self) -> Dict[str, Any]:
-        """Get state_dict for inference (includes V_B/U_B for filtering evaluation)."""
+        """Get state_dict for inference (includes V_B and readout for evaluation)."""
         state_dict = {
             'psi_omega': self.psi_omega.state_dict(),
+            'readout_type': self.readout_type,
         }
 
         if hasattr(self, 'V_B') and self.V_B is not None:
             state_dict['V_B'] = self.V_B
-        if hasattr(self, 'U_B') and self.U_B is not None:
+
+        if self.readout_type == 'nonlinear' and hasattr(self, 'readout_net'):
+            state_dict['readout_net'] = self.readout_net.state_dict()
+        elif hasattr(self, 'U_B') and self.U_B is not None:
             state_dict['U_B'] = self.U_B
 
         return state_dict
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
-        """Custom load_state_dict that also restores V_B/U_B."""
+        """Custom load_state_dict that also restores V_B and readout."""
         v_b = state_dict.pop('V_B', None)
         u_b = state_dict.pop('U_B', None)
+        readout_net_state = state_dict.pop('readout_net', None)
+        state_dict.pop('readout_type', None)
 
         super().load_state_dict(state_dict, strict=strict)
 
         if v_b is not None:
             self.V_B = v_b.to(self.device) if hasattr(self, 'device') else v_b
-        if u_b is not None:
+
+        if self.readout_type == 'nonlinear' and readout_net_state is not None:
+            self.readout_net.load_state_dict(readout_net_state)
+        elif u_b is not None:
             self.U_B = u_b.to(self.device) if hasattr(self, 'device') else u_b

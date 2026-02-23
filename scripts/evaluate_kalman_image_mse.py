@@ -118,6 +118,7 @@ def build_df_state(ckpt: Dict, config: Dict, device: torch.device) -> DFStateLay
     feature_dim = phi_state[weight_keys[-1]].shape[0]  # last layer output = dA
 
     fn_cfg = ds_cfg.get('feature_net', {})
+    readout_cfg = ds_cfg.get('readout', None)
 
     df_state = DFStateLayer(
         state_dim=state_dim,
@@ -126,17 +127,28 @@ def build_df_state(ckpt: Dict, config: Dict, device: torch.device) -> DFStateLay
         lambda_B=float(ds_cfg.get('lambda_B', 1e-3)),
         feature_net_config=fn_cfg,
         cross_fitting_config=ds_cfg.get('cross_fitting', None),
+        readout_config=readout_cfg,
     )
     df_state.phi_theta.load_state_dict(ds_ckpt['phi_theta'])
     df_state.V_A = ds_ckpt['V_A'].to(device)
-    df_state.U_A = ds_ckpt['U_A'].to(device)
+
+    # Load readout: nonlinear (readout_net) or linear (U_A)
+    readout_type = ds_ckpt.get('readout_type', 'linear')
+    if readout_type == 'nonlinear' and 'readout_net' in ds_ckpt:
+        df_state.readout_net.load_state_dict(ds_ckpt['readout_net'])
+        df_state.readout_type = 'nonlinear'
+        print(f"  DFState: readout=nonlinear (readout_net loaded)")
+    else:
+        df_state.U_A = ds_ckpt['U_A'].to(device)
     df_state._is_fitted = True
 
     df_state = df_state.to(device).eval()
     for p in df_state.parameters():
         p.requires_grad = False
+
+    u_a_info = f"U_A={tuple(df_state.U_A.shape)}" if df_state.U_A is not None else "readout_net"
     print(f"  DFState: r={state_dim}, dA={feature_dim}, "
-          f"V_A={tuple(df_state.V_A.shape)}, U_A={tuple(df_state.U_A.shape)}")
+          f"V_A={tuple(df_state.V_A.shape)}, {u_a_info}")
     return df_state
 
 
@@ -146,6 +158,7 @@ def build_df_obs(ckpt: Dict, config: Dict, df_state: DFStateLayer,
     do_ckpt = ckpt['df_obs']
 
     obs_net_cfg = do_cfg.get('obs_net', {})
+    readout_cfg = do_cfg.get('readout', None)
 
     df_obs = DFObservationLayer(
         df_state_layer=df_state,
@@ -155,16 +168,27 @@ def build_df_obs(ckpt: Dict, config: Dict, df_state: DFStateLayer,
         lambda_dB=float(do_cfg.get('lambda_dB', 1e-3)),
         obs_net_config=obs_net_cfg,
         cross_fitting_config=do_cfg.get('cross_fitting', None),
+        readout_config=readout_cfg,
     )
     df_obs.psi_omega.load_state_dict(do_ckpt['psi_omega'])
     df_obs.V_B = do_ckpt['V_B'].to(device)
-    df_obs.U_B = do_ckpt['U_B'].to(device)
+
+    # Load readout: nonlinear (readout_net) or linear (U_B)
+    readout_type = do_ckpt.get('readout_type', 'linear')
+    if readout_type == 'nonlinear' and 'readout_net' in do_ckpt:
+        df_obs.readout_net.load_state_dict(do_ckpt['readout_net'])
+        df_obs.readout_type = 'nonlinear'
+        print(f"  DFObs: readout=nonlinear (readout_net loaded)")
+    else:
+        df_obs.U_B = do_ckpt['U_B'].to(device)
     df_obs._is_fitted = True
 
     df_obs = df_obs.to(device).eval()
     for p in df_obs.parameters():
         p.requires_grad = False
-    print(f"  DFObs: V_B={tuple(df_obs.V_B.shape)}, U_B={tuple(df_obs.U_B.shape)}")
+
+    u_b_info = f"U_B={tuple(df_obs.U_B.shape)}" if df_obs.U_B is not None else "readout_net"
+    print(f"  DFObs: V_B={tuple(df_obs.V_B.shape)}, {u_b_info}")
     return df_obs
 
 
@@ -400,8 +424,12 @@ def evaluate_kalman_roundtrip(
     T = test_obs.shape[0]
     V_A = df_state.V_A
     V_B = df_obs.V_B
-    U_A = df_state.U_A
-    U_B = df_obs.U_B
+    U_A = getattr(df_state, 'U_A', None)
+    U_B = getattr(df_obs, 'U_B', None)
+
+    # Nonlinear readout nets
+    readout_A = getattr(df_state, 'readout_net', None) if getattr(df_state, 'readout_type', 'linear') == 'nonlinear' else None
+    readout_B = getattr(df_obs, 'readout_net', None) if getattr(df_obs, 'readout_type', 'linear') == 'nonlinear' else None
 
     t0 = time.time()
     with torch.no_grad():
@@ -412,6 +440,8 @@ def evaluate_kalman_roundtrip(
             encoder=encoder,
             df_obs_layer=df_obs,
             device=str(device),
+            readout_A=readout_A,
+            readout_B=readout_B,
         )
 
         # Filter all observations
@@ -474,12 +504,14 @@ def evaluate_kalman_feature_space(
     R: torch.Tensor,
     V_A: torch.Tensor,
     V_B: torch.Tensor,
-    U_A: torch.Tensor,
-    U_B: torch.Tensor,
+    U_A: Optional[torch.Tensor],
+    U_B: Optional[torch.Tensor],
     device: torch.device,
     warmup: int = 50,
+    readout_A: Optional[nn.Module] = None,
+    readout_B: Optional[nn.Module] = None,
 ) -> Dict[str, Any]:
-    """Step 3: Manual Kalman loop capturing mu_minus -> V_B @ mu -> U_B^T -> decode -> MSE.
+    """Step 3: Manual Kalman loop capturing mu_minus -> V_B @ mu -> readout_B/U_B -> decode -> MSE.
 
     This avoids the lossy round-trip through U_A^T and phi_theta by directly using
     the predicted feature-space state mu_minus_t for image prediction.
@@ -500,6 +532,8 @@ def evaluate_kalman_feature_space(
             encoder=encoder,
             df_obs_layer=df_obs,
             device=str(device),
+            readout_A=readout_A,
+            readout_B=readout_B,
         )
 
         # Initialize state
@@ -531,9 +565,12 @@ def evaluate_kalman_feature_space(
         print(f"  Predicted feature states: {tuple(mu_predicted.shape)}")
 
         # Direct feature-space image prediction (no phi_theta round-trip):
-        # m_hat_t = U_B^T @ (V_B @ mu_minus_t)
+        # m_hat_t = readout_B(V_B @ mu_minus_t) or U_B^T @ (V_B @ mu_minus_t)
         h_pred = (V_B @ mu_predicted.T).T  # (T, dB)
-        M_hat = h_pred @ U_B               # (T, m) = (T, dB) @ (dB, m)
+        if readout_B is not None:
+            M_hat = readout_B(h_pred)       # (T, m) via nonlinear readout
+        else:
+            M_hat = h_pred @ U_B            # (T, m) = (T, dB) @ (dB, m)
 
         print(f"  Feature predictions: {tuple(M_hat.shape)}")
 
@@ -665,10 +702,17 @@ def main():
 
     # ===== Step 3 =====
     if not args.skip_step3:
+        # Readout: nonlinear nets or linear matrices
+        readout_A = getattr(df_state, 'readout_net', None) if getattr(df_state, 'readout_type', 'linear') == 'nonlinear' else None
+        readout_B = getattr(df_obs, 'readout_net', None) if getattr(df_obs, 'readout_type', 'linear') == 'nonlinear' else None
+        U_A = getattr(df_state, 'U_A', None)
+        U_B = getattr(df_obs, 'U_B', None)
+
         results['step3_kalman_feature'] = evaluate_kalman_feature_space(
             encoder, decoder, df_obs, test_obs, Q, R,
-            df_state.V_A, df_obs.V_B, df_state.U_A, df_obs.U_B,
-            device, args.warmup)
+            df_state.V_A, df_obs.V_B, U_A, U_B,
+            device, args.warmup,
+            readout_A=readout_A, readout_B=readout_B)
 
     # ===== Summary =====
     print("\n" + "=" * 60)

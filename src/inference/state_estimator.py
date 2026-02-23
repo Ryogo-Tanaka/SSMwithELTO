@@ -55,6 +55,10 @@ class StateEstimator:
         self.U_B: Optional[torch.Tensor] = None
         self.Q: Optional[torch.Tensor] = None
         self.R: Optional[Union[torch.Tensor, float]] = None
+
+        # Nonlinear readout networks (Phase II)
+        self.readout_A: Optional[nn.Module] = None
+        self.readout_B: Optional[nn.Module] = None
         
         self.is_initialized = False
         self.calibration_data: Optional[torch.Tensor] = None
@@ -354,37 +358,55 @@ class StateEstimator:
         return 8
 
     def _extract_operators(self):
-        """Extract transfer operators from learned components (DF-A: V_A, U_A; DF-B: V_B, U_B)."""
+        """Extract transfer operators from learned components (DF-A: V_A, U_A/readout_A; DF-B: V_B, U_B/readout_B)."""
         if not all([self.df_state_layer, self.df_obs_layer]):
             raise RuntimeError("DF components not loaded")
-            
-        # Extract V_A, U_A from DF-A
+
+        # Extract V_A from DF-A
         if hasattr(self.df_state_layer, 'V_A') and self.df_state_layer.V_A is not None:
             self.V_A = self.df_state_layer.V_A.clone().detach()
         else:
             raise RuntimeError("V_A not found in DF-A component")
-            
-        if hasattr(self.df_state_layer, 'U_A') and self.df_state_layer.U_A is not None:
+
+        # Extract U_A or readout_A from DF-A
+        readout_type_A = getattr(self.df_state_layer, 'readout_type', 'linear')
+        if readout_type_A == 'nonlinear' and hasattr(self.df_state_layer, 'readout_net') and self.df_state_layer.readout_net is not None:
+            self.U_A = None
+            self.readout_A = self.df_state_layer.readout_net
+            self.readout_A.eval()
+        elif hasattr(self.df_state_layer, 'U_A') and self.df_state_layer.U_A is not None:
             self.U_A = self.df_state_layer.U_A.clone().detach()
+            self.readout_A = None
         else:
-            raise RuntimeError("U_A not found in DF-A component")
-            
-        # Extract V_B, U_B from DF-B
+            raise RuntimeError("Neither U_A nor readout_net found in DF-A component")
+
+        # Extract V_B from DF-B
         if hasattr(self.df_obs_layer, 'V_B') and self.df_obs_layer.V_B is not None:
             self.V_B = self.df_obs_layer.V_B.clone().detach()
         else:
             raise RuntimeError("V_B not found in DF-B component")
-            
-        if hasattr(self.df_obs_layer, 'U_B') and self.df_obs_layer.U_B is not None:
+
+        # Extract U_B or readout_B from DF-B
+        readout_type_B = getattr(self.df_obs_layer, 'readout_type', 'linear')
+        if readout_type_B == 'nonlinear' and hasattr(self.df_obs_layer, 'readout_net') and self.df_obs_layer.readout_net is not None:
+            self.U_B = None
+            self.readout_B = self.df_obs_layer.readout_net
+            self.readout_B.eval()
+        elif hasattr(self.df_obs_layer, 'U_B') and self.df_obs_layer.U_B is not None:
             self.U_B = self.df_obs_layer.U_B.clone().detach()
+            self.readout_B = None
         else:
-            raise RuntimeError("u_B not found in DF-B component")
-            
+            raise RuntimeError("Neither U_B nor readout_net found in DF-B component")
+
         print("Operators extracted successfully:")
         print(f"  V_A: {self.V_A.shape}")
         print(f"  V_B: {self.V_B.shape}")
-        print(f"  U_A: {self.U_A.shape}")
-        print(f"  U_B: {self.U_B.shape}")
+        print(f"  U_A: {self.U_A.shape if self.U_A is not None else 'None (nonlinear readout)'}")
+        print(f"  U_B: {self.U_B.shape if self.U_B is not None else 'None (nonlinear readout)'}")
+        if self.readout_A is not None:
+            print(f"  readout_A: {readout_type_A}")
+        if self.readout_B is not None:
+            print(f"  readout_B: {readout_type_B}")
 
     def estimate_noise_covariances(
         self,
@@ -563,29 +585,31 @@ class StateEstimator:
             initial_data: Data for initialization (N0, n) or None
             method: Initialization method ("data_driven" | "zero")
         """
-        if not all([self.V_A is not None, self.V_B is not None, self.U_A is not None, self.U_B is not None]):
+        # Check operators: need V_A, V_B, and either U_A/U_B or readout nets
+        has_state_readout = (self.U_A is not None) or (self.readout_A is not None)
+        has_obs_readout = (self.U_B is not None) or (self.readout_B is not None)
+        if not all([self.V_A is not None, self.V_B is not None, has_state_readout, has_obs_readout]):
             raise RuntimeError("Operators not extracted. Call load_components() first.")
-            
+
         if self.Q is None or self.R is None:
             # Default noise settings
             warnings.warn("Noise covariances not estimated. Using defaults.")
             dA = int(self.V_A.size(0))
             self.Q = 0.01 * torch.eye(dA, device=self.device)
             self.R = 0.1
-            
-        # Validate inputs
-        validation = validate_kalman_inputs(
-            self.V_A, self.V_B, self.U_A, self.U_B, self.Q, self.R
-        )
-        
-        if not validation["valid"]:
-            raise RuntimeError(f"Invalid Kalman inputs: {validation['errors']}")
-            
-        if validation["warnings"]:
-            for warning in validation["warnings"]:
-                warnings.warn(warning)
-                
-        # Create Kalman Filter (with learned DF-B layer)
+
+        # Validate inputs (only when linear readout with U_A/U_B available)
+        if self.U_A is not None and self.U_B is not None:
+            validation = validate_kalman_inputs(
+                self.V_A, self.V_B, self.U_A, self.U_B, self.Q, self.R
+            )
+            if not validation["valid"]:
+                raise RuntimeError(f"Invalid Kalman inputs: {validation['errors']}")
+            if validation["warnings"]:
+                for warning in validation["warnings"]:
+                    warnings.warn(warning)
+
+        # Create Kalman Filter (with learned DF-B layer and optional readout nets)
         self.kalman_filter = OperatorBasedKalmanFilter(
             V_A=self.V_A,
             V_B=self.V_B,
@@ -594,8 +618,10 @@ class StateEstimator:
             Q=self.Q,
             R=self.R,
             encoder=self.encoder,
-            df_obs_layer=self.df_obs_layer,  # includes trained psi_omega
-            device=str(self.device)
+            df_obs_layer=self.df_obs_layer,
+            device=str(self.device),
+            readout_A=self.readout_A,
+            readout_B=self.readout_B
         )
         
         # Set initial state
@@ -708,14 +734,22 @@ class StateEstimator:
         if not self.is_initialized:
             return {"status": "not_initialized"}
             
+        operator_shapes = {
+            "V_A": self.V_A.shape,
+            "V_B": self.V_B.shape,
+        }
+        if self.U_A is not None:
+            operator_shapes["U_A"] = self.U_A.shape
+        else:
+            operator_shapes["readout_A"] = "nonlinear"
+        if self.U_B is not None:
+            operator_shapes["U_B"] = self.U_B.shape
+        else:
+            operator_shapes["readout_B"] = "nonlinear"
+
         diagnostics = {
             "initialization_status": self.is_initialized,
-            "operator_shapes": {
-                "V_A": self.V_A.shape,
-                "V_B": self.V_B.shape,
-                "U_A": self.U_A.shape,
-                "U_B": self.U_B.shape
-            },
+            "operator_shapes": operator_shapes,
             "numerical_stability": self.kalman_filter.check_numerical_stability()
         }
         
@@ -745,19 +779,29 @@ class StateEstimator:
         if not self.is_initialized:
             raise RuntimeError("Filter not initialized. Cannot export.")
             
+        operators_dict = {
+            "V_A": self.V_A.cpu(),
+            "V_B": self.V_B.cpu(),
+        }
+        if self.U_A is not None:
+            operators_dict["U_A"] = self.U_A.cpu()
+        if self.U_B is not None:
+            operators_dict["U_B"] = self.U_B.cpu()
+
         inference_params = {
-            "operators": {
-                "V_A": self.V_A.cpu(),
-                "V_B": self.V_B.cpu(),
-                "U_A": self.U_A.cpu(),
-                "U_B": self.U_B.cpu()
-            },
+            "operators": operators_dict,
             "noise_covariances": {
                 "Q": self.Q.cpu(),
                 "R": self.R if isinstance(self.R, (int, float)) else self.R.cpu()
             },
             "config": self.config
         }
+
+        # Export nonlinear readout nets if present
+        if self.readout_A is not None:
+            inference_params["readout_A_state_dict"] = self.readout_A.state_dict()
+        if self.readout_B is not None:
+            inference_params["readout_B_state_dict"] = self.readout_B.state_dict()
         
         encoder_state = self.encoder.state_dict()
         

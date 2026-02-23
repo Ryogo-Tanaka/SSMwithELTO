@@ -90,6 +90,10 @@ ssm:
     cross_fitting:
       n_blocks: 5
       min_block_size: 100
+    readout:
+      type: "nonlinear"
+      hidden_dims: [32, 32]
+      activation: "ReLU"
 
   df_observation:
     obs_feature_dim: 25         # observation feature dimension d_B
@@ -103,6 +107,10 @@ ssm:
     cross_fitting:
       n_blocks: 5
       min_block_size: 100
+    readout:
+      type: "nonlinear"
+      hidden_dims: [32, 32]
+      activation: "ReLU"
 
 computation:
   device: "auto"

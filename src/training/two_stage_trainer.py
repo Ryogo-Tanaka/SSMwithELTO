@@ -698,9 +698,12 @@ class TwoStageTrainer:
             lambda_A=self.df_state_config['lambda_A'],
             lambda_B=self.df_state_config['lambda_B'],
             feature_net_config=self.df_state_config.get('feature_net'),
-            cross_fitting_config=self.df_state_config.get('cross_fitting')
+            cross_fitting_config=self.df_state_config.get('cross_fitting'),
+            readout_config=self.df_state_config.get('readout')
         )
         self.df_state.phi_theta = self.df_state.phi_theta.to(self.device)
+        if hasattr(self.df_state, 'readout_net'):
+            self.df_state.readout_net = self.df_state.readout_net.to(self.device)
 
         self.df_obs = DFObservationLayer(
             df_state_layer=self.df_state,
@@ -709,9 +712,12 @@ class TwoStageTrainer:
             lambda_B=self.df_obs_config['lambda_B'],
             lambda_dB=self.df_obs_config['lambda_dB'],
             obs_net_config=self.df_obs_config.get('obs_net'),
-            cross_fitting_config=self.df_obs_config.get('cross_fitting')
+            cross_fitting_config=self.df_obs_config.get('cross_fitting'),
+            readout_config=self.df_obs_config.get('readout')
         )
         self.df_obs.psi_omega = self.df_obs.psi_omega.to(self.device)
+        if hasattr(self.df_obs, 'readout_net'):
+            self.df_obs.readout_net = self.df_obs.readout_net.to(self.device)
         
         if 'df_layers_init' not in self._static_logs_shown:
             print(f"DF layers initialized: state_dim={r}")
@@ -719,15 +725,15 @@ class TwoStageTrainer:
     
     def _initialize_optimizers(self):
         """Initialize optimizers."""
-        self.optimizers['phi'] = torch.optim.Adam(
-            self.df_state.phi_theta.parameters(), 
-            lr=self.config.lr_phi
-        )
-        
-        self.optimizers['psi'] = torch.optim.Adam(
-            self.df_obs.psi_omega.parameters(), 
-            lr=self.config.lr_psi
-        )
+        phi_params = list(self.df_state.phi_theta.parameters())
+        if hasattr(self.df_state, 'readout_net'):
+            phi_params += list(self.df_state.readout_net.parameters())
+        self.optimizers['phi'] = torch.optim.Adam(phi_params, lr=self.config.lr_phi)
+
+        psi_params = list(self.df_obs.psi_omega.parameters())
+        if hasattr(self.df_obs, 'readout_net'):
+            psi_params += list(self.df_obs.readout_net.parameters())
+        self.optimizers['psi'] = torch.optim.Adam(psi_params, lr=self.config.lr_psi)
 
         # Phase-2 optimizer: param groups depend on update_strategy
         param_groups = [
@@ -893,8 +899,9 @@ class TwoStageTrainer:
             print("  Computing DF-B operators (V_B/U_B)...")
 
             with torch.no_grad():
-                # x_hat_{t|t-1} = U_A^T V_A phi(x_{t-1})
-                X_pred = (self.df_state.U_A.T @ (self.df_state.V_A @ Phi_minus.T)).T
+                # x_hat_{t|t-1} = r_xi_A(V_A phi(x_{t-1}))
+                H_A = (self.df_state.V_A @ Phi_minus.T).T
+                X_pred = self.df_state.apply_readout(H_A)
                 Phi_pred = self.df_state.phi_theta(X_pred)
 
                 # Account for realization time reduction: T -> T_eff = T - 2*h + 1
@@ -1441,7 +1448,8 @@ class TwoStageTrainer:
                 self.df_state._fit_without_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=False)
 
             if hasattr(self, 'df_obs') and self.df_obs is not None:
-                X_pred = (self.df_state.U_A.T @ (self.df_state.V_A @ Phi_minus.T)).T
+                H_A = (self.df_state.V_A @ Phi_minus.T).T
+                X_pred = self.df_state.apply_readout(H_A)
                 Phi_pred = self.df_state.phi_theta(X_pred)
 
                 if isinstance(self.realization, StochasticRealizationWithEncoder):
@@ -1482,19 +1490,21 @@ class TwoStageTrainer:
             Phi_minus = Phi_full[:-1]
             X_plus = X_states[1:]
 
-            H = self.df_state.V_A @ Phi_minus.T
-            X_pred = (self.df_state.U_A.T @ H).T
+            H_A = (self.df_state.V_A @ Phi_minus.T).T
+            X_pred = self.df_state.apply_readout(H_A)
             prediction_error = torch.norm(X_plus - X_pred, p='fro') ** 2
             T_samples = X_plus.shape[0]
             df_a_stage2_pred = (prediction_error / T_samples).item()
-            df_a_stage2_reg = (self.df_state.lambda_B * torch.norm(self.df_state.U_A, p='fro') ** 2).item()
+            if self.df_state.readout_type == 'nonlinear':
+                df_a_stage2_reg = 0.0
+            else:
+                df_a_stage2_reg = (self.df_state.lambda_B * torch.norm(self.df_state.U_A, p='fro') ** 2).item()
 
             losses['df_a_stage2_pred'] = df_a_stage2_pred
             losses['df_a_stage2_reg'] = df_a_stage2_reg
 
             # DF-B Stage-2: Eq. (42b)
             if hasattr(self, 'df_obs') and self.df_obs is not None:
-                X_pred = (self.df_state.U_A.T @ H).T
                 Phi_pred = self.df_state.phi_theta(X_pred)
 
                 if isinstance(self.realization, StochasticRealizationWithEncoder):
@@ -1511,13 +1521,16 @@ class TwoStageTrainer:
                 Psi_curr = Psi_curr[:min_size]
                 m_curr = M_curr[:min_size]
 
-                H_B = self.df_obs.V_B @ Phi_pred.T
-                m_pred = (self.df_obs.U_B.T @ H_B).T
+                H_B = (self.df_obs.V_B @ Phi_pred.T).T
+                m_pred = self.df_obs.apply_readout(H_B)
 
                 prediction_error_b = torch.norm(m_curr - m_pred, p='fro') ** 2
                 T_samples_b = m_curr.shape[0]
                 df_b_stage2_pred = (prediction_error_b / T_samples_b).item()
-                df_b_stage2_reg = (self.df_obs.lambda_dB * torch.norm(self.df_obs.U_B, p='fro') ** 2).item()
+                if self.df_obs.readout_type == 'nonlinear':
+                    df_b_stage2_reg = 0.0
+                else:
+                    df_b_stage2_reg = (self.df_obs.lambda_dB * torch.norm(self.df_obs.U_B, p='fro') ** 2).item()
 
                 losses['df_b_stage2_pred'] = df_b_stage2_pred
                 losses['df_b_stage2_reg'] = df_b_stage2_reg

@@ -33,13 +33,16 @@ class OperatorBasedKalmanFilter:
         self,
         V_A: torch.Tensor,
         V_B: torch.Tensor,
-        U_A: torch.Tensor,
-        U_B: torch.Tensor,
+        U_A: Optional[torch.Tensor],
+        U_B: Optional[torch.Tensor],
         Q: torch.Tensor,
         R: Union[torch.Tensor, float],
         encoder: nn.Module,
         df_obs_layer: nn.Module = None,
-        device: str = 'cpu'
+        device: str = 'cpu',
+        readout_A: Optional[nn.Module] = None,
+        readout_B: Optional[nn.Module] = None,
+        state_dim_r: Optional[int] = None
     ):
         """
         Initialize Algorithm 1.
@@ -47,20 +50,23 @@ class OperatorBasedKalmanFilter:
         Args:
             V_A: Learned state transfer operator (dA, dA)
             V_B: Learned observation transfer operator (dB, dA)
-            U_A: Learned state readout matrix (dA, r)
-            U_B: Learned observation readout matrix (dB, m)
+            U_A: Learned state readout matrix (dA, r), or None if nonlinear
+            U_B: Learned observation readout matrix (dB, m), or None if nonlinear
             Q: State noise covariance (dA, dA)
             R: Observation noise (scalar or matrix)
             encoder: Encoder network (frozen)
             df_obs_layer: DF-B layer (with learned psi_omega)
             device: Computation device
+            readout_A: Nonlinear state readout network r_{xi_A}: R^{dA} -> R^r
+            readout_B: Nonlinear observation readout network r_{xi_B}: R^{dB} -> R^m
+            state_dim_r: Explicit state dimension r (required when U_A is None and readout_A is provided)
         """
         self.device = torch.device(device)
-        
+
         self.V_A = V_A.to(self.device)
         self.V_B = V_B.to(self.device)
-        self.U_A = U_A.to(self.device)
-        self.U_B = U_B.to(self.device)
+        self.U_A = U_A.to(self.device) if U_A is not None else None
+        self.U_B = U_B.to(self.device) if U_B is not None else None
 
         self.Q = Q.to(self.device)
         if isinstance(R, (int, float)):
@@ -79,10 +85,41 @@ class OperatorBasedKalmanFilter:
         for param in self.encoder.parameters():
             param.requires_grad = False
 
+        # Nonlinear readout networks (Phase II)
+        self.readout_A = readout_A
+        self.readout_B = readout_B
+        self.use_nonlinear_readout_A = (readout_A is not None)
+        self.use_nonlinear_readout_B = (readout_B is not None)
+
+        if self.readout_A is not None:
+            self.readout_A = self.readout_A.to(self.device)
+            self.readout_A.eval()
+            for param in self.readout_A.parameters():
+                param.requires_grad = False
+
+        if self.readout_B is not None:
+            self.readout_B = self.readout_B.to(self.device)
+            self.readout_B.eval()
+            for param in self.readout_B.parameters():
+                param.requires_grad = False
+
         # Dimensions
         self.dA = int(V_A.size(0))
         self.dB = int(V_B.size(0))
-        self.r = int(U_A.size(1))
+
+        # Determine r (state dimension in original space)
+        if state_dim_r is not None:
+            self.r = state_dim_r
+        elif U_A is not None:
+            self.r = int(U_A.size(1))
+        elif self.readout_A is not None:
+            # Probe readout_A to determine output dimension
+            with torch.no_grad():
+                probe_input = torch.zeros(self.dA, device=self.device)
+                probe_output = self.readout_A(probe_input)
+                self.r = int(probe_output.size(0))
+        else:
+            raise ValueError("Cannot determine state dimension r: provide U_A, readout_A, or state_dim_r")
 
         # Internal state for sequential processing
         self.mu: Optional[torch.Tensor] = None
@@ -390,12 +427,15 @@ class OperatorBasedKalmanFilter:
         return X_means, X_covariances
 
     def _recover_original_state(
-        self, 
-        mu: torch.Tensor, 
+        self,
+        mu: torch.Tensor,
         Sigma: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Recover original state space: x_hat = U_A^T mu, Sigma_x = U_A^T Sigma U_A.
+        Recover original state space from feature-space filtered state.
+
+        Linear readout: x_hat = U_A^T mu, Sigma_x = U_A^T Sigma U_A
+        Nonlinear readout: x_hat = r_{xi_A}(mu), Sigma_x ~ J Sigma J^T (Jacobian linearization)
 
         Args:
             mu: Feature-space state mean (dA,)
@@ -405,15 +445,41 @@ class OperatorBasedKalmanFilter:
             x_hat: State estimate in original space (r,)
             Sigma_x: Covariance in original space (r, r)
         """
-        # x̂_t ← U_A^T µ
-        x_hat = self.U_A.T @ mu  # (r,)
-        
-        # Σ_t^(x) ← U_A^T Σ U_A  
-        Sigma_x = self.U_A.T @ Sigma @ self.U_A  # (r, r)
-        
-        Sigma_x = self._regularize_covariance(Sigma_x)
+        if self.use_nonlinear_readout_A:
+            # Nonlinear readout: x_hat = r_{xi_A}(mu)
+            with torch.no_grad():
+                x_hat = self.readout_A(mu)  # (r,)
 
-        return x_hat, Sigma_x
+            # Covariance via Jacobian linearization: Sigma_x ~ J Sigma J^T
+            try:
+                J = self._compute_readout_jacobian(mu)  # (r, dA)
+                Sigma_x = J @ Sigma @ J.T  # (r, r)
+            except Exception:
+                # Fallback: diagonal covariance scaled by trace
+                Sigma_x = torch.eye(self.r, device=self.device) * Sigma.diag().mean()
+
+            Sigma_x = self._regularize_covariance(Sigma_x)
+            return x_hat, Sigma_x
+        else:
+            # Linear readout: x_hat = U_A^T mu
+            x_hat = self.U_A.T @ mu  # (r,)
+            Sigma_x = self.U_A.T @ Sigma @ self.U_A  # (r, r)
+            Sigma_x = self._regularize_covariance(Sigma_x)
+            return x_hat, Sigma_x
+
+    def _compute_readout_jacobian(self, mu: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Jacobian of readout_A at mu using torch.func.jacrev.
+
+        Args:
+            mu: Feature-space state mean (dA,)
+
+        Returns:
+            J: Jacobian matrix (r, dA) where J[i,j] = d(readout_A_i)/d(mu_j)
+        """
+        mu_input = mu.detach().clone().requires_grad_(True)
+        J = torch.func.jacrev(self.readout_A)(mu_input)
+        return J.detach()
 
     def _regularize_covariance(self, cov_matrix: torch.Tensor) -> torch.Tensor:
         """
