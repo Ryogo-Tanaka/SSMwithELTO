@@ -129,11 +129,11 @@ def parse_args():
     )
     parser.add_argument(
         "--reuse-seed1", type=str, default=None,
-        help="Path to existing seed1 training results (e.g. results/paper_reconstruction_v4)"
+        help="Path to existing seed1 training results (e.g. results/paper_reconstruction)"
     )
     parser.add_argument(
         "--reuse-seed1-eval", type=str, default=None,
-        help="Path to existing seed1 Kalman eval results (e.g. results/kalman_eval_v4)"
+        help="Path to existing seed1 Kalman eval results (e.g. results/kalman_eval)"
     )
     parser.add_argument(
         "--aggregate-only", action="store_true",
@@ -164,7 +164,7 @@ def get_data_file(data_dir, seed_idx, condition_cfg):
 
 
 def copy_seed1_training(src_dir, dst_dir):
-    """Copy existing v4 training results into seed1 directory."""
+    """Copy existing training results into seed1 directory."""
     src = Path(src_dir)
     dst = Path(dst_dir)
 
@@ -189,7 +189,7 @@ def copy_seed1_training(src_dir, dst_dir):
 
 
 def copy_seed1_eval(src_dir, dst_dir):
-    """Copy existing v4 Kalman evaluation results into seed1/kalman_eval/."""
+    """Copy existing Kalman evaluation results into seed1/kalman_eval/."""
     src = Path(src_dir)
     dst = Path(dst_dir)
     dst.mkdir(parents=True, exist_ok=True)
@@ -466,7 +466,7 @@ def main():
                 # --- Training ---
                 if not args.skip_training:
                     if seed_idx == 1 and args.reuse_seed1:
-                        print(f"\n[SEED 1] Copying existing v4 results...")
+                        print(f"\n[SEED 1] Copying existing results...")
                         copy_seed1_training(args.reuse_seed1, seed_dir)
                     elif model_path.exists():
                         print(f"\n[SEED {seed_idx}] Model already exists, skipping training: {model_path}")

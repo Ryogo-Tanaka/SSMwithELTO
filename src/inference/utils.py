@@ -90,23 +90,6 @@ def compute_residuals_from_operators(
     return residuals_state, residuals_obs
 
 
-def compute_innovation_residuals(
-    predictions: torch.Tensor,
-    observations: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute innovation residuals for filter performance evaluation.
-
-    Args:
-        predictions: Prediction sequence (T,)
-        observations: Observation sequence (T,)
-
-    Returns:
-        Innovation residuals (T,).
-    """
-    return observations - predictions
-
-
 def check_numerical_stability(
     matrix: torch.Tensor,
     name: str = "Matrix",
@@ -201,28 +184,6 @@ def regularize_covariance(
         cov_matrix += jitter * torch.eye(cov_matrix.size(0), device=cov_matrix.device)
         
     return cov_matrix
-
-
-def compute_log_likelihood(
-    innovations: torch.Tensor,
-    innovation_covariances: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute log-likelihood from innovation sequence (Gaussian assumption).
-
-    Args:
-        innovations: Innovation sequence (T,)
-        innovation_covariances: Innovation covariance sequence (T,)
-
-    Returns:
-        Log-likelihood sequence (T,).
-    """
-    log_likelihoods = -0.5 * (
-        torch.log(2 * torch.pi * innovation_covariances) +
-        (innovations ** 2) / innovation_covariances
-    )
-    
-    return log_likelihoods
 
 
 def initialize_state_data_driven(
@@ -380,64 +341,6 @@ def validate_kalman_inputs(
         validation_results["errors"].append(f"Validation failed: {e}")
         
     return validation_results
-
-
-def create_test_operators(
-    dA: int = 10,
-    dB: int = 5,
-    r: int = 3,
-    m: int = 8,
-    device: str = 'cpu'
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Union[torch.Tensor, float]]:
-    """
-    Generate test operators (multivariate-compatible).
-
-    Creates stable operators for Kalman filter testing and debugging.
-
-    Args:
-        dA: Feature-space state dimension
-        dB: Feature-space observation dimension
-        r: Original state dimension
-        m: Multivariate feature dimension
-        device: Compute device
-
-    Returns:
-        V_A: State transfer operator (dA, dA)
-        V_B: Observation transfer operator (dB, dA)
-        U_A: State readout matrix (dA, r)
-        U_B: Observation readout matrix (dB, m)
-        Q: State noise covariance (dA, dA)
-        R: Observation noise covariance (m, m) or scalar
-    """
-    device = torch.device(device)
-    
-    # Generate stable V_A (eigenvalues constrained within unit circle)
-    V_A = torch.randn(dA, dA, device=device) * 0.1
-    eigenvals, eigenvecs = torch.linalg.eig(V_A)
-    eigenvals = eigenvals * 0.9 / torch.abs(eigenvals).max()  # Limit max eigenvalue to 0.9
-    V_A = torch.real(eigenvecs @ torch.diag(eigenvals) @ torch.linalg.inv(eigenvecs))
-
-    # V_B: Random matrix
-    V_B = torch.randn(dB, dA, device=device) * 0.5
-
-    # U_A: Random readout matrix
-    U_A = torch.randn(dA, r, device=device) * 0.7
-
-    # U_B: Random readout matrix (multivariate)
-    U_B = torch.randn(dB, m, device=device) * 0.5
-
-    # Q: Positive definite covariance matrix
-    Q_half = torch.randn(dA, dA, device=device) * 0.1
-    Q = Q_half @ Q_half.T + 0.01 * torch.eye(dA, device=device)
-
-    # R: Observation noise covariance (multivariate)
-    if m == 1:
-        R = 0.1  # Scalar (backward compatibility)
-    else:
-        R_half = torch.randn(m, m, device=device) * 0.05
-        R = R_half @ R_half.T + 0.01 * torch.eye(m, device=device)
-
-    return V_A, V_B, U_A, U_B, Q, R
 
 
 def format_filter_results(

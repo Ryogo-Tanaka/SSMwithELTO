@@ -85,7 +85,7 @@ class OperatorBasedKalmanFilter:
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        # Nonlinear readout networks (Phase II)
+        # Nonlinear readout networks
         self.readout_A = readout_A
         self.readout_B = readout_B
         self.use_nonlinear_readout_A = (readout_A is not None)

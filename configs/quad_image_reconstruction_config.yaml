@@ -48,18 +48,14 @@ model:
     activation: "relu"
 
 training:
-  epochs: 25                  # 5 warmup + 20 active (per Table 6)
+  epochs: 125                 # 25 warmup + 100 active
   T1_iterations: 1
   T2_iterations: 1
-  phase1_warmup_epochs: 5     # Table 6: Stage-1 = 5 epochs
+  phase1_warmup_epochs: 25    # Stage-1 = 25 epochs
 
   experiment_mode: "reconstruction"
-  target_loss_weight: 0.0
-  reconstruction_loss_weight: 1.0
-
   lr_phi: 1e-3                # Adam default
   lr_psi: 1e-3                # Adam default
-  weight_decay: 1e-6
 
   lr_encoder: 1e-3            # Adam default
   lr_decoder: 1e-3            # Adam default
@@ -117,17 +113,6 @@ computation:
   num_workers: 4
   pin_memory: true
 
-output:
-  save_model: true
-  save_history: true
-  create_plots: true
-  save_reconstructions: true
-
-logging:
-  level: "INFO"
-  console_output: true
-  file_output: true
-
 evaluation:
   use_new_realization: true
 
@@ -141,7 +126,6 @@ evaluation:
       - "mse"
       - "psnr"
       - "ssim"
-    save_detailed_results: true
 
   encoded_feature_space_viz:
     dim_indices: [0, 1]

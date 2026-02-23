@@ -5,7 +5,7 @@
 # Realization: r=9, past_horizon=20, encoder_output_dim=50
 # DF-A: feature_dim=30 (dA=30), lambda_A=0.01
 # DF-B: obs_feature_dim=30 (dB=30), multivariate_feature_dim=50
-# Training: 25 epochs (5 warmup + 20 end-to-end), batch_size=100
+# Training: 125 epochs (25 warmup + 100 end-to-end), batch_size=100
 # ====================================================================
 
 experiment:
@@ -41,21 +41,18 @@ model:
     dropout: 0.0
 
 training:
-  epochs: 25                  # 5 warmup + 20 end-to-end
+  epochs: 125                 # 25 warmup + 100 end-to-end
   T1_iterations: 1
   T2_iterations: 1
-  phase1_warmup_epochs: 5     # Paper Table 8: Stage-1 = 5
+  phase1_warmup_epochs: 25    # Stage-1 = 25 epochs
 
   experiment_mode: "reconstruction"
-  target_loss_weight: 0.0
-  reconstruction_loss_weight: 1.0
 
   lr_phi: 1e-3
   lr_psi: 1e-3
-  lr_encoder: 1e-3            # Adam default
-  lr_decoder: 1e-3            # Adam default
-  lambda_cca: 0.0001
-  weight_decay: 1e-6
+  lr_encoder: 1e-4
+  lr_decoder: 1e-4
+  lambda_cca: 0.001
   update_strategy: "encoder_decoder_only"
 
 ssm:
@@ -108,17 +105,6 @@ computation:
   device: "auto"
   num_workers: 4
   pin_memory: true
-
-output:
-  save_model: true
-  save_history: true
-  create_plots: false
-  save_reconstructions: false
-
-logging:
-  level: "INFO"
-  console_output: true
-  file_output: true
 
 evaluation:
   use_new_realization: true

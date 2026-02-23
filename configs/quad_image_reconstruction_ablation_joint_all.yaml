@@ -1,8 +1,12 @@
+# ====================================================================
 # Ablation Study Config: Joint Training Mode (all parameters simultaneously)
 # Base: quad_image_reconstruction_config.yaml
 # Purpose: Baseline for comparison against staged training (proposed method)
 # Data: data/rkn_quad/quad1_y.npz
-# Architecture: cnn_imageEncoder + cnn_imageDecoder
+# Architecture: cnn_imageEncoder (stride=2) + cnn_imageDecoder (ConvTranspose2d)
+# Note: Architecture and regularization are identical to main config (Table 6).
+#       Only training schedule differs (joint_all, no warmup).
+# ====================================================================
 
 experiment:
   mode: "reconstruction"
@@ -12,7 +16,7 @@ data:
   val_ratio: 0.2
   test_ratio: 0.1
   normalization: "unit_scale"  # [0,255] -> [0,1]
-  batch_size: 300
+  batch_size: 150              # Table 6: 150
   image_shape: [48, 48, 1]    # (H, W, C)
   paper_data_protocol: true    # train_obs->train, test_obs->eval (same as main config)
 
@@ -20,9 +24,10 @@ model:
   encoder:
     type: "cnn_image"              # cnn_imageEncoder
     input_resolution: [48, 48, 1]  # input image resolution (H, W, C)
-    feature_dim: 50               # latent dimension
+    feature_dim: 100               # Table 6: m=100
     hidden: 200                    # FC hidden dimension
-    conv_channels: [32, 64]        # CNN channel sizes
+    conv_channels: [12, 12]        # Table 6: [12, 12]
+    conv_strides: [2, 2]           # Table 6: stride=2
     activation: "relu"
     normalize_input: false
     normalize_output: false
@@ -31,59 +36,55 @@ model:
   decoder:
     type: "cnn_image"              # cnn_imageDecoder
     input_resolution: [48, 48, 1]  # output image resolution (H, W, C)
-    feature_dim: 50               # latent dimension
-    hidden: 200                    # FC hidden dimension
-    grid: [12, 12, 64]            # intermediate grid size (H/4, W/4, Ch)
-    upsample_mode: "nearest"       # upsampling method
-    conv_channels: [64, 32, 1]     # deconv channel sizes
+    feature_dim: 100               # Table 6: m=100
+    grid: [3, 3, 16]              # Table 6: FC->144->Reshape(3,3,16)
+    upsample_mode: "conv_transpose"  # Table 6: ConvTranspose2d
+    conv_channels: [16, 12, 1]    # Table 6
     activation: "relu"
     output_activation: "sigmoid"
 
+  # Target prediction head (unused in reconstruction mode, kept for compatibility)
   state_decoder:
-    feature_dim: 50               # latent dimension
+    feature_dim: 100              # Table 6: m=100
     state_dim: 8                   # control state dimension
     hidden: 50                     # hidden layer dimension
     activation: "relu"
 
 training:
-  epochs: 10               # total epochs (test: 10, full run: 50)
-  T1_iterations: 1         # Stage-1 iterations (unused since Phase-1 is skipped)
-  T2_iterations: 1         # Stage-2 iterations (unused since Phase-1 is skipped)
-  phase1_warmup_epochs: 0  # Ablation: no warmup (Phase-2 from the start)
+  epochs: 125                # Same total as main config (125 epochs, all active)
+  T1_iterations: 1           # Stage-1 iterations (unused since warmup is skipped)
+  T2_iterations: 1           # Stage-2 iterations (unused since warmup is skipped)
+  phase1_warmup_epochs: 0    # Ablation: no warmup (Stage-2 from the start)
 
   experiment_mode: "reconstruction"
-  target_loss_weight: 0.0
-  reconstruction_loss_weight: 1.0
 
-  # Phase-1 LR (not directly used since Phase-1 is skipped, but used by Phase-2 optimizer)
-  lr_phi: 1e-4             # phi_theta LR
-  lr_psi: 1e-4             # psi_omega LR
-  weight_decay: 1e-6
+  # LR (all Adam default, same as main config)
+  lr_phi: 1e-3               # phi_theta LR (Adam default)
+  lr_psi: 1e-3               # psi_omega LR (Adam default)
 
-  # Phase-2 LR (same as baseline)
-  lr_encoder: 1e-5          # encoder LR
-  lr_decoder: 1e-4          # decoder LR
-  lambda_cca: 0.0001         # CCA loss weight
+  lr_encoder: 1e-3            # encoder LR (Adam default)
+  lr_decoder: 1e-3            # decoder LR (Adam default)
+  lambda_cca: 0.0001          # CCA loss weight
   update_strategy: "joint_all"  # Ablation: joint training mode (all params simultaneously)
 
 ssm:
   realization:
-    past_horizon: 20        # past window length
-    rank: 30                 # state dimension
-    encoder_output_dim: 50   # encoder output dimension
+    past_horizon: 30           # Table 6: l=30
+    rank: 20                   # Table 6: r=20
+    encoder_output_dim: 100    # Table 6: m=100
     ridge_param: 1e-3
     jitter: 1e-6
 
     feature_mapping:
-      type: "mlp"      # averaging | linear | mlp
+      type: "mlp"
       hidden_dims: [32]
       activation: "relu"
 
   df_state:
-    feature_dim: 50         # state feature dimension d_A
-    lambda_A: 1e-3          # V_A regularization
-    lambda_B: 1e-3          # U_A regularization
-    feature_net:            # phi_theta net
+    feature_dim: 50            # Table 6: dA=50
+    lambda_A: 1e-2             # Table 6: lambda_A=1e-2
+    lambda_B: 1e-3
+    feature_net:
       hidden_sizes: [128, 64]
       activation: "ReLU"
       dropout: 0.1
@@ -96,11 +97,11 @@ ssm:
       activation: "ReLU"
 
   df_observation:
-    obs_feature_dim: 25         # observation feature dimension d_B
-    multivariate_feature_dim: 50  # encoder output dimension m
-    lambda_B: 1e-3              # V_B regularization
-    lambda_dB: 1e-3             # u_B regularization
-    obs_net:                    # psi_omega net
+    obs_feature_dim: 50            # Table 6: dB=50
+    multivariate_feature_dim: 100  # Table 6: m=100
+    lambda_B: 1e-3
+    lambda_dB: 1e-3
+    obs_net:
       hidden_sizes: [64, 32]
       activation: "ReLU"
       dropout: 0.1
@@ -117,17 +118,6 @@ computation:
   num_workers: 4
   pin_memory: true
 
-output:
-  save_model: true
-  save_history: true
-  create_plots: true
-  save_reconstructions: true
-
-logging:
-  level: "INFO"
-  console_output: true
-  file_output: true
-
 evaluation:
   use_new_realization: true
 
@@ -141,7 +131,6 @@ evaluation:
       - "mse"
       - "psnr"
       - "ssim"
-    save_detailed_results: true
 
   encoded_feature_space_viz:
     dim_indices: [0, 1]

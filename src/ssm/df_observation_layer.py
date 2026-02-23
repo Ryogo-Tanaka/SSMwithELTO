@@ -793,7 +793,7 @@ class DFObservationLayer(nn.Module):
         """
         Legacy two-stage cross-fitting training (multivariate).
 
-        Note: For Phase-1 training, use train_stage1_with_gradients
+        Note: For Stage-1 training, use train_stage1_with_gradients
         and train_stage2_with_gradients instead.
         """
         T_x, r = X_hat_states.shape

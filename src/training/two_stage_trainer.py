@@ -1,12 +1,12 @@
 """
 TwoStageTrainer: Two-stage training strategy implementation.
 
-Phase-1: DF-A/DF-B Stage-1/Stage-2 alternating training
-Phase-2: End-to-end fine-tuning
+Stage-1: DF-A/DF-B Stage-1/Stage-2 alternating training
+Stage-2: End-to-end fine-tuning
 
 Training strategy:
 **DF-A (State Layer)**:
-for epoch in Phase1:
+for epoch in warmup_epochs:
   for t = 1 to T1:  # Stage-1
     V_A^{(-k)} = closed_form(Phi_minus, Phi_plus, phi_theta fixed)
     phi_theta <- phi_theta - alpha * grad_L1(V_A^{(-k)}, phi_theta)
@@ -15,7 +15,7 @@ for epoch in Phase1:
     U_A = closed_form(H^{(cf)}_A, X_+)  # U_A update (closed-form only)
 
 **DF-B (Observation Layer)**:
-for epoch in Phase1:
+for epoch in warmup_epochs:
   for t = 1 to T1:  # Stage-1
     V_B = closed_form(Phi_prev, Psi_curr)  # V_B (psi_omega fixed)
     phi_theta <- phi_theta - alpha * grad_L1(V_B, phi_theta)
@@ -24,8 +24,8 @@ for epoch in Phase1:
     U_B = closed_form(H^{(cf)}_B, M)    # U_B (phi_theta fixed)
     psi_omega <- psi_omega - alpha * grad_L2(U_B, psi_omega)
 
-Phase-2: End-to-end fine-tuning
-for epoch in Phase2:
+Stage-2: End-to-end fine-tuning
+for epoch in active_epochs:
   # Fixed inference path
   x_hat_{t|t-1} = U_A^T V_A phi_theta(x_{t-1})
   m_hat_{t|t-1} = U_B^T V_B phi_theta(x_hat_{t|t-1})
@@ -167,7 +167,7 @@ class TrainingLogger:
     def log_phase1(self, epoch: int, phase: TrainingPhase, stage: str, 
                    iteration: int, metrics: Dict[str, float], 
                    learning_rates: Dict[str, float]):
-        """Record Phase-1 log entry."""
+        """Record Stage-1 log entry."""
         log_entry = {
             'epoch': epoch,
             'phase': phase.value,
@@ -190,7 +190,7 @@ class TrainingLogger:
 
     def log_phase2(self, epoch: int, total_loss: float, rec_loss: float,
                    cca_loss: float, learning_rates: Dict[str, float]):
-        """Record Phase-2 log entry."""
+        """Record Stage-2 log entry."""
         log_entry = {
             'epoch': epoch,
             'total_loss': total_loss,
@@ -264,8 +264,8 @@ class TwoStageTrainer:
     """
     Main class for the proposed two-stage training strategy.
     
-    1. Phase-1: DF-A/DF-B cooperative training
-    2. Phase-2: End-to-end fine-tuning
+    1. Stage-1: DF-A/DF-B cooperative training
+    2. Stage-2: End-to-end fine-tuning
     3. Detailed logging and visualization
     4. Time index alignment and memory efficiency
     """
@@ -735,7 +735,7 @@ class TwoStageTrainer:
             psi_params += list(self.df_obs.readout_net.parameters())
         self.optimizers['psi'] = torch.optim.Adam(psi_params, lr=self.config.lr_psi)
 
-        # Phase-2 optimizer: param groups depend on update_strategy
+        # Stage-2 optimizer: param groups depend on update_strategy
         param_groups = [
             {'params': list(self.encoder.parameters()), 'lr': self.config.lr_encoder},
             {'params': list(self.decoder.parameters()), 'lr': self.config.lr_decoder},
@@ -748,7 +748,7 @@ class TwoStageTrainer:
             ])
 
         self.optimizers['e2e'] = torch.optim.Adam(param_groups)
-        print(f"Phase-2 optimizer: {len(param_groups)} param groups (update_strategy={self.config.update_strategy})")
+        print(f"Stage-2 optimizer: {len(param_groups)} param groups (update_strategy={self.config.update_strategy})")
         
         print("Optimizers initialized")
     
@@ -804,11 +804,11 @@ class TwoStageTrainer:
                                         self._static_logs_shown.add('traditional_realization_shapes')
         except RealizationError as e:
             print(f"RealizationError: {e}")
-            raise RealizationError(f"Phase1 realization failed: {e}") from e
+            raise RealizationError(f"Stage-1 realization failed: {e}") from e
 
         self._last_X_states_length = X_states.size(0)
 
-        # Detach X_states for Phase-1 (allows multiple backward passes)
+        # Detach X_states for Stage-1 (allows multiple backward passes)
         X_states = X_states.detach()
 
         if self.config.verbose and 'state_estimation_complete' not in self._static_logs_shown:
@@ -825,13 +825,13 @@ class TwoStageTrainer:
 
     def train_phase1(self, Y_train: torch.Tensor) -> Dict[str, Any]:
         """
-        Phase-1: DF-A/DF-B cooperative training.
+        Stage-1: DF-A/DF-B cooperative training.
         
         Args:
             Y_train: Training observation sequence (T, d)
             
         Returns:
-            Phase-1 metrics
+            Stage-1 metrics
         """
         print("\n=")
 
@@ -862,12 +862,12 @@ class TwoStageTrainer:
         self._compute_final_operators(Y_train)
 
         self.phase1_complete = True
-        print("Phase-1 training complete")
+        print("Stage-1 training complete")
 
         return self.training_history['phase1_metrics']
 
     def _compute_final_operators(self, Y_train: torch.Tensor):
-        """Compute final operators V_A/V_B/U_A/U_B after Phase-1."""
+        """Compute final operators V_A/V_B/U_A/U_B after Stage-1."""
         self.encoder = self.encoder.to(self.device)
         self.decoder = self.decoder.to(self.device)
 
@@ -938,10 +938,10 @@ class TwoStageTrainer:
             if canonical_correlations is not None:
                 phase1_epochs = getattr(self.config, 'phase1_epochs', self.config.epochs)
                 final_epoch = getattr(self, 'current_epoch', phase1_epochs - 1)
-                self.logger.log_canonical_correlations(final_epoch, "Phase-1-Complete", canonical_correlations)
+                self.logger.log_canonical_correlations(final_epoch, "Stage-1-Complete", canonical_correlations)
 
         except Exception as e:
-            print(f"Error logging canonical correlations at Phase-1 completion: {e}")
+            print(f"Error logging canonical correlations at Stage-1 completion: {e}")
 
     def _train_df_a_epoch(self, X_states: torch.Tensor, epoch: int) -> Dict[str, float]:
         """
@@ -1077,7 +1077,7 @@ class TwoStageTrainer:
     def train_phase2(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None,
                      target_train: Optional[torch.Tensor] = None, target_val: Optional[torch.Tensor] = None) -> Dict[str, float]:
         """
-        Phase-2: End-to-end fine-tuning.
+        Stage-2: End-to-end fine-tuning.
         
         Fixed inference path:
         x̂_{t|t-1} = U_A^T V_A φ_θ(x_{t-1})
@@ -1101,7 +1101,7 @@ class TwoStageTrainer:
             Y_val = self._ensure_device(Y_val)
         
         if not self.phase1_complete:
-            raise RuntimeError("Phase-1 not completed")
+            raise RuntimeError("Stage-1 not completed")
         
         opt_e2e = self.optimizers['e2e']
 
@@ -1116,7 +1116,7 @@ class TwoStageTrainer:
                 opt_e2e.step()
                 
             except RealizationError as e:
-                print(f"Epoch {epoch} skipped (Phase2 realization failure): {e}")
+                print(f"Epoch {epoch} skipped (Stage-2 realization failure): {e}")
                 continue
             
             lr_dict = {f'lr_{name}': group['lr'] for name, group in
@@ -1132,20 +1132,20 @@ class TwoStageTrainer:
             })
 
             if epoch % self.config.log_interval == 0 and self.config.verbose:
-                print(f"Phase-2 Epoch {epoch}: Total={loss_total.item():.6f}, "
+                print(f"Stage-2 Epoch {epoch}: Total={loss_total.item():.6f}, "
                       f"Rec={rec_loss.item():.6f}, CCA={cca_loss.item():.6f}")
                 self.log_multivariate_training_progress(epoch, "phase2")
 
             if epoch % self.config.save_interval == 0:
                 self._save_checkpoint(epoch, TrainingPhase.PHASE2_E2E)
         
-        print("Phase-2 training complete")
+        print("Stage-2 training complete")
         return self.training_history['phase2_losses']
 
     def train_integrated(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None,
                          target_train: Optional[torch.Tensor] = None, target_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
-        Unified training: run Phase-1 and Phase-2 consecutively each epoch.
+        Unified training: run Stage-1 and Stage-2 consecutively each epoch.
 
         Args:
             Y_train: Training observation sequence (T, d)
@@ -1169,7 +1169,7 @@ class TwoStageTrainer:
         for epoch in range(self.config.epochs):
             self.current_epoch = epoch
             try:
-                # Recompute X_states after encoder update in Phase-2
+                # Recompute X_states after encoder update in Stage-2
                 if epoch >= self.config.phase1_warmup_epochs:
                     with torch.no_grad():
                         M_features = self.encoder(Y_train)
@@ -1184,14 +1184,14 @@ class TwoStageTrainer:
 
                 if self.config.update_strategy == "joint_all":
                     if epoch == 0:
-                        print("[joint_all] Phase-1 skipped (joint_all mode)")
+                        print("[joint_all] Stage-1 skipped (joint_all mode)")
                         print("[joint_all] Computing initial operators...")
                         self._compute_operators_for_joint_all(Y_train)
 
                         self.phase1_complete = True
                         self.df_state._is_fitted = True
                         self.df_obs._is_fitted = True
-                        print("[joint_all] Initial operators computed (proceeding to Phase-2)")
+                        print("[joint_all] Initial operators computed (proceeding to Stage-2)")
 
                     phase1_metrics = {
                         'df_a_stage1_pred': 0.0,
@@ -1284,7 +1284,7 @@ class TwoStageTrainer:
     def _train_integrated_phase1_epoch(self, X_states: torch.Tensor, M_features: torch.Tensor,
                                      epoch: int) -> Dict[str, Any]:
         """
-        Execute one epoch of Phase-1 in unified training.
+        Execute one epoch of Stage-1 in unified training.
         Same formulation-based implementation as _train_df_a_epoch, _train_df_b_epoch.
         """
         epoch_metrics = {}
@@ -1299,7 +1299,7 @@ class TwoStageTrainer:
 
     def _train_integrated_phase2_epoch(self, Y_train: torch.Tensor, epoch: int, target_data: torch.Tensor = None) -> Dict[str, float]:
         """
-        Execute one epoch of Phase-2 in unified training.
+        Execute one epoch of Stage-2 in unified training.
         Applies same device management and error handling as train_phase2.
         """
         validation_losses = None
@@ -1325,7 +1325,7 @@ class TwoStageTrainer:
         self.encoder.train()
         self.decoder.train()
 
-        # DF layers in eval mode during Phase-2 (disable dropout)
+        # DF layers in eval mode during Stage-2 (disable dropout)
         if hasattr(self, 'df_state') and self.df_state is not None:
             self.df_state.eval()
         if hasattr(self, 'df_obs') and self.df_obs is not None:
@@ -1342,7 +1342,7 @@ class TwoStageTrainer:
             opt_e2e.zero_grad()
             loss_total.backward()
 
-            # Gradient diagnostics at first active Phase-2 epoch
+            # Gradient diagnostics at first active Stage-2 epoch
             if epoch == self.config.phase1_warmup_epochs and not hasattr(self, '_grad_diag_done'):
                 enc_grad_norm = sum(
                     p.grad.norm().item() for p in self.encoder.parameters()
@@ -1381,7 +1381,7 @@ class TwoStageTrainer:
             return result
 
         except RealizationError as e:
-            print(f"Epoch {epoch} Phase-2 skipped (realization failure): {e}")
+            print(f"Epoch {epoch} Stage-2 skipped (realization failure): {e}")
             result = {
                 'epoch': epoch,
                 'total_loss': 0.0,
@@ -1405,7 +1405,7 @@ class TwoStageTrainer:
 
     def _lightweight_operator_update(self, Y_train: torch.Tensor):
         """
-        Lightweight operator update after Phase-1.
+        Lightweight operator update after Stage-1.
         Based on _compute_final_operators pattern.
         """
         try:
@@ -1541,7 +1541,7 @@ class TwoStageTrainer:
             return losses
 
     def _initialize_phase2_optimizer(self):
-        """Initialize Phase-2 optimizer with param groups based on update_strategy."""
+        """Initialize Stage-2 optimizer with param groups based on update_strategy."""
         if 'e2e' not in self.optimizers:
             param_groups = [
                 {'params': list(self.encoder.parameters()), 'lr': self.config.lr_encoder},
@@ -1561,7 +1561,7 @@ class TwoStageTrainer:
                     {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
                     {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi}
                 ])
-                print("Phase-2 also updates DF layers (update_strategy='all', staged+Phase-2 DF update)")
+                print("Stage-2 also updates DF layers (update_strategy='all', staged+Stage-2 DF update)")
             elif self.config.update_strategy == "joint_all":
                 param_groups.extend([
                     {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
@@ -1571,13 +1571,13 @@ class TwoStageTrainer:
                 print("  - Training targets: encoder + decoder + phi_theta + psi_omega")
                 print("  - Operators: recomputed from phi_theta/psi_omega every epoch")
             else:
-                print("Phase-2 updates encoder/decoder only (staged training design)")
+                print("Stage-2 updates encoder/decoder only (staged training design)")
 
             self.optimizers['e2e'] = torch.optim.Adam(param_groups)
 
     def _forward_and_loss_phase2(self, Y_train: torch.Tensor, target_data: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Phase-2 forward inference and loss computation (experiment_mode aware).
+        Stage-2 forward inference and loss computation (experiment_mode aware).
         Args:
             Y_train: Observation data
             target_data: Target data (required for target_prediction mode)
@@ -1592,7 +1592,7 @@ class TwoStageTrainer:
             return self._forward_and_loss_phase2_reconstruction(Y_train)
 
     def _forward_and_loss_phase2_reconstruction(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Phase-2 reconstruction mode: forward pass and loss computation."""
+        """Stage-2 reconstruction mode: forward pass and loss computation."""
         self.encoder = self.encoder.to(self.device)
         self.decoder = self.decoder.to(self.device)
 
@@ -1615,8 +1615,8 @@ class TwoStageTrainer:
                 self.realization.fit(m_scalar.unsqueeze(1))
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
         except RealizationError as e:
-            print(f"Phase2 RealizationError: {e}")
-            raise RealizationError(f"Phase2 realization failed: {e}") from e
+            print(f"Stage-2 RealizationError: {e}")
+            raise RealizationError(f"Stage-2 realization failed: {e}") from e
 
         # Step 3: DF-A prediction (retain gradients for end-to-end)
         X_hat_states = self.df_state.predict_sequence(X_states, training=True)
@@ -1649,7 +1649,7 @@ class TwoStageTrainer:
         return loss_total, loss_rec, loss_cca
 
     def _forward_and_loss_phase2_target(self, Y_train: torch.Tensor, target_data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Phase-2 target prediction mode: forward pass and loss computation."""
+        """Stage-2 target prediction mode: forward pass and loss computation."""
         self.encoder = self.encoder.to(self.device)
         self.decoder = self.decoder.to(self.device)
 
@@ -1675,8 +1675,8 @@ class TwoStageTrainer:
                 self.realization.fit(m_scalar.unsqueeze(1))
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
         except RealizationError as e:
-            print(f"Phase2 Target RealizationError: {e}")
-            raise RealizationError(f"Phase2 target realization failed: {e}") from e
+            print(f"Stage-2 Target RealizationError: {e}")
+            raise RealizationError(f"Stage-2 target realization failed: {e}") from e
 
         # Steps 3-4: DF-A/DF-B prediction
         X_hat_states = self.df_state.predict_sequence(X_states, training=True)
@@ -1727,7 +1727,7 @@ class TwoStageTrainer:
             if hasattr(self, 'current_epoch') and hasattr(self, 'logger'):
                 epoch = getattr(self, 'current_epoch', 0)
                 if epoch % self.config.log_interval == 0:
-                    self.logger.log_canonical_correlations(epoch, "Phase-2", canonical_correlations)
+                    self.logger.log_canonical_correlations(epoch, "Stage-2", canonical_correlations)
 
             return cca_loss
 
@@ -2035,7 +2035,7 @@ class TwoStageTrainer:
             return torch.stack(predictions)
     
     def train_full(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-        """Execute full training (Phase-1 + Phase-2)."""
+        """Execute full training (Stage-1 + Stage-2)."""
         try:
             phase1_metrics = self.train_phase1(Y_train)
             phase2_metrics = self.train_phase2(Y_train, Y_val)
@@ -2058,13 +2058,13 @@ class TwoStageTrainer:
             raise
     
     def _print_phase1_progress(self, epoch: int, metrics: Dict[str, float]):
-        """Display Phase-1 progress."""
+        """Display Stage-1 progress."""
         df_a_s1 = metrics.get('df_a_stage1_loss', 0)
         df_a_s2 = metrics.get('df_a_stage2_loss', 0)
         df_b_s1 = metrics.get('df_b_stage1_loss', 0)
         df_b_s2 = metrics.get('df_b_stage2_loss', 0)
         
-        print(f"Phase-1 Epoch {epoch:3d}: "
+        print(f"Stage-1 Epoch {epoch:3d}: "
               f"DF-A(S1={df_a_s1:.4f}, S2={df_a_s2:.4f}) "
               f"DF-B(S1={df_b_s1:.4f}, S2={df_b_s2:.4f})")
     
@@ -2444,7 +2444,7 @@ def plot_training_results(output_dir: str) -> None:
             df_phase1 = pd.read_csv(phase1_csv)
             
             fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle('Phase-1 Training Progress')
+            fig.suptitle('Stage-1 Training Progress')
 
             df_a_s1 = df_phase1[(df_phase1['phase'] == 'phase1_df_a') & (df_phase1['stage'] == 'stage1')]
             if not df_a_s1.empty:
@@ -2483,7 +2483,7 @@ def plot_training_results(output_dir: str) -> None:
             df_phase2 = pd.read_csv(phase2_csv)
             
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            fig.suptitle('Phase-2 Training Progress')
+            fig.suptitle('Stage-2 Training Progress')
             
             axes[0].plot(df_phase2['epoch'], df_phase2['total_loss'])
             axes[0].set_title('Total Loss')

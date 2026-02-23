@@ -712,7 +712,7 @@ class DFStateLayer(nn.Module):
         """
         Legacy two-stage cross-fitting training.
 
-        Note: For Phase-1 training, use train_stage1_with_gradients
+        Note: For Stage-1 training, use train_stage1_with_gradients
         and train_stage2_with_gradients instead.
         """
         T, r = X_states.shape
@@ -997,7 +997,7 @@ class DFStateLayer(nn.Module):
         Args:
             X_states: State sequence (T, r)
             return_features: Whether to also return features
-            training: If True, retain gradients (for Phase-2 end-to-end training)
+            training: If True, retain gradients (for Stage-2 end-to-end training)
 
         Returns:
             torch.Tensor: Prediction sequence (T-1, r)

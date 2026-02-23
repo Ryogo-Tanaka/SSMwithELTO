@@ -5,7 +5,7 @@ Full experiment pipeline for quad-link image reconstruction.
 
 Features:
 - Unified data loading with architecture dispatch
-- Phase-1 + Phase-2 integrated training (with optional Kalman filtering)
+- Stage-1 + Stage-2 integrated training (with optional Kalman filtering)
 - Model and transfer operator saving
 - Training visualization and logging
 - Reproducibility via random seed
@@ -559,7 +559,7 @@ class FullExperimentPipeline:
                 axes[0, 0].plot(epochs, total_losses, label='Total Loss')
                 axes[0, 0].plot(epochs, rec_losses, label='Reconstruction Loss')
                 axes[0, 0].plot(epochs, cca_losses, label='CCA Loss')
-                axes[0, 0].set_title('Phase-2 Loss Components')
+                axes[0, 0].set_title('Stage-2 Loss Components')
                 axes[0, 0].set_xlabel('Epoch')
                 axes[0, 0].set_ylabel('Loss')
                 axes[0, 0].legend()
@@ -571,7 +571,7 @@ class FullExperimentPipeline:
                 axes[0, 1].set_ylabel('CCA Loss')
                 axes[0, 1].grid(True)
         else:
-            loss_type = "Target Loss" if experiment_mode == "target_prediction" else "Phase-2 Loss"
+            loss_type = "Target Loss" if experiment_mode == "target_prediction" else "Stage-2 Loss"
             axes[0, 0].text(0.5, 0.5, f'No {loss_type} training data available',
                            ha='center', va='center', transform=axes[0, 0].transAxes)
             axes[0, 0].set_title(f'{loss_type} Components')
@@ -593,9 +593,9 @@ class FullExperimentPipeline:
         Experiment Mode: {experiment_mode}
         Total Training Time: {total_time:.1f}s
         Kalman Filtering: {results.get('use_kalman', False)}
-        Phase-2 Epochs: {phase2_count}
+        Stage-2 Epochs: {phase2_count}
         Integrated Epochs: {integrated_count}
-        Status: {'Completed' if phase2_count > 0 else 'Phase-1 Only'}
+        Status: {'Completed' if phase2_count > 0 else 'Stage-1 Only'}
         """
         axes[1, 1].text(0.1, 0.5, info_text, transform=axes[1, 1].transAxes,
                         verticalalignment='center', fontsize=10)

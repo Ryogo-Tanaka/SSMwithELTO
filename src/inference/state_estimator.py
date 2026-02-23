@@ -56,7 +56,7 @@ class StateEstimator:
         self.Q: Optional[torch.Tensor] = None
         self.R: Optional[Union[torch.Tensor, float]] = None
 
-        # Nonlinear readout networks (Phase II)
+        # Nonlinear readout networks
         self.readout_A: Optional[nn.Module] = None
         self.readout_B: Optional[nn.Module] = None
         

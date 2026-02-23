@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.linalg import cholesky, solve_triangular, eigvalsh, svd
+from torch.linalg import cholesky, solve_triangular, svd
 import warnings
 from typing import Optional, Dict, Any, Tuple, Union, List
 import math
@@ -205,7 +205,7 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         # Step 1: Apply encoder u_eta at all time points (Section 3.1)
         if self.encoder.training:
-            # Retain gradients for Phase-2 CCA loss backpropagation
+            # Retain gradients for Stage-2 CCA loss backpropagation
             M = self.encoder(Y)  # (T, m)
         else:
             self.encoder.eval()
@@ -219,11 +219,6 @@ class StochasticRealizationWithEncoder(nn.Module):
 
         if N <= 0:
             raise ValueError(f"Time series too short for window length {L}")
-
-            if M.dim() == 1:
-                M = M.unsqueeze(0)
-            elif M.dim() == 3:
-                M = M.squeeze(1)
 
         # Step 2: Build feature mapping phi_m (Section 3.3)
         Feat_X_list = []
@@ -621,8 +616,6 @@ class Realization:
 
         self.B = None
         self._L_vals = None
-        self._Spp_eigvals = None
-        self.H = None
 
     def fit(self, Y: torch.Tensor):
         T, p = Y.shape

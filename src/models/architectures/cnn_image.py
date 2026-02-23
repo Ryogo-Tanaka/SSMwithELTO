@@ -579,7 +579,7 @@ def make_state_decoder(cfg: Dict[str, Any]) -> cnn_image_targetDecoder:
     )
 
 
-# Backward-compatible aliases for checkpoints saved before Phase E rename
+# Backward-compatible aliases for legacy checkpoint loading
 rknEncoder = cnn_imageEncoder
 rknDecoder = cnn_imageDecoder
 rkn_targetDecoder = cnn_image_targetDecoder
