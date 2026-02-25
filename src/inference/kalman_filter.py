@@ -516,15 +516,6 @@ class OperatorBasedKalmanFilter:
         
         return cov_matrix
 
-    def _compute_likelihood(self, innovation: torch.Tensor, S: torch.Tensor) -> float:
-        """
-        Observation likelihood (deprecated).
-
-        The formulation does not assume a Gaussian distribution, so likelihood
-        computation is not theoretically applicable. Returns a dummy value.
-        """
-        return 0.0
-
     def get_current_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get current state estimate and covariance.

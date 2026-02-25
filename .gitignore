@@ -19,11 +19,11 @@ generate_series.py
 
 .vscode
 
-# 生成物
+# Generated files
 checkpoints/
 experiments/
 
-# 一時的設定
+# Temporary configs
 main_proposed_method.py
 main_two_stage.py
 
