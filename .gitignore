@@ -27,3 +27,6 @@ experiments/
 main_proposed_method.py
 main_two_stage.py
 
+# PROJ-REBUTTAL: external NCDSSM repo (cloned, kept out of git)
+external/
+
