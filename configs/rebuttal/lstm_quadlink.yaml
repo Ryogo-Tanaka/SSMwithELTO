@@ -1,0 +1,47 @@
+# LSTM (CNN-LSTM-CNN) baseline config for quad-link prediction.
+#
+# Key choices:
+# - feature_dim 100 (matches DSE encoder output)
+# - LSTM hidden 100 (matches RKN paper Table 5 m=100 LSTM baseline)
+# - 1-layer LSTM, MSE loss, Adam lr=1e-3 (DSE-equivalent default)
+# - window_len = 30 (training); ctx_len for eval is set per-script
+
+method: lstm
+dataset: quadlink
+quadlink_data_root: /workspace/nas/SSMwithELTO/data/rkn_quad
+regime: clean
+data_seed: 1
+
+# Model architecture
+input_resolution: [48, 48, 1]
+feature_dim: 100
+lstm_hidden: 100
+lstm_layers: 1
+encoder_hidden: 200
+decoder_hidden: 200
+
+# Data / windowing
+window_len: 30
+stride: 1
+val_size: 300
+
+# Training
+num_epochs: 30
+batch_size: 32
+learning_rate: 1.0e-3
+weight_decay: 0.0
+max_grad_norm: 10.0
+device: cuda
+num_workers: 0
+
+# Logging / checkpointing
+log_every_steps: 50
+val_every_epochs: 1
+save_every_epochs: 5
+
+# Evaluation defaults (used by evaluate_lstm_quadlink.py / evaluate_multistep_rollout_lstm.py)
+eval:
+  ctx_len: 30
+  protocol: dse  # "dse" (skip 1) or "onestep"
+  rollout_horizons: [1, 5, 10, 20, 50]
+  rollout_context_lens: [5, 10]

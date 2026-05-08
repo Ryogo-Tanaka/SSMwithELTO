@@ -141,14 +141,20 @@ class OperatorBasedKalmanFilter:
 
         Args:
             initial_observations: Initial observation samples (N0, n)
-            method: Initialization method ("data_driven" | "zero")
+            method: Initialization method ("data_driven" | "zero" | "from_observations")
+                - "data_driven": legacy path using _approximate_feature_mapping placeholder
+                - "zero": mu_0=0, Sigma_0=I (uninformative prior)
+                - "from_observations": use learned V_B and psi_omega
+                  (mu_0 = V_B^+ mean(psi_omega(encoder(y_t))),
+                   Sigma_0 = scaled identity to avoid rank deficiency
+                   when N0 < dA, e.g. short rollout context like C=5)
 
         Returns:
             mu_0: Initial state mean (dA,)
             Sigma_0: Initial state covariance (dA, dA)
         """
         N0 = initial_observations.size(0)
-        
+
         if method == "data_driven":
             # Eq. 47-48: Data-driven initialization
             with torch.no_grad():
@@ -161,7 +167,7 @@ class OperatorBasedKalmanFilter:
 
                 # Approximate feature mapping (simplified; real implementation uses DF-B psi_omega)
                 phi_samples = self._approximate_feature_mapping(m_initial)  # (N0, dA)
-                
+
                 mu_0 = torch.mean(phi_samples, dim=0)  # (dA,)
 
                 centered = phi_samples - mu_0.unsqueeze(0)  # (N0, dA)
@@ -170,16 +176,99 @@ class OperatorBasedKalmanFilter:
         elif method == "zero":
             mu_0 = torch.zeros(self.dA, device=self.device)
             Sigma_0 = torch.eye(self.dA, device=self.device)
+
+        elif method == "from_observations":
+            mu_0, Sigma_0 = self._init_from_observations(initial_observations)
+
         else:
             raise ValueError(f"Unknown initialization method: {method}")
-            
+
         # Ensure positive definiteness
         Sigma_0 = self._regularize_covariance(Sigma_0)
 
         self.mu = mu_0.clone()
         self.Sigma = Sigma_0.clone()
         self.is_initialized = True
-        
+
+        return mu_0, Sigma_0
+
+    def _init_from_observations(
+        self,
+        observations: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Initialize mu_0 from C frames using the learned V_B and psi_omega.
+
+        For each frame: phi_t = V_B^+ psi_omega(encoder(y_t)), then
+        mu_0 = mean_t(phi_t). Sigma_0 is set to a scaled identity to avoid
+        rank deficiency when N0 < dA (e.g. C=5 context windows for dA=50).
+
+        Args:
+            observations: Initial observation samples. Expected shapes:
+                (T, H, W, C) for image data, or (T, n) for vector data.
+
+        Returns:
+            mu_0: Initial state mean (dA,)
+            Sigma_0: Initial state covariance (dA, dA)
+        """
+        if self.df_obs_layer is None or not hasattr(self.df_obs_layer, "psi_omega"):
+            raise RuntimeError(
+                "method='from_observations' requires df_obs_layer with psi_omega; "
+                "got None or layer without psi_omega."
+            )
+
+        with torch.no_grad():
+            obs = observations.to(self.device)
+
+            # Encode y_t -> m_t (m,). The cnn_image encoder accepts (B, T, H, W, C);
+            # vector encoders accept (B, T, n). Normalize to (T, m).
+            if obs.dim() == 4:        # (T, H, W, C) image batch
+                obs_in = obs.unsqueeze(0)  # (1, T, H, W, C)
+                m_series = self.encoder(obs_in)
+                # cnn_imageEncoder returns (B, T, m) -> squeeze batch
+                if m_series.dim() == 3 and m_series.size(0) == 1:
+                    m_series = m_series.squeeze(0)  # (T, m)
+            elif obs.dim() == 5:      # (B=1, T, H, W, C)
+                m_series = self.encoder(obs)
+                if m_series.dim() == 3 and m_series.size(0) == 1:
+                    m_series = m_series.squeeze(0)
+            elif obs.dim() == 2:      # (T, n) vector data
+                m_series = self.encoder(obs.unsqueeze(0))
+                if m_series.dim() == 3 and m_series.size(0) == 1:
+                    m_series = m_series.squeeze(0)
+            else:
+                raise ValueError(
+                    f"Unexpected observations.dim()={obs.dim()}; expected 2, 4, or 5."
+                )
+
+            if m_series.dim() == 1:
+                m_series = m_series.unsqueeze(0)  # (1, m)
+            T = m_series.size(0)
+
+            # Apply learned psi_omega: m_t -> psi_t (dB,)
+            psi_series = self.df_obs_layer.psi_omega(m_series)  # (T, dB)
+            if psi_series.dim() == 1:
+                psi_series = psi_series.unsqueeze(0)
+
+            # Pseudo-inverse of V_B (dB, dA) -> (dA, dB)
+            try:
+                V_B_pinv = torch.linalg.pinv(self.V_B, rtol=1e-6)
+            except Exception:
+                V_B_pinv = torch.linalg.pinv(self.V_B)
+
+            # Map psi back to phi space: phi_t = V_B^+ psi_t
+            phi_series = (V_B_pinv @ psi_series.T).T  # (T, dA)
+
+            # mu_0: empirical mean over context frames
+            mu_0 = torch.mean(phi_series, dim=0)  # (dA,)
+
+            # Sigma_0: scaled identity (avoid rank-deficient empirical cov when T < dA)
+            if T > 1:
+                phi_var_scale = phi_series.var(dim=0).mean().clamp(min=1e-3).item()
+            else:
+                phi_var_scale = 1.0
+            Sigma_0 = phi_var_scale * torch.eye(self.dA, device=self.device)
+
         return mu_0, Sigma_0
 
     def _approximate_feature_mapping(self, m_series: torch.Tensor) -> torch.Tensor:

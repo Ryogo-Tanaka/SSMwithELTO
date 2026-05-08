@@ -1,0 +1,52 @@
+# RKN baseline config for quad-link image prediction (PROJ-REBUTTAL Step 8).
+#
+# Architecture mirrors the official PyTorch port (`ALRhub/rkn_share`) hyper-
+# parameters for the quad-link experiment (paper §3.3):
+#   m = lod = 100, lsd = 2*m = 200, bandwidth b = 3, K = num_basis = 15.
+# Training uses image-space MSE (matches DSE-aligned evaluation protocol).
+
+method: rkn
+dataset: quadlink
+quadlink_data_root: /workspace/nas/SSMwithELTO/data/rkn_quad
+regime: clean
+data_seed: 1
+
+# Model architecture (RKN cell)
+input_resolution: [48, 48, 1]
+lod: 100                        # latent observation dim m
+num_basis: 15                   # K
+bandwidth: 3                    # b
+trans_net_hidden_units: [128, 128]
+trans_net_hidden_activation: Tanh
+trans_covar: 0.1
+encoder_hidden: 200
+decoder_hidden: 200
+decoder_upsample_mode: nearest
+initial_state_variance: 10.0
+normalize_pre: true             # L2-normalize encoder hidden (RKN "pre" mode)
+
+# Data / windowing
+window_len: 30
+stride: 1
+val_size: 300
+
+# Training
+num_epochs: 30
+batch_size: 32
+learning_rate: 1.0e-3
+weight_decay: 0.0
+max_grad_norm: 10.0
+device: cuda
+num_workers: 0
+
+# Logging / checkpointing
+log_every_steps: 50
+val_every_epochs: 1
+save_every_epochs: 5
+
+# Evaluation defaults (used by evaluate scripts)
+eval:
+  ctx_len: 30
+  protocol: dse
+  rollout_horizons: [1, 5, 10, 20, 50]
+  rollout_context_lens: [5, 10]
