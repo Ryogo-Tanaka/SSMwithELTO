@@ -107,7 +107,6 @@ evaluation:
   reconstruction_metrics:
     metrics: ['reconstruction_rmse', 'psnr', 'temporal_correlation']
     max_samples: 100
-    visualization: true
 
   reconstruction:
     metrics:

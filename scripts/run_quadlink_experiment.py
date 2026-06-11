@@ -338,86 +338,6 @@ class FullExperimentPipeline:
         print(f"Experiment completed: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"All results saved to: {self.output_dir}")
 
-    def _plot_data_overview(self, data_dict: Dict[str, torch.Tensor]):
-        """Plot data overview (image and time series data)."""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle('Data Overview', fontsize=14)
-
-        train_data = data_dict['train'].cpu().numpy()
-
-        if len(train_data.shape) == 4:  # Image data (T, H, W, C)
-            T, H, W, C = train_data.shape
-            sample_images = train_data[:min(6, T)]
-            for i, img in enumerate(sample_images):
-                if i >= 6:
-                    break
-                row = i // 3
-                col = i % 3
-                if row < 2 and col < 2:
-                    if C == 1:
-                        axes[row, col].imshow(img.squeeze(-1), cmap='gray')
-                    else:
-                        axes[row, col].imshow(img)
-                    axes[row, col].set_title(f'Frame {i}')
-                    axes[row, col].axis('off')
-
-            sizes = [data_dict['train'].shape[0], data_dict['val'].shape[0], data_dict['test'].shape[0]]
-            if len(sizes) >= 3:
-                axes[0, 1].pie(sizes, labels=['Train', 'Val', 'Test'], autopct='%1.1f%%')
-                axes[0, 1].set_title('Data Split Ratio')
-
-            axes[1, 0].hist(train_data.flatten(), bins=50, alpha=0.7)
-            axes[1, 0].set_title('Pixel Value Distribution')
-            axes[1, 0].set_xlabel('Pixel Value')
-            axes[1, 0].set_ylabel('Frequency')
-            axes[1, 0].grid(True)
-
-            stats_text = f"""
-            Data Type: Image Sequence
-            Shape: {train_data.shape}
-            Time steps: {T}
-            Image size: {H}x{W}x{C}
-            Mean: {train_data.mean():.3f}
-            Std: {train_data.std():.3f}
-            Min: {train_data.min():.3f}
-            Max: {train_data.max():.3f}
-            """
-
-        else:  # Time series data (T, d)
-            for i in range(min(3, train_data.shape[1])):
-                axes[0, 0].plot(train_data[:, i], label=f'Feature {i+1}')
-            axes[0, 0].set_title('Training Data Time Series')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True)
-
-            sizes = [data_dict['train'].shape[0], data_dict['val'].shape[0], data_dict['test'].shape[0]]
-            axes[0, 1].pie(sizes, labels=['Train', 'Val', 'Test'], autopct='%1.1f%%')
-            axes[0, 1].set_title('Data Split Ratio')
-
-            axes[1, 0].hist(train_data.flatten(), bins=50, alpha=0.7)
-            axes[1, 0].set_title('Feature Value Distribution')
-            axes[1, 0].set_xlabel('Value')
-            axes[1, 0].set_ylabel('Frequency')
-            axes[1, 0].grid(True)
-
-            stats_text = f"""
-            Data Type: Time Series
-            Shape: {train_data.shape}
-            Mean: {train_data.mean():.3f}
-            Std: {train_data.std():.3f}
-            Min: {train_data.min():.3f}
-            Max: {train_data.max():.3f}
-            """
-
-        axes[1, 1].text(0.1, 0.5, stats_text, transform=axes[1, 1].transAxes,
-                        verticalalignment='center', fontsize=10)
-        axes[1, 1].set_title('Data Statistics')
-        axes[1, 1].axis('off')
-
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'plots' / 'data_overview.png', dpi=300)
-        plt.close()
-
     def _plot_training_progress(self, results: Dict[str, Any]):
         """Visualize training progress."""
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -630,12 +550,6 @@ class FullExperimentPipeline:
                 test_originals, test_reconstructions, metrics=selected_metrics, verbose=True
             )
 
-            generated_files = reconstruction_evaluator.create_reconstruction_visualizations(
-                test_originals, test_reconstructions,
-                metrics=selected_metrics,
-                output_dir=str(self.output_dir / 'plots')
-            )
-
             experiment_info = {
                 'experiment_mode': 'reconstruction',
                 'test_data_shape': list(test_originals.shape),
@@ -653,7 +567,6 @@ class FullExperimentPipeline:
             evaluation_results = {
                 'metrics': reconstruction_metrics,
                 'selected_metrics': selected_metrics,
-                'generated_visualizations': generated_files,
                 'saved_metrics_file': saved_metrics_file,
                 'test_data_shape': list(test_originals.shape),
                 'reconstructions_shape': list(test_reconstructions.shape),
