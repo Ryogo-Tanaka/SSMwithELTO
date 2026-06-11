@@ -466,7 +466,7 @@ class ReconstructionMetrics:
         output_dir: str = None
     ) -> List[str]:
         """
-        Generate reconstruction visualizations (placeholder).
+        Return reconstruction visualization outputs when enabled by downstream code.
 
         Args:
             y_true: Ground truth tensor

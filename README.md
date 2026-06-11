@@ -1,6 +1,6 @@
 # Deep Spectral Encoder (DSE)
 
-Minimal camera-ready code for the single-run experiments in the accompanying paper:
+Reference implementation for the single-run experiments in the accompanying paper:
 quad-link pendulum image reconstruction, Van der Pol mode decomposition, and
 Stuart-Landau mode decomposition.
 

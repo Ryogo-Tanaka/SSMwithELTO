@@ -24,7 +24,6 @@ external/
 checkpoints/
 experiments/
 
-# Temporary configs
+# Local entry points
 main_proposed_method.py
 main_two_stage.py
-
