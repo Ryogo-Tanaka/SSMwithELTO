@@ -58,12 +58,8 @@ def compute_image_mse_per_timestep(y_true: torch.Tensor, y_pred: torch.Tensor) -
 def load_checkpoint(model_path: str) -> Tuple[Dict, Dict]:
     """Load checkpoint and config."""
     print(f"Loading checkpoint: {model_path}")
-    # Backward compatibility: legacy module name 'rkn' -> 'cnn_image'
-    import src.models.architectures.cnn_image as _cnn_image_module
-    sys.modules['src.models.architectures.rkn'] = _cnn_image_module
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
     config = ckpt.get('config', {})
-    print(f"  Top-level keys: {list(ckpt.keys())}")
     return ckpt, config
 
 

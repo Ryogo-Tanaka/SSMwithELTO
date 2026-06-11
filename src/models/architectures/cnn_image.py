@@ -1,12 +1,8 @@
-# src/models/architectures/cnn_image.py
 """
-CNN image encoder/decoder architecture - Factory Pattern compliant.
-File: cnn_image.py -> Classes: cnn_imageEncoder, cnn_imageDecoder
-(Originally adapted from RKN codebase)
+CNN image encoder/decoder architecture.
 
 - cnn_imageEncoder: image (H,W,C) -> latent representation (100-dim)
 - cnn_imageDecoder: latent representation (100-dim) -> image (H,W,C)
-- cnn_image_targetDecoder: latent representation -> state mean (d_state-dim)
 
 Shape handling (consistent with time_invariant.py):
 - Single image: (H, W, C)
@@ -15,7 +11,7 @@ Shape handling (consistent with time_invariant.py):
 """
 
 import math
-from typing import Optional, List, Tuple, Dict, Any, Union
+from typing import Optional, List, Tuple, Dict, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -282,7 +278,7 @@ class cnn_imageDecoder(nn.Module):
         feature_dim: int = 100,
         grid: Optional[Tuple[int, int, int]] = None,
         hidden: int = 200,
-        upsample_mode: str = "nearest",  # "nearest"=legacy, "conv_transpose"=Table 6
+        upsample_mode: str = "nearest",
         conv_channels: Tuple[int, ...] = (64, 32, 1),
         activation: str = "relu",
         output_activation: str = "sigmoid",
@@ -295,7 +291,7 @@ class cnn_imageDecoder(nn.Module):
             grid: Intermediate grid size (H', W', C') - auto if None
             hidden: FC hidden dimension (unused in conv_transpose mode)
             upsample_mode: "nearest"/"bilinear"=Upsample+Conv, "conv_transpose"=TransposedConv (Table 6)
-            conv_channels: Channel sizes -- conv_transpose: (16,12,1), legacy: (64,32,1)
+            conv_channels: Channel sizes for the decoder convolution stack.
             activation: Activation function name
             output_activation: Output activation function name
         """
@@ -341,7 +337,7 @@ class cnn_imageDecoder(nn.Module):
             )
             self.final_conv = nn.Conv2d(conv_channels[1], C, kernel_size=1)
         else:
-            # Legacy: FC + Upsample+Conv
+            # Upsample + convolution decoder.
             self.fc1 = nn.Linear(feature_dim, hidden)
             self.fc2 = nn.Linear(hidden, grid_size)
 
@@ -438,148 +434,3 @@ class cnn_imageDecoder(nn.Module):
             return o.squeeze(1)
         else:
             return o
-
-
-class cnn_image_targetDecoder(nn.Module):
-    """
-    Target prediction decoder: latent (d-dim) -> state mean (d_state-dim).
-    Naming: <type>_targetDecoder (factory pattern compliant).
-
-    Per-timestep structure:
-    z_t in R^{feature_dim} -> FC(hidden) -> ReLU -> FC(d_state) -> output_activation
-    """
-
-    def __init__(
-        self,
-        feature_dim: int = 100,
-        state_dim: int = 8,
-        hidden: int = 50,
-        activation: str = "relu",
-        output_activation: str = "linear",
-        **kwargs
-    ):
-        """
-        Args:
-            feature_dim: Input latent feature dimension
-            state_dim: Output state dimension (e.g., 8 for quadcopter)
-            hidden: FC hidden dimension
-            activation: Activation function name
-            output_activation: Output activation ("linear", "tanh", "sigmoid")
-        """
-        super().__init__()
-
-        self.feature_dim = feature_dim
-        self.state_dim = state_dim
-        self.hidden = hidden
-
-        self.activation = getattr(nn, activation)() if hasattr(nn, activation) else nn.ReLU()
-
-        if output_activation.lower() == "tanh":
-            self.output_activation = nn.Tanh()
-        elif output_activation.lower() == "sigmoid":
-            self.output_activation = nn.Sigmoid()
-        elif output_activation.lower() == "linear":
-            self.output_activation = nn.Identity()
-        else:
-            self.output_activation = nn.Identity()
-
-        self.fc1 = nn.Linear(feature_dim, hidden)
-        self.fc2 = nn.Linear(hidden, state_dim)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Weight initialization."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                if isinstance(self.activation, (nn.ReLU, nn.LeakyReLU)):
-                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                else:
-                    nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Latent -> state mean: time-invariant state estimation.
-
-        Args:
-            z: Latent representation
-               - (feature_dim,): single
-               - (T, feature_dim): time series <- primary shape
-               - (B, T, feature_dim): batched time series
-
-        Returns:
-            mu_s: State mean
-                - (state_dim,): single
-                - (T, state_dim): time series <- primary shape
-                - (B, T, state_dim): batched time series
-        """
-        original_shape = z.shape
-        is_single_step = len(original_shape) == 1
-        is_no_batch = len(original_shape) == 2
-
-        # Unify to (B, T, feature_dim)
-        if is_single_step:
-            z = z.unsqueeze(0).unsqueeze(0)
-        elif is_no_batch:
-            z = z.unsqueeze(0)
-        elif len(original_shape) == 2:
-            z = z.unsqueeze(1)
-
-        B, T, feature_dim = z.shape
-
-        if feature_dim != self.feature_dim:
-            raise ValueError(f"Feature dim mismatch: expected {self.feature_dim}, got {feature_dim}")
-
-        z_flat = z.view(B * T, feature_dim)
-
-        x = self.activation(self.fc1(z_flat))
-        x = self.fc2(x)
-        mu_s_flat = self.output_activation(x)
-
-        mu_s = mu_s_flat.view(B, T, self.state_dim)
-
-        # Restore original shape
-        if is_single_step:
-            return mu_s.squeeze(0).squeeze(0)
-        elif is_no_batch:
-            return mu_s.squeeze(0)
-        elif len(original_shape) == 2:
-            return mu_s.squeeze(1)
-        else:
-            return mu_s
-
-
-def make_state_decoder(cfg: Dict[str, Any]) -> cnn_image_targetDecoder:
-    """
-    Factory function for state decoder.
-
-    Args:
-        cfg: Config dict
-            - feature_dim: Latent feature dimension (default 100)
-            - state_dim: State dimension (required)
-            - hidden: Hidden layer dimension (default 50)
-
-    Returns:
-        cnn_image_targetDecoder instance
-    """
-    feature_dim = cfg.get('feature_dim', 100)
-    state_dim = cfg.get('state_dim')
-    hidden = cfg.get('hidden', 50)
-
-    if state_dim is None:
-        raise ValueError("state_dim is required")
-
-    return cnn_image_targetDecoder(
-        feature_dim=feature_dim,
-        state_dim=state_dim,
-        hidden=hidden,
-        **{k: v for k, v in cfg.items() if k not in ['feature_dim', 'state_dim', 'hidden']}
-    )
-
-
-# Backward-compatible aliases for legacy checkpoint loading
-rknEncoder = cnn_imageEncoder
-rknDecoder = cnn_imageDecoder
-rkn_targetDecoder = cnn_image_targetDecoder

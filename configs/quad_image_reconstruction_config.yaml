@@ -1,9 +1,5 @@
-# ====================================================================
-# Image Reconstruction Experiment Config (per Table 6 in the paper)
-# Task: One-step-ahead prediction reconstruction of quadcopter images
-# Data: data/rkn_quad/quad1_n.npz (paper_data_protocol: train_obs->train, test_obs->eval)
-# Architecture: cnn_imageEncoder (stride=2) + cnn_imageDecoder (ConvTranspose2d)
-# ====================================================================
+# Quad-link image reconstruction config.
+# Matches the paper appendix architecture and train/test protocol.
 
 experiment:
   mode: "reconstruction"
@@ -40,20 +36,12 @@ model:
     activation: "relu"
     output_activation: "sigmoid"
 
-  # Target prediction head (unused in reconstruction mode, kept for compatibility)
-  state_decoder:
-    feature_dim: 100
-    state_dim: 8
-    hidden: 50
-    activation: "relu"
-
 training:
   epochs: 125                 # 25 warmup + 100 active
   T1_iterations: 1
   T2_iterations: 1
   phase1_warmup_epochs: 25    # Stage-1 = 25 epochs
 
-  experiment_mode: "reconstruction"
   lr_phi: 1e-3                # Adam default
   lr_psi: 1e-3                # Adam default
 

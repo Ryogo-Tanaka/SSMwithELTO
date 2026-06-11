@@ -38,10 +38,6 @@ class DataMetadata:
     train_indices: Tuple[int, int]
     val_indices: Tuple[int, int]
     test_indices: Tuple[int, int]
-    has_target_data: bool = False
-    target_shape: Optional[Tuple[int, int]] = None
-    target_feature_names: Optional[List[str]] = None
-    target_dtype: Optional[str] = None
 
 
 class DataLoaderError(Exception):
@@ -69,8 +65,7 @@ class UniversalTimeSeriesDataset(Dataset):
         test_ratio: float = 0.1,
         normalization: str = "standard",
         handle_missing: str = "interpolate",
-        feature_names: Optional[List[str]] = None,
-        experiment_mode: str = "reconstruction"
+        feature_names: Optional[List[str]] = None
     ):
         """
         Args:
@@ -82,7 +77,6 @@ class UniversalTimeSeriesDataset(Dataset):
             normalization: "standard", "minmax", "none"
             handle_missing: "interpolate", "forward_fill", "remove"
             feature_names: List of feature names
-            experiment_mode: "reconstruction" or "target_prediction"
         """
         super().__init__()
 
@@ -95,7 +89,6 @@ class UniversalTimeSeriesDataset(Dataset):
         self.data_path = Path(data_path)
         self.split = split
         self.normalization = normalization
-        self.experiment_mode = experiment_mode
 
         raw_data = self._load_raw_data()
         cleaned_data = self._validate_and_clean(raw_data, handle_missing)
@@ -113,64 +106,8 @@ class UniversalTimeSeriesDataset(Dataset):
             return np.squeeze(data, axis=0)
         return data
 
-    def _detect_target_data(self, data: dict) -> Dict[str, Any]:
-        """Auto-detect target data (quad_link format, with class-level caching)."""
-        cache_key = str(self.data_path)
-        if not hasattr(UniversalTimeSeriesDataset, '_class_target_cache'):
-            UniversalTimeSeriesDataset._class_target_cache = {}
-
-        if cache_key in UniversalTimeSeriesDataset._class_target_cache:
-            return UniversalTimeSeriesDataset._class_target_cache[cache_key]
-
-        target_info = {
-            'has_target': False,
-            'input_data': None,
-            'target_data': None,
-            'target_test_data': None
-        }
-
-        target_keys_train = ['train_targets', 'y_train', 'target_train', 'labels_train']
-        target_keys_test = ['test_targets', 'y_test', 'target_test', 'labels_test']
-        input_keys_train = ['train_obs', 'X_train', 'input_train', 'obs_train']
-        input_keys_test = ['test_obs', 'X_test', 'input_test', 'obs_test']
-
-        target_train = None
-        target_test = None
-        input_train = None
-        input_test = None
-
-        for key in target_keys_train:
-            if key in data:
-                target_train = self._squeeze_leading_batch_dim(data[key])
-                break
-
-        for key in target_keys_test:
-            if key in data:
-                target_test = self._squeeze_leading_batch_dim(data[key])
-                break
-
-        for key in input_keys_train:
-            if key in data:
-                input_train = self._squeeze_leading_batch_dim(data[key])
-                break
-
-        for key in input_keys_test:
-            if key in data:
-                input_test = self._squeeze_leading_batch_dim(data[key])
-                break
-
-        if target_train is not None and input_train is not None:
-            target_info['has_target'] = True
-            target_info['input_data'] = input_train
-            target_info['target_data'] = target_train
-            target_info['target_test_data'] = target_test
-            target_info['input_test_data'] = input_test
-
-        UniversalTimeSeriesDataset._class_target_cache[cache_key] = target_info
-        return target_info
-
     def _load_raw_data(self) -> np.ndarray:
-        """Load raw data with automatic target detection."""
+        """Load the observation array from disk."""
         if not self.data_path.exists():
             raise FileNotFoundError(f"Data file not found: {self.data_path}")
 
@@ -180,58 +117,36 @@ class UniversalTimeSeriesDataset(Dataset):
             if ext == ".npz":
                 data = np.load(self.data_path)
 
-                if self.experiment_mode == "target_prediction":
-                    target_info = self._detect_target_data(data)
+                candidate_keys = ['Y', 'X', 'data', 'arr_0', 'train_obs', 'test_obs']
+                raw_data = None
 
-                    if target_info['has_target']:
-                        self.has_target = True
-                        self.target_data = target_info['target_data']
-                        self.target_test_data = target_info.get('target_test_data', None)
-                        self.input_test_data = target_info.get('input_test_data', None)
-                        raw_data = target_info['input_data']
-                    else:
-                        raise DataLoaderError(
-                            f"Target prediction mode specified but no target data found.\n"
-                            f"Available keys: {list(data.keys())}\n"
-                            f"Expected keys: train_targets, y_train, target_train, etc."
-                        )
-                else:
-                    self.has_target = False
-                    self.target_data = None
-                    self.target_test_data = None
-                    self.input_test_data = None
+                for key in candidate_keys:
+                    if key in data:
+                        candidate = data[key]
+                        if ((candidate.ndim == 2 and candidate.shape[0] > 1) or
+                            (candidate.ndim == 4 and candidate.shape[0] > 1)):
+                            raw_data = candidate
+                            break
 
-                    # Search for data array by priority
-                    candidate_keys = ['Y', 'X', 'data', 'arr_0', 'train_obs', 'test_obs']
-                    raw_data = None
+                if raw_data is None:
+                    available_keys = list(data.keys())
+                    for key in available_keys:
+                        candidate = data[key]
+                        if (hasattr(candidate, 'ndim') and
+                            ((candidate.ndim == 2 and candidate.shape[0] > 1 and candidate.shape[1] > 0) or
+                             (candidate.ndim == 4 and candidate.shape[0] > 1))):
+                            raw_data = candidate
+                            break
 
-                    for key in candidate_keys:
-                        if key in data:
-                            candidate = data[key]
-                            if ((candidate.ndim == 2 and candidate.shape[0] > 1) or
-                                (candidate.ndim == 4 and candidate.shape[0] > 1)):
-                                raw_data = candidate
-                                break
-
-                    if raw_data is None:
-                        available_keys = list(data.keys())
-                        for key in available_keys:
-                            candidate = data[key]
-                            if (hasattr(candidate, 'ndim') and
-                                ((candidate.ndim == 2 and candidate.shape[0] > 1 and candidate.shape[1] > 0) or
-                                 (candidate.ndim == 4 and candidate.shape[0] > 1))):
-                                raw_data = candidate
-                                break
-
-                    if raw_data is None:
-                        available_info = []
-                        for key in data.keys():
-                            try:
-                                shape = data[key].shape if hasattr(data[key], 'shape') else 'scalar'
-                                dtype = data[key].dtype if hasattr(data[key], 'dtype') else type(data[key])
-                                available_info.append(f"'{key}': shape={shape}, dtype={dtype}")
-                            except:
-                                available_info.append(f"'{key}': (unreadable)")
+                if raw_data is None:
+                    available_info = []
+                    for key in data.keys():
+                        try:
+                            shape = data[key].shape if hasattr(data[key], 'shape') else 'scalar'
+                            dtype = data[key].dtype if hasattr(data[key], 'dtype') else type(data[key])
+                            available_info.append(f"'{key}': shape={shape}, dtype={dtype}")
+                        except Exception:
+                            available_info.append(f"'{key}': (unreadable)")
 
                         raise DataLoaderError(
                             f"No suitable data found in npz file.\n"
@@ -421,16 +336,6 @@ class UniversalTimeSeriesDataset(Dataset):
             else:
                 final_feature_names = ["feature_0"]
 
-        has_target = getattr(self, 'has_target', False)
-        target_shape = None
-        target_feature_names = None
-        target_dtype = None
-
-        if has_target and hasattr(self, 'target_data') and self.target_data is not None:
-            target_shape = self.target_data.shape
-            target_dtype = str(self.target_data.dtype)
-            target_feature_names = [f"target_{i}" for i in range(self.target_data.shape[1])]
-
         self.metadata = DataMetadata(
             original_shape=raw_data.shape,
             feature_names=final_feature_names,
@@ -441,39 +346,15 @@ class UniversalTimeSeriesDataset(Dataset):
             normalization_method=self.normalization,
             train_indices=self.split_indices["train"],
             val_indices=self.split_indices["val"],
-            test_indices=self.split_indices["test"],
-            has_target_data=has_target,
-            target_shape=target_shape,
-            target_feature_names=target_feature_names,
-            target_dtype=target_dtype
+            test_indices=self.split_indices["test"]
         )
 
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx: int) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Get data item (with optional target)."""
-        sample = self.data[idx]
-
-        if hasattr(self, 'has_target') and self.has_target:
-            if hasattr(self, 'target_data') and self.target_data is not None:
-                target_sample = self._get_target_for_split(idx)
-                return (torch.from_numpy(sample).float(),
-                       torch.from_numpy(target_sample).float())
-            else:
-                return torch.from_numpy(sample).float()
-        else:
-            return torch.from_numpy(sample).float()
-
-    def _get_target_for_split(self, idx: int) -> np.ndarray:
-        """Get target data for the current split."""
-        if not hasattr(self, 'target_data') or self.target_data is None:
-            raise ValueError("Target data not set")
-
-        split_start, split_end = self.split_indices[self.split]
-        target_split_data = self.target_data[split_start:split_end]
-
-        return target_split_data[idx]
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        """Get one observation sample."""
+        return torch.from_numpy(self.data[idx]).float()
 
     def get_full_data(self) -> torch.Tensor:
         """Get the full split data as a tensor."""
@@ -592,7 +473,7 @@ def build_dataloaders(
     num_workers: int = 4,
     pin_memory: bool = True
 ) -> DataLoader:
-    """Legacy compatibility wrapper."""
+    """Build a DataLoader from a time-ordered split."""
     dataset = UniversalTimeSeriesDataset(
         data_path=file_path,
         split=split,
@@ -716,18 +597,16 @@ def load_experimental_data_with_architecture(
     data_path: str,
     config: Dict[str, Any],
     split: str = "train",
-    return_dataloaders: bool = False,
-    experiment_mode: Optional[str] = None
+    return_dataloaders: bool = False
 ) -> Union[Dataset, Dict[str, Dataset], DataLoader, Dict[str, DataLoader]]:
     """
-    Architecture-aware unified data loader (backward compatible).
+    Architecture-aware unified data loader.
 
     Args:
         data_path: Path to data file
         config: Experiment config (uses model.encoder.type for dispatch)
         split: Data split ("train" | "val" | "test" | "all")
         return_dataloaders: Return DataLoaders instead of Datasets
-        experiment_mode: "reconstruction" | "target_prediction" (None = auto from config)
 
     Returns:
         Dataset/DataLoader or dict of Datasets/DataLoaders
@@ -735,15 +614,10 @@ def load_experimental_data_with_architecture(
     encoder_type = config.get('model', {}).get('encoder', {}).get('type', 'time_invariant')
     data_config = config.get('data', {})
 
-    if experiment_mode is None:
-        experiment_mode = config.get('experiment', {}).get('mode', 'reconstruction')
-
     if encoder_type == "cnn_image":
-        # Filter out non-Dataset parameters
         dataset_params = {k: v for k, v in data_config.items()
                          if k not in ['batch_size', 'num_workers', 'pin_memory',
-                                     'image_shape', 'target_shape',
-                                     'paper_data_protocol']}
+                                     'image_shape', 'paper_data_protocol']}
 
         if split == "all":
             datasets = {}
@@ -751,7 +625,6 @@ def load_experimental_data_with_architecture(
                 datasets[s] = UniversalTimeSeriesDataset(
                     data_path=data_path,
                     split=s,
-                    experiment_mode=experiment_mode,
                     **dataset_params
                 )
 
@@ -773,7 +646,6 @@ def load_experimental_data_with_architecture(
             dataset = UniversalTimeSeriesDataset(
                 data_path=data_path,
                 split=split,
-                experiment_mode=experiment_mode,
                 **dataset_params
             )
 
@@ -792,8 +664,7 @@ def load_experimental_data_with_architecture(
     elif encoder_type == "time_invariant":
         dataset_params = {k: v for k, v in data_config.items()
                          if k not in ['batch_size', 'num_workers', 'pin_memory',
-                                     'image_shape', 'target_shape',
-                                     'paper_data_protocol']}
+                                     'image_shape', 'paper_data_protocol']}
 
         if split == "all":
             datasets = {}
@@ -801,7 +672,6 @@ def load_experimental_data_with_architecture(
                 datasets[s] = UniversalTimeSeriesDataset(
                     data_path=data_path,
                     split=s,
-                    experiment_mode=experiment_mode,
                     **dataset_params
                 )
 
@@ -823,7 +693,6 @@ def load_experimental_data_with_architecture(
             dataset = UniversalTimeSeriesDataset(
                 data_path=data_path,
                 split=split,
-                experiment_mode=experiment_mode,
                 **dataset_params
             )
 
@@ -849,7 +718,7 @@ def load_experimental_data(
     return_dataloaders: bool = False
 ) -> Union[Dict[str, torch.Tensor], Dict[str, Dataset], Dict[str, DataLoader]]:
     """
-    Backward-compatible data loading wrapper.
+    Load data with the architecture-aware loader.
 
     Args:
         data_path: Path to data file
@@ -858,7 +727,7 @@ def load_experimental_data(
         return_dataloaders: Return DataLoaders
 
     Returns:
-        Data dict maintaining backward compatibility
+        Data tensors, datasets, or dataloaders depending on the flags.
     """
     if config is None:
         config = {

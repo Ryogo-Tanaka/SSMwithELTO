@@ -72,7 +72,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         self.canonical_correlations: Optional[torch.Tensor] = None
         self.is_fitted = False
 
-        # Backward compatibility with legacy Realization class
+        # Common aliases used by trainer code.
         self.h = self.window_length
         self.rank = self.num_components
 
@@ -497,7 +497,7 @@ class StochasticRealizationWithEncoder(nn.Module):
         self.canonical_directions_future = canonical_dirs_future
         self.canonical_correlations = S_vals[:min(self.num_components, len(S_vals))]
 
-        # B = Sigma^{1/2} a^T for compatibility with legacy filter()
+        # B = Sigma^{1/2} a^T, used by the filter-compatible interface.
         sqrt_correlations = torch.sqrt(self.canonical_correlations)
         self.B_matrix = torch.diag(sqrt_correlations) @ canonical_dirs_past.T  # (r, m)
 
@@ -540,9 +540,7 @@ class StochasticRealizationWithEncoder(nn.Module):
 
     def filter_compatible(self, Y: torch.Tensor) -> torch.Tensor:
         """
-        Backward-compatible wrapper for legacy filter() interface.
-
-        Delegates to estimate_states() for numerical consistency.
+        Filter-style state estimation wrapper around estimate_states().
 
         Args:
             Y: Observation time series (T, n)

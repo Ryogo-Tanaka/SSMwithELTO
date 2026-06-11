@@ -53,7 +53,6 @@ import gc
 from ..ssm.df_state_layer import DFStateLayer
 from ..ssm.df_observation_layer import DFObservationLayer
 from ..ssm.realization import Realization, StochasticRealizationWithEncoder, RealizationError
-from ..models.architectures.time_invariant import time_invariantEncoder, time_invariantDecoder
 
 
 class TrainingPhase(Enum):
@@ -72,7 +71,6 @@ class TrainingConfig:
     phase1_warmup_epochs: int = 5
     lambda_cca: float = 0.001
     update_strategy: str = "encoder_decoder_only"
-    experiment_mode: str = "reconstruction"
     lr_phi: float = 1e-3
     lr_psi: float = 1e-3
     lr_encoder: float = 1e-3
@@ -296,13 +294,8 @@ class TwoStageTrainer:
         encoder_config = config['model']['encoder'].copy()
         decoder_config = config['model']['decoder'].copy()
 
-        # Backward compatibility: normalize legacy type names
         if 'type' not in encoder_config:
             encoder_config['type'] = 'time_invariant'
-        if encoder_config['type'] == 'time_invariantEncoder':
-            encoder_config['type'] = 'time_invariant'
-        if decoder_config.get('type') == 'time_invariantDecoder':
-            decoder_config['type'] = 'time_invariant'
 
         if encoder_config['type'] == 'time_invariant':
             if 'output_dim' not in encoder_config:
@@ -310,15 +303,6 @@ class TwoStageTrainer:
 
         encoder = build_encoder(encoder_config)
         decoder = build_decoder(decoder_config)
-
-        target_decoder = None
-        experiment_mode = config.get('training', {}).get('experiment_mode', 'reconstruction')
-        if experiment_mode == "target_prediction" and 'target_decoder' in config['model']:
-            target_decoder_config = config['model']['target_decoder'].copy()
-            target_decoder = build_decoder(target_decoder_config, experiment_mode="target_prediction")
-            print(f"target_decoder created: {target_decoder_config.get('type', 'unknown')}")
-        elif experiment_mode == "target_prediction":
-            print(f"target_prediction mode specified but target_decoder config not found")
 
         realization_config = config['ssm']['realization']
         if config.get('evaluation', {}).get('use_new_realization', True):
@@ -347,7 +331,7 @@ class TwoStageTrainer:
         self._init_from_args(encoder, decoder, realization,
                            config['ssm']['df_state'], config['ssm']['df_observation'],
                            training_config, device, output_dir, use_kalman_filtering,
-                           calibration_ratio, auto_inference_setup, target_decoder)
+                           calibration_ratio, auto_inference_setup)
 
     @classmethod
     def from_trained_model(cls, model_path: str, config_path: str = None,
@@ -638,16 +622,10 @@ class TwoStageTrainer:
                        df_state_config: Dict[str, Any], df_obs_config: Dict[str, Any],
                        training_config: TrainingConfig, device: torch.device, output_dir: str,
                        use_kalman_filtering: bool, calibration_ratio: float = 0.1,
-                       auto_inference_setup: bool = True, target_decoder: nn.Module = None):
+                       auto_inference_setup: bool = True):
         """Initialize from individual arguments."""
         self.encoder = encoder.to(device)
         self.decoder = decoder.to(device)
-
-        if target_decoder is not None:
-            self.target_decoder = target_decoder.to(device)
-            print(f"target_decoder configured: {type(target_decoder).__name__}")
-        else:
-            self.target_decoder = None
 
         # realization inherits nn.Module; move to device like encoder/decoder
         if hasattr(realization, 'to'):
@@ -741,7 +719,7 @@ class TwoStageTrainer:
             {'params': list(self.decoder.parameters()), 'lr': self.config.lr_decoder},
         ]
 
-        if self.config.update_strategy in ("all", "joint_all"):
+        if self.config.update_strategy == "all":
             param_groups.extend([
                 {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
                 {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi},
@@ -796,7 +774,7 @@ class TwoStageTrainer:
                 if 'stochastic_realization_shapes' not in self._static_logs_shown:
                                         self._static_logs_shown.add('stochastic_realization_shapes')
             else:
-                # Legacy Realization: reduce to scalar
+                # Scalar realization path.
                 m_scalar = M_features.mean(dim=1)
                 self.realization.fit(m_scalar.unsqueeze(1))
                 X_states = self.realization.filter(m_scalar.unsqueeze(1))
@@ -1074,8 +1052,7 @@ class TwoStageTrainer:
         """Move tensor to target device if needed."""
         return tensor.to(self.device) if tensor.device != self.device else tensor
 
-    def train_phase2(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None,
-                     target_train: Optional[torch.Tensor] = None, target_val: Optional[torch.Tensor] = None) -> Dict[str, float]:
+    def train_phase2(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, float]:
         """
         Stage-2: End-to-end fine-tuning.
         
@@ -1109,7 +1086,7 @@ class TwoStageTrainer:
             self.current_epoch = self.config.phase1_epochs + epoch
             
             try:
-                loss_total, rec_loss, cca_loss = self._forward_and_loss_phase2(Y_train, target_train)
+                loss_total, rec_loss, cca_loss = self._forward_and_loss_phase2(Y_train)
 
                 opt_e2e.zero_grad()
                 loss_total.backward()
@@ -1142,8 +1119,7 @@ class TwoStageTrainer:
         print("Stage-2 training complete")
         return self.training_history['phase2_losses']
 
-    def train_integrated(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None,
-                         target_train: Optional[torch.Tensor] = None, target_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    def train_integrated(self, Y_train: torch.Tensor, Y_val: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         Unified training: run Stage-1 and Stage-2 consecutively each epoch.
 
@@ -1182,46 +1158,12 @@ class TwoStageTrainer:
                             self.realization.fit(m_scalar.unsqueeze(1))
                             X_states = self.realization.filter(m_scalar.unsqueeze(1))
 
-                if self.config.update_strategy == "joint_all":
-                    if epoch == 0:
-                        print("[joint_all] Stage-1 skipped (joint_all mode)")
-                        print("[joint_all] Computing initial operators...")
-                        self._compute_operators_for_joint_all(Y_train)
-
-                        self.phase1_complete = True
-                        self.df_state._is_fitted = True
-                        self.df_obs._is_fitted = True
-                        print("[joint_all] Initial operators computed (proceeding to Stage-2)")
-
-                    phase1_metrics = {
-                        'df_a_stage1_pred': 0.0,
-                        'df_a_stage1_reg': 0.0,
-                        'df_a_stage2_pred': 0.0,
-                        'df_a_stage2_reg': 0.0,
-                        'df_b_stage1_pred': 0.0,
-                        'df_b_stage1_reg': 0.0,
-                        'df_b_stage2_pred': 0.0,
-                        'df_b_stage2_reg': 0.0
-                    }
-                else:
-                    phase1_metrics = self._train_integrated_phase1_epoch(X_states, M_features, epoch)
-                    self._lightweight_operator_update(Y_train)
+                phase1_metrics = self._train_integrated_phase1_epoch(X_states, M_features, epoch)
+                self._lightweight_operator_update(Y_train)
 
                 phase2_metrics = {}
-                if self.config.update_strategy == "joint_all" or epoch >= self.config.phase1_warmup_epochs:
-                    phase2_metrics = self._train_integrated_phase2_epoch(Y_train, epoch, target_train)
-
-                    if self.config.update_strategy == "joint_all":
-                        phase1_metrics.update({
-                            'df_a_stage1_pred': phase2_metrics.get('df_a_stage1_pred', 0.0),
-                            'df_a_stage1_reg': phase2_metrics.get('df_a_stage1_reg', 0.0),
-                            'df_a_stage2_pred': phase2_metrics.get('df_a_stage2_pred', 0.0),
-                            'df_a_stage2_reg': phase2_metrics.get('df_a_stage2_reg', 0.0),
-                            'df_b_stage1_pred': phase2_metrics.get('df_b_stage1_pred', 0.0),
-                            'df_b_stage1_reg': phase2_metrics.get('df_b_stage1_reg', 0.0),
-                            'df_b_stage2_pred': phase2_metrics.get('df_b_stage2_pred', 0.0),
-                            'df_b_stage2_reg': phase2_metrics.get('df_b_stage2_reg', 0.0)
-                        })
+                if epoch >= self.config.phase1_warmup_epochs:
+                    phase2_metrics = self._train_integrated_phase2_epoch(Y_train, epoch)
                 else:
                     phase2_metrics = {
                         'total_loss': 0.0,
@@ -1297,27 +1239,11 @@ class TwoStageTrainer:
 
         return epoch_metrics
 
-    def _train_integrated_phase2_epoch(self, Y_train: torch.Tensor, epoch: int, target_data: torch.Tensor = None) -> Dict[str, float]:
+    def _train_integrated_phase2_epoch(self, Y_train: torch.Tensor, epoch: int) -> Dict[str, float]:
         """
         Execute one epoch of Stage-2 in unified training.
         Applies same device management and error handling as train_phase2.
         """
-        validation_losses = None
-        if self.config.update_strategy == "joint_all" and epoch >= 1:
-            self._compute_operators_for_joint_all(Y_train)
-
-        if self.config.update_strategy == "joint_all":
-            M_features = self.encoder(Y_train)
-            if isinstance(self.realization, StochasticRealizationWithEncoder):
-                self.realization.fit(Y_train, self.encoder)
-                X_states = self.realization.estimate_states(Y_train)
-            else:
-                m_scalar = M_features.mean(dim=1)
-                self.realization.fit(m_scalar.unsqueeze(1))
-                X_states = self.realization.filter(m_scalar.unsqueeze(1))
-
-            validation_losses = self._compute_validation_losses_for_joint_all(M_features, X_states)
-
         Y_train = self._ensure_device(Y_train)
         self.encoder = self.encoder.to(self.device)
         self.decoder = self.decoder.to(self.device)
@@ -1337,7 +1263,7 @@ class TwoStageTrainer:
         opt_e2e = self.optimizers['e2e']
 
         try:
-            loss_total, rec_loss, cca_loss = self._forward_and_loss_phase2(Y_train, target_data)
+            loss_total, rec_loss, cca_loss = self._forward_and_loss_phase2(Y_train)
 
             opt_e2e.zero_grad()
             loss_total.backward()
@@ -1374,10 +1300,6 @@ class TwoStageTrainer:
                 'cca_loss': cca_loss.item()
             }
 
-            # joint_all mode: add validation loss
-            if validation_losses is not None:
-                result.update(validation_losses)
-
             return result
 
         except RealizationError as e:
@@ -1388,18 +1310,6 @@ class TwoStageTrainer:
                 'rec_loss': 0.0,
                 'cca_loss': 0.0
             }
-
-            if self.config.update_strategy == "joint_all":
-                result.update({
-                    'df_a_stage1_pred': 0.0,
-                    'df_a_stage1_reg': 0.0,
-                    'df_a_stage2_pred': 0.0,
-                    'df_a_stage2_reg': 0.0,
-                    'df_b_stage1_pred': 0.0,
-                    'df_b_stage1_reg': 0.0,
-                    'df_b_stage2_pred': 0.0,
-                    'df_b_stage2_reg': 0.0
-                })
 
             return result
 
@@ -1425,121 +1335,6 @@ class TwoStageTrainer:
         except Exception as e:
             print(f"Lightweight operator update error: {e}")
 
-    def _compute_operators_for_joint_all(self, Y_train: torch.Tensor):
-        """Recompute V_A/U_A/V_B/U_B from updated phi_theta/psi_omega (joint_all mode)."""
-        with torch.no_grad():
-            self.encoder = self.encoder.to(self.device)
-            self.decoder = self.decoder.to(self.device)
-            if hasattr(self.df_state, 'phi_theta'):
-                self.df_state.phi_theta = self.df_state.phi_theta.to(self.device)
-            if hasattr(self.df_obs, 'psi_omega'):
-                self.df_obs.psi_omega = self.df_obs.psi_omega.to(self.device)
-
-            M_features, X_states = self._prepare_data(Y_train)
-
-            Phi_full = self.df_state.phi_theta(X_states)
-            Phi_minus = Phi_full[:-1]
-            Phi_plus = Phi_full[1:]
-            X_plus = X_states[1:]
-
-            if hasattr(self.df_state, 'cf_config') and self.df_state.cf_config:
-                self.df_state._fit_with_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=False)
-            else:
-                self.df_state._fit_without_cross_fitting(Phi_minus, Phi_plus, X_plus, verbose=False)
-
-            if hasattr(self, 'df_obs') and self.df_obs is not None:
-                H_A = (self.df_state.V_A @ Phi_minus.T).T
-                X_pred = self.df_state.apply_readout(H_A)
-                Phi_pred = self.df_state.phi_theta(X_pred)
-
-                if isinstance(self.realization, StochasticRealizationWithEncoder):
-                    h = getattr(self.realization, 'window_length', 5)
-                else:
-                    h = self.realization.h
-                T_states = X_states.shape[0]
-
-                M_curr = M_features[h:h+T_states]
-                Psi_curr = self.df_obs.psi_omega(M_curr)
-
-                min_size = min(Phi_pred.shape[0], Psi_curr.shape[0], M_curr.shape[0])
-                Phi_pred = Phi_pred[:min_size]
-                Psi_curr = Psi_curr[:min_size]
-                m_curr = M_curr[:min_size]
-
-                if hasattr(self.df_obs, 'cf_config') and self.df_obs.cf_config:
-                    self.df_obs._fit_with_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=False)
-                else:
-                    self.df_obs._fit_without_cross_fitting(Phi_pred, Psi_curr, m_curr, verbose=False)
-
-    def _compute_validation_losses_for_joint_all(
-        self,
-        M_features: torch.Tensor,
-        X_states: torch.Tensor
-    ) -> Dict[str, float]:
-        """Compute DF-A/DF-B Stage-2 losses for display in joint_all mode (no grad)."""
-        with torch.no_grad():
-            losses = {
-                'df_a_stage1_pred': 0.0,
-                'df_a_stage1_reg': 0.0,
-                'df_b_stage1_pred': 0.0,
-                'df_b_stage1_reg': 0.0
-            }
-
-            # DF-A Stage-2: Eq. (42a)
-            Phi_full = self.df_state.phi_theta(X_states)
-            Phi_minus = Phi_full[:-1]
-            X_plus = X_states[1:]
-
-            H_A = (self.df_state.V_A @ Phi_minus.T).T
-            X_pred = self.df_state.apply_readout(H_A)
-            prediction_error = torch.norm(X_plus - X_pred, p='fro') ** 2
-            T_samples = X_plus.shape[0]
-            df_a_stage2_pred = (prediction_error / T_samples).item()
-            if self.df_state.readout_type == 'nonlinear':
-                df_a_stage2_reg = 0.0
-            else:
-                df_a_stage2_reg = (self.df_state.lambda_B * torch.norm(self.df_state.U_A, p='fro') ** 2).item()
-
-            losses['df_a_stage2_pred'] = df_a_stage2_pred
-            losses['df_a_stage2_reg'] = df_a_stage2_reg
-
-            # DF-B Stage-2: Eq. (42b)
-            if hasattr(self, 'df_obs') and self.df_obs is not None:
-                Phi_pred = self.df_state.phi_theta(X_pred)
-
-                if isinstance(self.realization, StochasticRealizationWithEncoder):
-                    h = getattr(self.realization, 'window_length', 5)
-                else:
-                    h = self.realization.h
-                T_states = X_states.shape[0]
-
-                M_curr = M_features[h:h+T_states]
-                Psi_curr = self.df_obs.psi_omega(M_curr)
-
-                min_size = min(Phi_pred.shape[0], Psi_curr.shape[0], M_curr.shape[0])
-                Phi_pred = Phi_pred[:min_size]
-                Psi_curr = Psi_curr[:min_size]
-                m_curr = M_curr[:min_size]
-
-                H_B = (self.df_obs.V_B @ Phi_pred.T).T
-                m_pred = self.df_obs.apply_readout(H_B)
-
-                prediction_error_b = torch.norm(m_curr - m_pred, p='fro') ** 2
-                T_samples_b = m_curr.shape[0]
-                df_b_stage2_pred = (prediction_error_b / T_samples_b).item()
-                if self.df_obs.readout_type == 'nonlinear':
-                    df_b_stage2_reg = 0.0
-                else:
-                    df_b_stage2_reg = (self.df_obs.lambda_dB * torch.norm(self.df_obs.U_B, p='fro') ** 2).item()
-
-                losses['df_b_stage2_pred'] = df_b_stage2_pred
-                losses['df_b_stage2_reg'] = df_b_stage2_reg
-            else:
-                losses['df_b_stage2_pred'] = 0.0
-                losses['df_b_stage2_reg'] = 0.0
-
-            return losses
-
     def _initialize_phase2_optimizer(self):
         """Initialize Stage-2 optimizer with param groups based on update_strategy."""
         if 'e2e' not in self.optimizers:
@@ -1562,34 +1357,14 @@ class TwoStageTrainer:
                     {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi}
                 ])
                 print("Stage-2 also updates DF layers (update_strategy='all', staged+Stage-2 DF update)")
-            elif self.config.update_strategy == "joint_all":
-                param_groups.extend([
-                    {'params': list(self.df_state.phi_theta.parameters()), 'lr': self.config.lr_phi},
-                    {'params': list(self.df_obs.psi_omega.parameters()), 'lr': self.config.lr_psi}
-                ])
-                print("Joint all-parameter training mode (update_strategy='joint_all')")
-                print("  - Training targets: encoder + decoder + phi_theta + psi_omega")
-                print("  - Operators: recomputed from phi_theta/psi_omega every epoch")
             else:
                 print("Stage-2 updates encoder/decoder only (staged training design)")
 
             self.optimizers['e2e'] = torch.optim.Adam(param_groups)
 
-    def _forward_and_loss_phase2(self, Y_train: torch.Tensor, target_data: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Stage-2 forward inference and loss computation (experiment_mode aware).
-        Args:
-            Y_train: Observation data
-            target_data: Target data (required for target_prediction mode)
-        Returns:
-            (loss_total, primary_loss, loss_cca)
-        """
-        if self.config.experiment_mode == "target_prediction":
-            if target_data is None:
-                raise ValueError("Target data required for target_prediction mode")
-            return self._forward_and_loss_phase2_target(Y_train, target_data)
-        else:
-            return self._forward_and_loss_phase2_reconstruction(Y_train)
+    def _forward_and_loss_phase2(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stage-2 reconstruction forward pass and loss computation."""
+        return self._forward_and_loss_phase2_reconstruction(Y_train)
 
     def _forward_and_loss_phase2_reconstruction(self, Y_train: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Stage-2 reconstruction mode: forward pass and loss computation."""
@@ -1647,70 +1422,6 @@ class TwoStageTrainer:
         loss_total = loss_rec + self.config.lambda_cca * loss_cca
 
         return loss_total, loss_rec, loss_cca
-
-    def _forward_and_loss_phase2_target(self, Y_train: torch.Tensor, target_data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Stage-2 target prediction mode: forward pass and loss computation."""
-        self.encoder = self.encoder.to(self.device)
-        self.decoder = self.decoder.to(self.device)
-
-        T = Y_train.shape[0]
-        h = self.realization.h
-
-        if T <= 2 * h:
-            raise RuntimeError(f"Time series too short: T({T}) <= 2*h({2*h})")
-
-        # Step 1: Encode
-        M_features = self.encoder(Y_train)
-
-        if M_features.dim() == 1:
-            M_features = M_features.unsqueeze(1)
-
-        # Step 2: Stochastic realization
-        try:
-            if isinstance(self.realization, StochasticRealizationWithEncoder):
-                self.realization.fit(Y_train, self.encoder)
-                X_states = self.realization.estimate_states(Y_train)
-            else:
-                m_scalar = M_features.mean(dim=1)
-                self.realization.fit(m_scalar.unsqueeze(1))
-                X_states = self.realization.filter(m_scalar.unsqueeze(1))
-        except RealizationError as e:
-            print(f"Stage-2 Target RealizationError: {e}")
-            raise RealizationError(f"Stage-2 target realization failed: {e}") from e
-
-        # Steps 3-4: DF-A/DF-B prediction
-        X_hat_states = self.df_state.predict_sequence(X_states, training=True)
-        T_pred = X_hat_states.size(0)
-
-        M_hat_series = []
-        for t in range(T_pred):
-            m_hat_t = self.df_obs.predict_one_step(X_hat_states[t])
-            M_hat_series.append(m_hat_t)
-        M_hat_tensor = torch.stack(M_hat_series)
-        M_hat_tensor = self._ensure_device(M_hat_tensor)
-
-        # Step 5: Decode
-        if hasattr(self, 'target_decoder') and self.target_decoder is not None:
-            target_pred = self.target_decoder(M_hat_tensor)
-            print(f"Target prediction mode: using target_decoder -> {target_pred.shape}")
-        else:
-            target_pred = self.decoder(M_hat_tensor)
-            print(f"Target prediction mode: target_decoder not set, using decoder -> {target_pred.shape}")
-
-        # Step 6: Loss against corresponding target ground truth
-        target_true = target_data[h+1:h+1+T_pred]
-        target_true = self._ensure_device(target_true)
-
-        loss_target = torch.nn.functional.mse_loss(target_pred, target_true)
-
-        if self.config.lambda_cca > 0:
-            loss_cca = self._compute_cca_loss()
-        else:
-            loss_cca = torch.tensor(0.0, requires_grad=True)
-
-        loss_total = loss_target + self.config.lambda_cca * loss_cca
-
-        return loss_total, loss_target, loss_cca
 
     def _compute_cca_loss(self) -> torch.Tensor:
         """CCA loss: L_cca = -sum_i rho_i (maximize canonical correlations)."""
@@ -2178,339 +1889,3 @@ class TwoStageTrainer:
             summary['final_losses']['phase2'] = self.training_history['phase2_losses'][-1]
         
         return summary
-
-
-# Utility functions
-def create_trainer_from_config(config_path: str, device: torch.device, output_dir: str) -> TwoStageTrainer:
-    """
-    Create trainer from config file.
-    
-    Args:
-        config_path: YAML config file path
-        device: Computation device
-        output_dir: Output directory
-        
-    Returns:
-        TwoStageTrainer: Initialized trainer
-    """
-    import yaml
-    
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    encoder_config = config['model']['encoder'].copy()
-    decoder_config = config['model']['decoder'].copy()
-
-    if 'output_dim' not in encoder_config:
-        encoder_config['output_dim'] = encoder_config.get('channels', 32)
-
-    encoder = time_invariantEncoder(**encoder_config)
-    decoder = time_invariantDecoder(**decoder_config)
-
-    realization_config = config['ssm']['realization']
-    if config.get('evaluation', {}).get('use_new_realization', True):
-        realization_config_copy = realization_config.copy()
-        feature_mapping_cfg = realization_config_copy.pop('feature_mapping', {})
-        realization_config_copy.pop('m', None)
-        realization = StochasticRealizationWithEncoder(
-            encoder=encoder,
-            feature_mapping_type=feature_mapping_cfg.get('type', 'averaging'),
-            feature_mapping_hidden_dims=feature_mapping_cfg.get('hidden_dims', None),
-            feature_mapping_activation=feature_mapping_cfg.get('activation', 'relu'),
-            **realization_config_copy
-        )
-    else:
-        realization = Realization(**realization_config)
-
-    training_config = TrainingConfig.from_nested_dict(config['training'])
-
-    trainer = TwoStageTrainer(
-        encoder=encoder,
-        decoder=decoder,
-        realization=realization,
-        df_state_config=config['ssm']['df_state'],
-        df_obs_config=config['ssm']['df_observation'],
-        training_config=training_config,
-        device=device,
-        output_dir=output_dir
-    )
-    
-    return trainer
-
-
-def run_training_experiment(
-    config_path: str,
-    data_path: str,
-    output_dir: str,
-    device: Optional[torch.device] = None
-) -> Dict[str, Any]:
-    """
-    Execute training experiment.
-    
-    Args:
-        config_path: Config file path
-        data_path: Data file path (.npz)
-        output_dir: Results output directory
-        device: Computation device (auto-select if None)
-        
-    Returns:
-        Experiment results dictionary
-    """
-    import yaml
-    import numpy as np
-    from ..utils.gpu_utils import select_device
-
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    if device is None:
-        device = select_device()
-    
-    print(f"Experiment started: device={device}")
-
-    try:
-        from ..utils.data_loader import load_experimental_data
-        
-        if 'data' in config:
-            print(f"Loading data with unified data loader: {data_path}")
-            data_dict = load_experimental_data(data_path, config['data'])
-            Y_train = data_dict['train'].to(device)
-            print(f"Data shape: {Y_train.shape} (normalization: {data_dict['metadata'].normalization_method})")
-        else:
-            raise ImportError("No data config, using legacy method")
-            
-    except (ImportError, ModuleNotFoundError, Exception) as e:
-        print(f"Unified data loader unavailable, using legacy: {e}")
-        
-        data = np.load(data_path)
-        if 'Y' in data:
-            Y_train = torch.tensor(data['Y'], dtype=torch.float32, device=device)
-        elif 'arr_0' in data:
-            Y_train = torch.tensor(data['arr_0'], dtype=torch.float32, device=device)
-        else:
-            available_keys = list(data.keys())
-            raise ValueError(
-                f"'Y' or 'arr_0' key not found in data file."
-                f"Available keys: {available_keys}"
-                )
-    
-    print(f"Data loaded: {Y_train.shape}")
-
-    if Y_train.dim() != 2:
-        raise ValueError(f"Data must be 2D (T, d): got {Y_train.shape}")
-    
-    T, d = Y_train.shape
-    if T < 50:
-        warnings.warn(f"Time series may be too short: T={T}")
-
-    try:
-        trainer = create_trainer_from_config(config_path, device, output_dir)
-    except Exception as e:
-        raise RuntimeError(f"Trainer creation failed: {config_path}. Error: {e}")
-
-    try:
-        results = trainer.train_full(Y_train)
-    except Exception as e:
-        print(f"Error during training: {e}")
-        try:
-            trainer._save_checkpoint(
-                trainer.current_epoch, 
-                TrainingPhase.PHASE1_DF_A, 
-                emergency=True
-            )
-            print(f"Emergency checkpoint saved: {trainer.output_dir}")
-        except:
-            print("Emergency save also failed")
-        raise
-
-    try:
-        experiment_summary = trainer.get_training_summary()
-        results['experiment_summary'] = experiment_summary
-        results['data_info'] = {
-            'data_path': data_path,
-            'data_shape': tuple(Y_train.shape),
-            'device': str(device),
-            'total_parameters': experiment_summary.get('model_info', {}).get('total_params', 0)
-        }
-        
-        config_backup_path = Path(output_dir) / 'config_used.yaml'
-        if not config_backup_path.exists():
-            import shutil
-            shutil.copy2(config_path, config_backup_path)
-            print(f"Config file backed up: {config_backup_path}")
-            
-    except Exception as e:
-        warnings.warn(f"Error creating summary: {e}")
-        results['experiment_summary'] = {'error': str(e)}
-        results['data_info'] = {
-            'data_path': data_path,
-            'data_shape': tuple(Y_train.shape),
-            'device': str(device)
-        }
-    
-    print(f"Experiment complete: results saved to {output_dir}")
-    
-    return results
-
-
-def run_validation(
-    trainer: TwoStageTrainer, 
-    Y_test: torch.Tensor, 
-    output_dir: str,
-    forecast_steps: int = 96
-) -> Dict[str, Any]:
-    """
-    Execute validation on trained model.
-    
-    Args:
-        trainer: Trained trainer
-        Y_test: Test data
-        output_dir: Results output directory
-        forecast_steps: Number of forecast steps
-        
-    Returns:
-        Validation results dictionary
-    """
-    print("Validation started...")
-    
-    try:
-        predictions = trainer.forecast(Y_test, forecast_steps)
-
-        if Y_test.size(0) > forecast_steps:
-            Y_true = Y_test[-forecast_steps:]
-            mse = torch.mean((predictions - Y_true) ** 2).item()
-            mae = torch.mean(torch.abs(predictions - Y_true)).item()
-
-            relative_error = (torch.norm(predictions - Y_true) / torch.norm(Y_true)).item()
-
-            metrics = {
-                'mse': mse,
-                'mae': mae,
-                'rmse': mse ** 0.5,
-                'relative_error': relative_error,
-                'forecast_steps': forecast_steps
-            }
-        else:
-            warnings.warn("Test data shorter than forecast steps, skipping accuracy computation")
-            metrics = {
-                'forecast_steps': forecast_steps,
-                'note': 'Insufficient test data for accuracy computation'
-            }
-
-        validation_results = {
-            'metrics': metrics,
-            'predictions_shape': tuple(predictions.shape),
-            'test_data_shape': tuple(Y_test.shape),
-            'model_summary': trainer.get_training_summary()
-        }
-
-        output_path = Path(output_dir)
-        predictions_path = output_path / 'predictions.npz'
-        np.savez(
-            predictions_path,
-            predictions=predictions.cpu().numpy(),
-            Y_test=Y_test.cpu().numpy()
-        )
-        
-        print(f"Validation complete: MSE={metrics.get('mse', 'N/A'):.6f}")
-        
-        return validation_results
-        
-    except Exception as e:
-        error_result = {
-            'error': str(e),
-            'test_data_shape': tuple(Y_test.shape),
-            'forecast_steps': forecast_steps
-        }
-        print(f"Validation error: {e}")
-        return error_result
-
-
-def plot_training_results(output_dir: str) -> None:
-    """
-    Visualize training results.
-    
-    Args:
-        output_dir: Results directory
-    """
-    try:
-        import matplotlib.pyplot as plt
-        import pandas as pd
-        
-        output_path = Path(output_dir)
-
-        phase1_csv = output_path / 'phase1_training.csv'
-        if phase1_csv.exists():
-            df_phase1 = pd.read_csv(phase1_csv)
-            
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle('Stage-1 Training Progress')
-
-            df_a_s1 = df_phase1[(df_phase1['phase'] == 'phase1_df_a') & (df_phase1['stage'] == 'stage1')]
-            if not df_a_s1.empty:
-                axes[0, 0].plot(df_a_s1['epoch'], df_a_s1['loss'])
-                axes[0, 0].set_title('DF-A Stage-1 Loss')
-                axes[0, 0].set_xlabel('Epoch')
-                axes[0, 0].set_ylabel('Loss')
-
-            df_a_s2 = df_phase1[(df_phase1['phase'] == 'phase1_df_a') & (df_phase1['stage'] == 'stage2')]
-            if not df_a_s2.empty:
-                axes[0, 1].plot(df_a_s2['epoch'], df_a_s2['loss'])
-                axes[0, 1].set_title('DF-A Stage-2 Loss')
-                axes[0, 1].set_xlabel('Epoch')
-                axes[0, 1].set_ylabel('Loss')
-
-            df_b_s1 = df_phase1[(df_phase1['phase'] == 'phase1_df_b') & (df_phase1['stage'] == 'stage1')]
-            if not df_b_s1.empty:
-                axes[1, 0].plot(df_b_s1['epoch'], df_b_s1['loss'])
-                axes[1, 0].set_title('DF-B Stage-1 Loss')
-                axes[1, 0].set_xlabel('Epoch')
-                axes[1, 0].set_ylabel('Loss')
-
-            df_b_s2 = df_phase1[(df_phase1['phase'] == 'phase1_df_b') & (df_phase1['stage'] == 'stage2')]
-            if not df_b_s2.empty:
-                axes[1, 1].plot(df_b_s2['epoch'], df_b_s2['loss'])
-                axes[1, 1].set_title('DF-B Stage-2 Loss')
-                axes[1, 1].set_xlabel('Epoch')
-                axes[1, 1].set_ylabel('Loss')
-            
-            plt.tight_layout()
-            plt.savefig(output_path / 'phase1_losses.png', dpi=150)
-            plt.close()
-
-        phase2_csv = output_path / 'phase2_training.csv'
-        if phase2_csv.exists():
-            df_phase2 = pd.read_csv(phase2_csv)
-            
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            fig.suptitle('Stage-2 Training Progress')
-            
-            axes[0].plot(df_phase2['epoch'], df_phase2['total_loss'])
-            axes[0].set_title('Total Loss')
-            axes[0].set_xlabel('Epoch')
-            axes[0].set_ylabel('Loss')
-            
-            axes[1].plot(df_phase2['epoch'], df_phase2['rec_loss'])
-            axes[1].set_title('Reconstruction Loss')
-            axes[1].set_xlabel('Epoch')
-            axes[1].set_ylabel('Loss')
-            
-            axes[2].plot(df_phase2['epoch'], df_phase2['cca_loss'])
-            axes[2].set_title('CCA Loss')
-            axes[2].set_xlabel('Epoch')
-            axes[2].set_ylabel('Loss')
-            
-            plt.tight_layout()
-            plt.savefig(output_path / 'phase2_losses.png', dpi=150)
-            plt.close()
-        
-        print(f"Visualization complete: {output_path}")
-        
-    except ImportError:
-        warnings.warn("matplotlib/pandas not available, skipping visualization")
-    except Exception as e:
-        warnings.warn(f"Visualization error: {e}")
-
-
-if __name__ == "__main__":
-    print("TwoStageTrainer loaded")

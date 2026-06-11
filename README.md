@@ -1,6 +1,8 @@
 # Deep Spectral Encoder (DSE)
 
-Code for the three experiments in the accompanying paper: quad-link pendulum, Van der Pol oscillator, and Stuart-Landau oscillator.
+Minimal camera-ready code for the single-run experiments in the accompanying paper:
+quad-link pendulum image reconstruction, Van der Pol mode decomposition, and
+Stuart-Landau mode decomposition.
 
 ## Requirements
 
@@ -38,7 +40,6 @@ See the paper appendix for the full list of simulation parameters.
 
 ### 1. Quad-link Pendulum
 
-**Training:**
 ```bash
 python scripts/run_quadlink_experiment.py \
     --config configs/quad_image_reconstruction_config.yaml \
@@ -46,7 +47,6 @@ python scripts/run_quadlink_experiment.py \
     --output results/quadlink_seed1
 ```
 
-**Kalman Filtering Evaluation:**
 ```bash
 python scripts/evaluate_kalman_image_mse.py \
     --model results/quadlink_seed1/models/final_model.pth \
@@ -54,22 +54,12 @@ python scripts/evaluate_kalman_image_mse.py \
     --output results/kalman_eval
 ```
 
-**Multi-seed Evaluation (5 seeds):**
-```bash
-python scripts/run_multiseed_evaluation.py \
-    --condition clean-1.5k \
-    --base-output results/clean_1500 \
-    --config configs/quad_image_reconstruction_config.yaml
-```
-
 ### 2. Van der Pol Oscillator
 
 ```bash
-# Generate data (single noise level, single trial)
 python scripts/generate_vdp_data.py \
     --output-dir data/vdp --sig-o-list 0.05 --n-trials 1
 
-# Run single trial
 python scripts/run_vdp_experiment.py \
     --data data/vdp/sig_o_0.05/trial_001.npz \
     --config configs/vdp_config.yaml \
@@ -79,11 +69,9 @@ python scripts/run_vdp_experiment.py \
 ### 3. Stuart-Landau Oscillator
 
 ```bash
-# Generate data (single noise level, single trial)
 python scripts/generate_sl_data.py \
     --output-dir data/sl --var-p-list 0.05 --n-trials 1
 
-# Run single trial
 python scripts/run_sl_experiment.py \
     --data data/sl/var_p_0.05/trial_001.npz \
     --config configs/sl_config.yaml \

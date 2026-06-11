@@ -9,14 +9,12 @@ Provides comprehensive metrics for DFIV Kalman Filter state estimation:
 """
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import time
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Any
 from scipy import stats
-from sklearn.metrics import r2_score
 import warnings
 
 
@@ -401,189 +399,8 @@ def print_comparison_summary(
     print("="*60)
 
 
-class TargetPredictionMetrics:
-    """
-    Target prediction evaluation (unified interface with StateEstimationMetrics).
-
-    Provides evaluation metrics for target prediction experiments:
-    - Selectable metrics (RMSE, MAE, R^2, per-dimension R^2)
-    - Unified terminal output format
-    """
-
-    def __init__(self, device: str = 'cpu'):
-        self.device = torch.device(device)
-
-    def compute_target_metrics(
-        self,
-        y_true: torch.Tensor,
-        y_pred: torch.Tensor,
-        metrics: List[str] = ['rmse'],
-        verbose: bool = True
-    ) -> Dict[str, Union[float, List[float]]]:
-        """
-        Compute target prediction evaluation metrics.
-
-        Args:
-            y_true: Ground truth tensor (T, d)
-            y_pred: Predicted tensor (T, d)
-            metrics: List of metrics to compute ['mse', 'rmse', 'mae', 'r2', 'r2_per_dim']
-            verbose: Whether to print results
-
-        Returns:
-            Dict of evaluation metric results.
-        """
-        if y_true.shape != y_pred.shape:
-            raise ValueError(f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}")
-
-        y_true = y_true.to(self.device)
-        y_pred = y_pred.to(self.device)
-        available_metrics = {
-            'mse': lambda: F.mse_loss(y_pred, y_true).item(),
-            'rmse': lambda: torch.sqrt(F.mse_loss(y_pred, y_true)).item(),
-            'mae': lambda: F.l1_loss(y_pred, y_true).item(),
-            'r2': lambda: self._compute_r2_score(y_true, y_pred),
-            'r2_per_dim': lambda: self._compute_r2_per_dimension(y_true, y_pred)
-        }
-
-        results = {}
-        for metric in metrics:
-            if metric in available_metrics:
-                try:
-                    results[metric] = available_metrics[metric]()
-                except Exception as e:
-                    print(f"Error computing metric '{metric}': {e}")
-                    results[metric] = None
-            else:
-                print(f"Unknown metric: '{metric}'. Available: {list(available_metrics.keys())}")
-        if verbose:
-            self._print_target_metrics_summary(results)
-
-        return results
-
-    def save_target_metrics_results(
-        self,
-        results: Dict[str, Union[float, List[float]]],
-        output_dir: str,
-        experiment_info: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """
-        Save target prediction evaluation results to JSON.
-
-        Args:
-            results: Output of compute_target_metrics()
-            output_dir: Output directory
-            experiment_info: Additional experiment info (optional)
-
-        Returns:
-            Path of the saved file.
-        """
-        import json
-        from datetime import datetime
-        from pathlib import Path
-
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        save_data = {
-            'timestamp': datetime.now().isoformat(),
-            'evaluation_type': 'target_prediction',
-            'metrics': results,
-            'experiment_info': experiment_info or {}
-        }
-
-        save_file = output_path / 'target_prediction_metrics.json'
-        with open(save_file, 'w') as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
-
-        print(f"Target prediction results saved: {save_file}")
-        return str(save_file)
-
-    def create_target_visualizations(
-        self,
-        y_true: torch.Tensor,
-        y_pred: torch.Tensor,
-        metrics: List[str] = ['rmse'],
-        output_dir: Optional[str] = None
-    ) -> List[str]:
-        """
-        Generate target prediction visualizations (placeholder).
-
-        Args:
-            y_true: Ground truth tensor
-            y_pred: Predicted tensor
-            metrics: List of metrics to visualize
-            output_dir: Output directory (None to skip saving)
-
-        Returns:
-            List of generated file paths.
-        """
-        generated_files = []
-        return generated_files
-
-    def _compute_r2_score(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
-        """Compute overall R^2 score."""
-        try:
-            y_true_np = y_true.cpu().numpy()
-            y_pred_np = y_pred.cpu().numpy()
-            return float(r2_score(y_true_np, y_pred_np, multioutput='uniform_average'))
-        except Exception as e:
-            print(f"R^2 computation error: {e}")
-            return 0.0
-
-    def _compute_r2_per_dimension(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> List[float]:
-        """Compute per-dimension R^2 scores."""
-        try:
-            y_true_np = y_true.cpu().numpy()
-            y_pred_np = y_pred.cpu().numpy()
-            r2_values = r2_score(y_true_np, y_pred_np, multioutput='raw_values')
-            return r2_values.tolist()
-        except Exception as e:
-            print(f"Per-dimension R^2 computation error: {e}")
-            return [0.0]
-
-    def _plot_individual_metric(
-        self,
-        y_true: torch.Tensor,
-        y_pred: torch.Tensor,
-        metric: str,
-        save_path: Optional[Path] = None,
-        max_samples: int = 200
-    ) -> None:
-        """
-        Visualization for individual metrics (placeholder).
-
-        Supported metrics: rmse, mae, r2, r2_per_dim.
-        Currently disabled; use numerical output instead.
-        """
-        pass
-
-    def _print_target_metrics_summary(self, metrics: Dict[str, Union[float, List[float]]]) -> None:
-        """Print target prediction metrics summary."""
-        print("\n" + "="*50)
-        print("Target Prediction Evaluation")
-        print("="*50)
-
-        for metric_name, value in metrics.items():
-            if value is None:
-                print(f"  {metric_name.upper()}: computation error")
-            elif isinstance(value, list):
-                if metric_name == 'r2_per_dim':
-                    print(f"  R^2 PER DIMENSION:")
-                    for i, dim_r2 in enumerate(value):
-                        print(f"    Dim {i}: {dim_r2:.4f}")
-                    print(f"    Average: {np.mean(value):.4f}")
-                else:
-                    print(f"  {metric_name.upper()}: {value}")
-            else:
-                print(f"  {metric_name.upper()}: {value:.4f}")
-
-        print("="*50)
-
-
 class ReconstructionMetrics:
     """
-    Data reconstruction evaluation (unified interface with TargetPredictionMetrics).
-
     Provides metrics for reconstruction experiments on arbitrary data types
     (images: T,H,W,C / time series: T,d / etc.):
     - reconstruction_rmse, psnr, temporal_correlation
@@ -777,11 +594,6 @@ class ReconstructionMetrics:
 
         print(f"Reconstruction results saved: {save_file}")
         return str(save_file)
-
-
-def create_target_prediction_evaluator(device: str = 'cpu') -> TargetPredictionMetrics:
-    """Create a target prediction evaluator."""
-    return TargetPredictionMetrics(device=device)
 
 
 def create_reconstruction_evaluator(device: str = 'cpu') -> ReconstructionMetrics:

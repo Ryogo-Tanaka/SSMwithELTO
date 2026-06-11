@@ -1,12 +1,5 @@
-# ====================================================================
-# VDP Oscillator Mode Decomposition Config (Paper Table 8)
-# Encoder: MLP 30->128->128->64->50 (3 hidden layers, tanh)
-# Decoder: MLP 50->64->128->128->30 (3 hidden layers, tanh)
-# Realization: r=9, past_horizon=20, encoder_output_dim=50
-# DF-A: feature_dim=30 (dA=30), lambda_A=0.01
-# DF-B: obs_feature_dim=30 (dB=30), multivariate_feature_dim=50
-# Training: 125 epochs (25 warmup + 100 end-to-end), batch_size=100
-# ====================================================================
+# Van der Pol mode decomposition config.
+# Uses the appendix MLP architecture and staged training schedule.
 
 experiment:
   mode: "reconstruction"
@@ -45,8 +38,6 @@ training:
   T1_iterations: 1
   T2_iterations: 1
   phase1_warmup_epochs: 25    # Stage-1 = 25 epochs
-
-  experiment_mode: "reconstruction"
 
   lr_phi: 1e-3
   lr_psi: 1e-3

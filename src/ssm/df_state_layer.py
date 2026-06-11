@@ -709,12 +709,7 @@ class DFStateLayer(nn.Module):
         use_cross_fitting: bool = True,
         verbose: bool = False
     ) -> 'DFStateLayer':
-        """
-        Legacy two-stage cross-fitting training.
-
-        Note: For Stage-1 training, use train_stage1_with_gradients
-        and train_stage2_with_gradients instead.
-        """
+        """Two-stage cross-fitting training."""
         T, r = X_states.shape
 
         if r != self.state_dim:
