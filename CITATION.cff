@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated paper."
+title: "Deep Spectral Encoder"
+type: software
+authors:
+  - family-names: Tanaka
+    given-names: Ryogo
+  - family-names: Kawahara
+    given-names: Yoshinobu
+repository-code: "https://github.com/uosaka-mlsyslab/DeepSpectralEncoder"
+url: "https://arxiv.org/abs/2606.14079"
+date-released: 2026-06-19
+preferred-citation:
+  type: article
+  title: "Deep Spectral Learning of Embedded Latent Transfer Operators for Stochastic Dynamical Systems"
+  authors:
+    - family-names: Tanaka
+      given-names: Ryogo
+    - family-names: Kawahara
+      given-names: Yoshinobu
+  year: 2026
+  url: "https://arxiv.org/abs/2606.14079"

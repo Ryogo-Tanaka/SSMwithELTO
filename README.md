@@ -87,3 +87,21 @@ python scripts/run_sl_experiment.py \
 | `sl_config.yaml` | Stuart-Landau oscillator |
 
 See the paper appendix for detailed hyperparameter settings.
+
+## Citation
+
+This repository provides the reference implementation for Deep Spectral Encoder (DSE), proposed in the following paper:
+
+```bibtex
+@misc{tanaka2026deepspectrallearningembedded,
+  title         = {Deep Spectral Learning of Embedded Latent Transfer Operators for Stochastic Dynamical Systems},
+  author        = {Ryogo Tanaka and Yoshinobu Kawahara},
+  year          = {2026},
+  eprint        = {2606.14079},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2606.14079}
+}
+```
+
+The paper has been accepted to the 42nd Conference on Uncertainty in Artificial Intelligence (UAI 2026). The citation will be updated with the official proceedings information when it becomes available.
